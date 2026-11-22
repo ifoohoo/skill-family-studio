@@ -22,6 +22,8 @@ import {
 import { sanitizePublicText } from './markdown-render.mjs';
 
 export const STUDIO_RUNTIME_REGISTRY_PATH = '.skill-family-studio/runtime-registry.json';
+export const FOUNDATION_RUNTIME_REGISTRY_PATH = '.artifacts/runtime-monitor/registry.json';
+export const LEGACY_RUNTIME_REGISTRY_PATH = 'artifacts/runtime-monitor/registry.json';
 export const DEFAULT_LOCK_WARN_MS = 30_000;
 
 const SENSITIVE_SEGMENTS = new Set(['.ssh', '.gnupg', '.aws', '.kube', '.docker', '.netrc', '.npmrc', '.pypirc', '.git-credentials', 'keychains']);
@@ -261,6 +263,29 @@ export async function loadMonitorRegistry(root = '.', registryPath = STUDIO_RUNT
   return { schemaVersion: 1, updatedAt: parsed.value?.updatedAt ?? null, targets: Array.isArray(parsed.value?.targets) ? parsed.value.targets : [] };
 }
 
+export async function loadMergedMonitorTargets(root = '.', { registryPath = STUDIO_RUNTIME_REGISTRY_PATH, allowedRoots = [] } = {}) {
+  const base = resolve(root);
+  const candidatePaths = [...new Set([
+    registryPath || STUDIO_RUNTIME_REGISTRY_PATH,
+    STUDIO_RUNTIME_REGISTRY_PATH,
+    FOUNDATION_RUNTIME_REGISTRY_PATH,
+    LEGACY_RUNTIME_REGISTRY_PATH,
+  ])];
+  const merged = [];
+  const seenIds = new Set();
+  for (const cand of candidatePaths) {
+    try {
+      const reg = await loadMonitorRegistry(base, cand, { allowedRoots });
+      for (const t of reg.targets ?? []) {
+        if (!t?.id || seenIds.has(t.id)) continue;
+        seenIds.add(t.id);
+        merged.push(t);
+      }
+    } catch {}
+  }
+  return merged;
+}
+
 export async function registerMonitorTarget(root = '.', input = {}, registryPath = STUDIO_RUNTIME_REGISTRY_PATH, { allowedRoots = [] } = {}) {
   const base = resolve(root);
   const id = String(input.id ?? '').trim();
@@ -294,9 +319,15 @@ export async function registerMonitorTarget(root = '.', input = {}, registryPath
   else current.targets.unshift(entry);
 
   const payload = { schemaVersion: 1, updatedAt: now, targets: current.targets };
-  const absReg = await resolveContained(base, registryPath);
-  await mkdir(dirname(absReg), { recursive: true });
-  await writeFileAtomic(base, registryPath, `${JSON.stringify(payload, null, 2)}\n`);
+  if (isAbsolute(registryPath)) {
+    const safeRegAbs = resolveRuntimeTargetPath(base, registryPath, { allowedRoots, strict: true });
+    await mkdir(dirname(safeRegAbs), { recursive: true });
+    await writeFile(safeRegAbs, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+  } else {
+    const absReg = await resolveContained(base, registryPath);
+    await mkdir(dirname(absReg), { recursive: true });
+    await writeFileAtomic(base, registryPath, `${JSON.stringify(payload, null, 2)}\n`);
+  }
   return { entry, registry: payload };
 }
 
@@ -395,15 +426,35 @@ export async function collectStudioRuntimeView({
   extraTargets = [],
   lockWarnMs = DEFAULT_LOCK_WARN_MS,
   allowedRoots = [],
+  workbenchUrl = null,
 } = {}) {
   const base = resolve(root);
   const repoRoots = catalog?.byId ? [...catalog.byId.values()].map(r => r.realPath) : [];
   const effectiveRoots = [base, ...repoRoots, ...allowedRoots, tmpdir()];
 
-  const reg = await loadMonitorRegistry(base, registryPath, { allowedRoots: effectiveRoots });
+  const regTargets = (await loadMergedMonitorTargets(base, { registryPath, allowedRoots: effectiveRoots }))
+    .map(t => ({ ...t, repoId: t.repoId || catalog?.primaryRepoId || selectedRepoId || null }));
   const autoTargets = [];
   if (catalog?.byId) {
     for (const rec of catalog.byId.values()) {
+      const siblingRegs = await loadMergedMonitorTargets(rec.realPath, {
+        registryPath: FOUNDATION_RUNTIME_REGISTRY_PATH,
+        allowedRoots: [rec.realPath, tmpdir(), ...allowedRoots],
+      });
+      for (const stItem of siblingRegs) {
+        if (rec.isPrimary) continue;
+        const relToAbs = p => (p && !isAbsolute(p) ? join(rec.realPath, p) : p);
+        autoTargets.push({
+          ...stItem,
+          id: `${rec.name}:${stItem.id}`,
+          repoId: rec.id,
+          title: `${rec.name} · ${stItem.title || stItem.id}`,
+          stateDir: relToAbs(stItem.stateDir),
+          planPath: relToAbs(stItem.planPath),
+          runsDir: relToAbs(stItem.runsDir),
+          lockPaths: (stItem.lockPaths ?? []).map(relToAbs).filter(Boolean),
+        });
+      }
       const runsDir = join(rec.realPath, '.runs');
       const stateDir = (await safeLstat(join(rec.realPath, '.artifacts/state-store'))) ? join(rec.realPath, '.artifacts/state-store') : undefined;
       if ((await safeLstat(runsDir)) || stateDir) {
@@ -413,7 +464,7 @@ export async function collectStudioRuntimeView({
   }
 
   const seen = new Set();
-  const rawList = [...extraTargets, ...reg.targets, ...autoTargets].filter(t => {
+  const rawList = [...extraTargets, ...regTargets, ...autoTargets].filter(t => {
     if (!t?.id || seen.has(t.id)) return false;
     seen.add(t.id);
     return true;
@@ -479,6 +530,7 @@ export async function collectStudioRuntimeView({
     ok: true,
     foundationVersion: FOUNDATION_PACKAGE_VERSION,
     generatedAt: new Date().toISOString(),
+    workbenchUrl,
     kpi,
     targets: cleanTargets,
     currentRepoTargets,

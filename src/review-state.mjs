@@ -73,17 +73,25 @@ export function normalizeLegacyTargetKey(rawKey, defaultPrimaryRepoId = 'skill-f
 
 export function qualifyRepoTargetId(repoId, rawTarget) {
   const cleanTarget = validateTargetId(rawTarget);
-  if (cleanTarget.startsWith('repo:')) return cleanTarget;
-  const ecoMatch = /^eco:([^:]+):(.+)$/.exec(cleanTarget);
-  if (ecoMatch) return validateTargetId(`repo:${ecoMatch[1]}:${ecoMatch[2]}`);
   const cleanRepo = cleanString(repoId, 140);
-  if (!cleanRepo) return cleanTarget;
-  if (FORBIDDEN_OBJECT_KEYS.has(cleanRepo) || !/^[A-Za-z0-9_./-]+$/.test(cleanRepo)) {
+  if (cleanRepo && (FORBIDDEN_OBJECT_KEYS.has(cleanRepo) || !/^[A-Za-z0-9_./-]+$/.test(cleanRepo))) {
     throw Object.assign(new Error(`无效的仓库标识 repo：${cleanRepo}`), { statusCode: 400 });
   }
-  const prefix = `repo:${cleanRepo}:`;
-  if (cleanTarget.startsWith(prefix)) return cleanTarget;
-  return validateTargetId(`${prefix}${cleanTarget}`);
+  const embedded = splitQualifiedTargetId(cleanTarget);
+  if (embedded.repoId !== null) {
+    if (FORBIDDEN_OBJECT_KEYS.has(embedded.repoId) || !/^[A-Za-z0-9_./-]+$/.test(embedded.repoId)) {
+      throw Object.assign(new Error(`target 内嵌了非法的仓库标识：${embedded.repoId}`), { statusCode: 400 });
+    }
+    if (cleanRepo && cleanRepo !== embedded.repoId) {
+      throw Object.assign(
+        new Error(`请求体 repo (${cleanRepo}) 与 target 内嵌仓库前缀 (${embedded.repoId}) 不一致。`),
+        { statusCode: 400 },
+      );
+    }
+    return validateTargetId(`repo:${embedded.repoId}:${embedded.rawTarget}`);
+  }
+  if (!cleanRepo) return cleanTarget;
+  return validateTargetId(`repo:${cleanRepo}:${cleanTarget}`);
 }
 
 export function splitQualifiedTargetId(qualifiedTarget) {

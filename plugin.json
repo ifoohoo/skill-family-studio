@@ -1,0 +1,8 @@
+{
+  "name": "skill-family-studio",
+  "displayName": "Skill Family Studio",
+  "version": "0.1.0",
+  "description": "单端口统一承载 artifact-graph 宽屏制品图谱审阅与 Foundation 运行态监控的本地离线研发控制台。",
+  "author": "广州市风荷科技有限公司",
+  "repository": "https://github.com/ifoohoo/skill-family-studio"
+}

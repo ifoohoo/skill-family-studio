@@ -43,8 +43,12 @@ export {
 } from './guide-content.mjs';
 
 export {
+  DEFAULT_LOCK_WARN_MS,
+  FOUNDATION_RUNTIME_REGISTRY_PATH,
+  LEGACY_RUNTIME_REGISTRY_PATH,
   STUDIO_RUNTIME_REGISTRY_PATH,
   collectStudioRuntimeView,
+  loadMergedMonitorTargets,
 } from './runtime-bridge.mjs';
 
 export {
@@ -52,5 +56,6 @@ export {
   createStudioServer,
   isSafeLoopbackHost,
   isSafeLoopbackOrigin,
+  normalizeStudioTab,
   runStudioDoctor,
 } from './server.mjs';

@@ -1,8 +1,9 @@
 import { createServer } from 'node:http';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { extname, join, resolve } from 'node:path';
+import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { FOUNDATION_PACKAGE_VERSION } from 'skill-family-harness-node';
 import { discoverStudioRepos, inspectProjectRepo, readRepoArchifyAsset, readRepoDocument } from './ecosystem.mjs';
 import { STUDIO_GUIDE_MODEL } from './guide-content.mjs';
 import {
@@ -13,9 +14,16 @@ import {
   buildStudioReviewSummary,
   cleanString,
   readStudioReviewStore,
+  splitQualifiedTargetId,
   writeStudioReviewStore,
 } from './review-state.mjs';
-import { STUDIO_RUNTIME_REGISTRY_PATH, collectStudioRuntimeView, registerMonitorTarget, runSandboxExercise } from './runtime-bridge.mjs';
+import {
+  DEFAULT_LOCK_WARN_MS,
+  STUDIO_RUNTIME_REGISTRY_PATH,
+  collectStudioRuntimeView,
+  registerMonitorTarget,
+  runSandboxExercise,
+} from './runtime-bridge.mjs';
 
 const PKG_SRC_DIR = fileURLToPath(new URL('./', import.meta.url));
 const UI_DIR = join(PKG_SRC_DIR, 'ui');
@@ -92,18 +100,40 @@ async function readJsonBody(req, maxBytes = 262144) {
   return parsed;
 }
 
+export function normalizeStudioTab(rawTab) {
+  if (!rawTab) return null;
+  const clean = String(rawTab).trim().toLowerCase();
+  if (!clean) return null;
+  if (clean === 'overview') return 'guide';
+  if (clean === 'monitor') return 'runtime';
+  if (['guide', 'graph', 'review', 'runtime'].includes(clean)) return clean;
+  return 'graph';
+}
+
+function safeDecodeUri(raw, label = '请求路径') {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    throw Object.assign(new Error(`非法的百分号编码${label}。`), { statusCode: 400 });
+  }
+}
+
 export async function createStudioServer({
   root = '.',
   port = 0,
   writable = true,
   reviewsPath = DEFAULT_STUDIO_REVIEWS_PATH,
   runtimeRegistryPath = STUDIO_RUNTIME_REGISTRY_PATH,
+  lockWarnMs = DEFAULT_LOCK_WARN_MS,
+  allowedRoots = [],
+  workbenchUrl = null,
   scanRoots,
   defaultTab = null,
   defaultRepo = null,
   env = process.env,
 } = {}) {
   const resolvedRoot = resolve(root);
+  const normalizedDefaultTab = normalizeStudioTab(defaultTab);
   const emptyScanDir = await mkdtemp(join(tmpdir(), 'sfs-scan-'));
   let writeChain = Promise.resolve();
   const enqueueWrite = fn => {
@@ -162,11 +192,18 @@ export async function createStudioServer({
       }
 
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-      const pathname = decodeURIComponent(url.pathname);
+      const pathname = safeDecodeUri(url.pathname, '请求路径');
 
       if (pathname === '/api/health') {
         if (req.method !== 'GET') { sendJson(res, 405, { ok: false, error: '仅支持 GET 请求。' }); return; }
-        sendJson(res, 200, { ok: true, service: 'skill-family-studio', writable, at: new Date().toISOString() });
+        sendJson(res, 200, {
+          ok: true,
+          service: 'skill-family-studio',
+          pid: process.pid,
+          foundationVersion: FOUNDATION_PACKAGE_VERSION,
+          writable,
+          at: new Date().toISOString(),
+        });
         return;
       }
 
@@ -193,7 +230,7 @@ export async function createStudioServer({
         sendJson(res, 200, {
           ok: true,
           writable,
-          defaultTab,
+          defaultTab: normalizedDefaultTab,
           defaultRepo,
           updatedAt: store.updatedAt,
           decisions: store.decisions,
@@ -250,8 +287,8 @@ export async function createStudioServer({
         const rawRest = req.url.split('?')[0].slice('/api/studio/archify/'.length);
         const slashIdx = rawRest.indexOf('/');
         if (slashIdx <= 0) { sendJson(res, 400, { ok: false, error: '缺少 Archify 仓库或资源路径。' }); return; }
-        const repoId = decodeURIComponent(rawRest.slice(0, slashIdx));
-        const assetRel = decodeURIComponent(rawRest.slice(slashIdx + 1));
+        const repoId = safeDecodeUri(rawRest.slice(0, slashIdx), '仓库标识');
+        const assetRel = safeDecodeUri(rawRest.slice(slashIdx + 1), '资源路径');
         const catalog = await getCatalog(false);
         const record = catalog.byId.get(repoId);
         if (!record) { sendJson(res, 404, { ok: false, error: `未找到指定的技能族仓库：${repoId}` }); return; }
@@ -294,6 +331,9 @@ export async function createStudioServer({
           selectedRepoId,
           registryPath: runtimeRegistryPath,
           extraTargets,
+          lockWarnMs,
+          allowedRoots,
+          workbenchUrl,
         });
         sendJson(res, 200, rt);
         return;
@@ -313,11 +353,22 @@ export async function createStudioServer({
         if (pathname === '/api/studio/annotations' || pathname === '/api/studio/decisions') {
           const catalog = await getCatalog(false);
           const reqRepo = cleanString(body.repo, 140);
-          if (reqRepo && !catalog.byId.has(reqRepo)) {
-            sendJson(res, 404, { ok: false, error: `未找到指定的技能族仓库：${reqRepo}` });
+          const { repoId: embeddedRepo } = body.target !== undefined && body.target !== null
+            ? splitQualifiedTargetId(cleanString(body.target, 280))
+            : { repoId: null };
+          if (reqRepo && embeddedRepo && reqRepo !== embeddedRepo) {
+            sendJson(res, 400, {
+              ok: false,
+              error: `请求体 repo (${reqRepo}) 与 target 内嵌仓库前缀 (${embeddedRepo}) 不一致。`,
+            });
             return;
           }
-          const effectiveRepoId = reqRepo || catalog.primaryRepoId || 'workspace';
+          const checkRepo = embeddedRepo || reqRepo;
+          if (checkRepo && !catalog.byId.has(checkRepo)) {
+            sendJson(res, 404, { ok: false, error: `未找到指定的技能族仓库：${checkRepo}` });
+            return;
+          }
+          const effectiveRepoId = checkRepo || catalog.primaryRepoId || 'workspace';
           const out = await enqueueWrite(async () => {
             const store = await readStudioReviewStore(resolvedRoot, {
               reviewsPath,
@@ -347,7 +398,7 @@ export async function createStudioServer({
           const catalog = await getCatalog(false);
           const repoRoots = [...catalog.byId.values()].map(r => r.realPath);
           const registered = await registerMonitorTarget(resolvedRoot, body, runtimeRegistryPath, {
-            allowedRoots: [resolvedRoot, ...repoRoots, tmpdir()],
+            allowedRoots: [resolvedRoot, ...repoRoots, ...allowedRoots, tmpdir()],
           });
           broadcast('runtime-change', { at: new Date().toISOString() });
           sendJson(res, 200, { ok: true, ...registered });
@@ -375,6 +426,7 @@ export async function createStudioServer({
         '/index.html': { file: join(UI_DIR, 'index.html'), type: MIME_TYPES['.html'] },
         '/assets/studio.css': { file: join(UI_DIR, 'studio.css'), type: MIME_TYPES['.css'] },
         '/assets/app.mjs': { file: join(UI_DIR, 'app.mjs'), type: MIME_TYPES['.mjs'] },
+        '/graph-layout.mjs': { file: join(PKG_SRC_DIR, 'graph-layout.mjs'), type: MIME_TYPES['.mjs'] },
         '/assets/graph-layout.mjs': { file: join(PKG_SRC_DIR, 'graph-layout.mjs'), type: MIME_TYPES['.mjs'] },
       };
       const hit = staticMap[pathname];
@@ -411,11 +463,32 @@ export async function createStudioServer({
   });
 
   const boundPort = server.address().port;
+  const serverUrl = `http://127.0.0.1:${boundPort}/`;
+  const readyFile = typeof env?.SF_MONITOR_READY_FILE === 'string' ? env.SF_MONITOR_READY_FILE.trim() : '';
+  if (readyFile) {
+    try {
+      await mkdir(dirname(resolve(readyFile)), { recursive: true });
+      await writeFile(
+        resolve(readyFile),
+        `${JSON.stringify({
+          ok: true,
+          service: 'skill-family-studio',
+          port: boundPort,
+          pid: process.pid,
+          url: serverUrl,
+          foundationVersion: FOUNDATION_PACKAGE_VERSION,
+          at: new Date().toISOString(),
+        }, null, 2)}\n`,
+        'utf8',
+      );
+    } catch {}
+  }
+
   return {
     server,
     port: boundPort,
     writable,
-    url: `http://127.0.0.1:${boundPort}/`,
+    url: serverUrl,
     close: () => new Promise(res => server.close(() => res())),
   };
 }

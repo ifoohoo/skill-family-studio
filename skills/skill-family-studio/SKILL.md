@@ -22,7 +22,7 @@ description: 启动或复用单端口本地研发与审阅可视化控制台（S
    npx skill-family-studio doctor --root /absolute/project/path
    ```
 
-2. **幂等启动或复用单端口控制台**：需要为用户、制品助手（`artifact-chain-assistant`）或本地长程任务（`local-long-task`）打开可视化界面时，优先调用 `ensure`。若目标端口已有运行中的 Studio 实例会直接复用，不会重复拉起冲突进程：
+2. **幂等启动或复用单端口控制台**：需要为用户、制品助手（`artifact-chain-assistant`）或 `loop-agent` 或 Foundation 长任务工作流打开可视化界面时，优先调用 `ensure`（兼容 `open`）。若目标端口已有运行中的 Studio 实例会直接复用，不会重复拉起冲突进程：
 
    ```bash
    npx skill-family-studio ensure --root /absolute/project/path --port 57630 --tab graph
