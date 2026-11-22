@@ -29,8 +29,9 @@ export function computeEdgePath(src, dst) {
 
 /**
  * 响应式宽屏自适应 + 同层多行自动折行（Wrap Grid）DAG 布局引擎。
- * 保证在大屏（1920px / 2560px / 3840px）自动铺满容器宽度，且单层几十个节点时自动折成多行网格，
- * 彻底消除超宽横向滚动条，同时确保有效字号始终不低于可读阈值（>= 11px）。
+ * 保证在 1920px、2560px（2K）与 3440px（21:9 带鱼屏）自动铺满容器宽度：
+ * 多节点层自动折成多行网格并均匀铺满横向视口，少节点层适度放宽卡片并居中排布（避免孤岛撕裂），
+ * 同时确保有效字号始终不低于可读阈值（>= 11px）。
  */
 export function computeAdaptiveGraphLayout(
   snapshot,
@@ -85,10 +86,12 @@ export function computeAdaptiveGraphLayout(
   const bandHeadH = 36;
   const bandPadBottom = 16;
   const bandGapY = 26;
-  const minCardW = 204;
-  const maxCardW = 360;
+  const isUltrawide = safeContainerW >= 3000;
+  const is2K = safeContainerW >= 2200;
+  const minCardW = isUltrawide ? 260 : (is2K ? 240 : 204);
+  const maxCardW = isUltrawide ? 460 : (is2K ? 420 : 360);
   const cardH = 62;
-  const gapX = 16;
+  const gapX = is2K ? 18 : 16;
   const gapY = 14;
 
   const innerAvailW = Math.max(minCardW, safeContainerW - padX * 2 - bandPadX * 2);
@@ -128,8 +131,12 @@ export function computeAdaptiveGraphLayout(
         startX = padX + bandPadX + Math.round(leftover / 2);
         stepX = cardW + gapX;
       } else {
-        const extraGap = Math.floor(leftover / (cols - 1));
-        stepX = cardW + gapX + extraGap;
+        const maxComfortableGap = 56;
+        const rawExtra = Math.floor(leftover / (cols - 1));
+        const extraGap = sorted.length >= maxColsPerRow
+          ? rawExtra
+          : Math.min(maxComfortableGap - gapX, rawExtra);
+        stepX = cardW + gapX + Math.max(0, extraGap);
         const totalSpan = cardW + (cols - 1) * stepX;
         startX = padX + bandPadX + Math.max(0, Math.round((innerAvailW - totalSpan) / 2));
       }

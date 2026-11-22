@@ -137,7 +137,74 @@ export async function resolveStudioScanRoots(workspaceRoot, explicitScanRoots, e
   return candidates.length ? candidates : [rootReal];
 }
 
-async function readQuickRepoMeta(repoReal) {
+function extractLockEndpointKey(endpoint) {
+  if (!endpoint) return null;
+  if (typeof endpoint === 'string') {
+    const clean = endpoint.trim();
+    return clean || null;
+  }
+  if (typeof endpoint === 'object') {
+    if (typeof endpoint.type === 'string' && typeof endpoint.id === 'string' && endpoint.type && endpoint.id) {
+      return `${endpoint.type}:${endpoint.id}`;
+    }
+    if (typeof endpoint.type === 'string' && typeof endpoint.path === 'string' && endpoint.type && endpoint.path) {
+      return `${endpoint.type}:${endpoint.path}`;
+    }
+    if (typeof endpoint.id === 'string' && endpoint.id) return endpoint.id;
+    if (typeof endpoint.path === 'string' && endpoint.path) return endpoint.path;
+  }
+  return null;
+}
+
+async function countConfiguredArtifactFiles(repoReal) {
+  try {
+    const { schema } = await loadRepoSchemaSafe(repoReal);
+    const prefixes = new Set();
+    let rootWalk = false;
+    for (const def of Object.values(schema.types ?? {})) {
+      for (const p of def.paths ?? []) {
+        const seg = String(p).replace(/^\.\//, '').split('/')[0];
+        if (!seg || /[*?[\]{}]/.test(seg)) rootWalk = true;
+        else prefixes.add(seg);
+      }
+    }
+    const matched = new Set();
+    const walkCount = async absDir => {
+      let entries;
+      try { entries = await readdir(absDir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        if (SKIP_DIRS.has(e.name) && !prefixes.has(e.name)) continue;
+        if (e.isSymbolicLink()) continue;
+        const full = join(absDir, e.name);
+        if (e.isDirectory()) {
+          await walkCount(full);
+        } else if (e.isFile()) {
+          const rel = relative(repoReal, full).split('\\').join('/');
+          if (matchesConfiguredArtifactPath(rel, schema)) matched.add(rel);
+        }
+      }
+    };
+    if (rootWalk) {
+      await walkCount(repoReal);
+    } else {
+      for (const pre of prefixes) {
+        const target = join(repoReal, pre);
+        try {
+          const st = await lstat(target);
+          if (!st.isSymbolicLink() && st.isDirectory()) await walkCount(target);
+          else if (!st.isSymbolicLink() && st.isFile() && matchesConfiguredArtifactPath(pre, schema)) {
+            matched.add(pre);
+          }
+        } catch {}
+      }
+    }
+    return matched.size;
+  } catch {
+    return 0;
+  }
+}
+
+export async function readQuickRepoMeta(repoReal) {
   let pkgName = basename(repoReal);
   let description = '';
   let version = '';
@@ -159,17 +226,35 @@ async function readQuickRepoMeta(repoReal) {
     lockedCount = locksArr.length + relArr.length;
     const uidSet = new Set();
     for (const item of [...locksArr, ...relArr]) {
-      if (item?.from) uidSet.add(item.from);
-      if (item?.to) uidSet.add(item.to);
-      if (item?.artifact) uidSet.add(item.artifact);
+      for (const rawEp of [item?.source, item?.target, item?.from, item?.to, item?.artifact]) {
+        const key = extractLockEndpointKey(rawEp);
+        if (key) uidSet.add(key);
+      }
     }
     estimatedNodes = uidSet.size;
   } catch {}
 
-  let richItemBonus = 0;
-  if (await exists(join(repoReal, 'local/lifecycle-user-stories/stories.json'))) {
-    richItemBonus += 147;
+  // 若锁文件缺失或仅有孤立节点（无关系边），轻量统计配置的受管制品种类文件数作为兜底。
+  if (estimatedNodes === 0) {
+    estimatedNodes = await countConfiguredArtifactFiles(repoReal);
   }
+
+  let richItemBonus = 0;
+  try {
+    const storiesRaw = JSON.parse(await readFileContained(repoReal, 'local/lifecycle-user-stories/stories.json', { encoding: 'utf8' }));
+    if (Array.isArray(storiesRaw?.stories)) richItemBonus += storiesRaw.stories.length;
+  } catch {}
+  try {
+    const expAbs = await resolveContained(repoReal, 'local/lifecycle-user-stories/explanations');
+    const expFiles = (await readdir(expAbs)).filter(n => /^\d{2}\.md$/.test(n));
+    richItemBonus += expFiles.length;
+  } catch {}
+  try {
+    const msRaw = JSON.parse(await readFileContained(repoReal, 'artifact-reading/business/inputs/model-and-scenes.json', { encoding: 'utf8' }));
+    for (const doc of msRaw?.documents ?? []) {
+      if (typeof doc?.markdown === 'string' && doc.markdown) richItemBonus += 1;
+    }
+  } catch {}
 
   let runtimeActive = false;
   let runtimeLabel = '无运行任务';
@@ -188,7 +273,7 @@ async function readQuickRepoMeta(repoReal) {
     lockPresent,
     lockedCount,
     versionLockLabel: lockPresent ? `已锁 (${lockedCount})` : '未建锁',
-    estimatedNodeCount: Math.max(estimatedNodes, richItemBonus > 0 ? estimatedNodes + richItemBonus : 0),
+    estimatedNodeCount: estimatedNodes + richItemBonus,
     runtimeActive,
     runtimeLabel,
   };
@@ -328,9 +413,19 @@ async function loadRichWorkspaceExtensions(repoReal) {
         archifyDiagrams.push({
           id: fig.id,
           title: sanitizePublicText(fig.title || fig.id),
+          docPageId: doc.pageId ? String(doc.pageId) : null,
           docTitle: sanitizePublicText(doc.title || ''),
           htmlPath: cleanHtml,
           resources: Array.isArray(fig.resources) ? fig.resources : [],
+          bindings: Array.isArray(fig.bindings)
+            ? fig.bindings
+                .filter(b => b?.nodeId && b?.pageId)
+                .map(b => ({
+                  nodeId: String(b.nodeId),
+                  pageId: String(b.pageId),
+                  anchor: b.anchor ? String(b.anchor) : null,
+                }))
+            : [],
         });
       }
     }

@@ -30,8 +30,24 @@ const state = {
   panX: 0,
   panY: 0,
   fullscreenGraph: false,
+  selectedAnchor: null,
+  archifySelectedNode: null,
   docCache: new Map(),
 };
+
+function resolveStudioItemByPageId(pageId) {
+  if (!pageId || !state.snap) return null;
+  const items = [...(state.snap.reviewItems || []), ...(state.snap.nodes || [])];
+  const raw = String(pageId).trim();
+  const exactArticle = items.find(i => i.uid === `business_article:${raw}`);
+  if (exactArticle) return exactArticle;
+  const normalized = raw.replace(/^story-/i, '').toUpperCase();
+  return items.find(i =>
+    String(i.code || '').toUpperCase() === raw.toUpperCase()
+    || String(i.code || '').toUpperCase() === normalized
+    || String(i.uid || '').toLowerCase().endsWith(`:${raw.toLowerCase()}`),
+  ) || null;
+}
 
 const el = (tag, text, cls) => {
   const n = document.createElement(tag);
@@ -214,12 +230,14 @@ async function mutateAnnotation(payload) {
   renderActiveTab();
 }
 
-async function mountDocumentReader(container, item) {
+async function mountDocumentReader(container, item, options = {}) {
   container.replaceChildren();
   if (!item) {
     container.append(el('div', '请在左侧或图谱中点击任意制品节点开始阅读与审阅。', 'st-prose-container st-muted-xs'));
     return;
   }
+  const anchorId = options.anchorId ?? state.selectedAnchor ?? null;
+  const archifyContext = options.archifyContext ?? state.archifySelectedNode ?? null;
   const rawTarget = item.target || item.uid;
   const eff = getEffectiveStatus(rawTarget);
   const meta = STATUS_META[eff] || STATUS_META.pending;
@@ -242,7 +260,7 @@ async function mountDocumentReader(container, item) {
   skipNextBtn.type = 'button';
   skipNextBtn.addEventListener('click', () => {
     const nxt = findNextUnreviewed(item.uid);
-    if (nxt) { state.selectedUid = nxt.uid; renderActiveTab(); }
+    if (nxt) { state.selectedUid = nxt.uid; state.selectedAnchor = null; renderActiveTab(); }
   });
 
   const widthToggle = el('button', state.proseWidth === 'full' ? '切换舒适行宽' : '铺满全屏阅读', 'st-btn');
@@ -250,11 +268,38 @@ async function mountDocumentReader(container, item) {
   widthToggle.addEventListener('click', () => {
     state.proseWidth = state.proseWidth === 'full' ? 'comfort' : 'full';
     localStorage.setItem('st-prose-width', state.proseWidth);
-    mountDocumentReader(container, item);
+    mountDocumentReader(container, item, options);
   });
 
   rightBtns.append(approveNextBtn, skipNextBtn, widthToggle);
   actionBar.append(leftInfo, rightBtns);
+  container.append(actionBar);
+
+  if (archifyContext && Array.isArray(archifyContext.bindings) && archifyContext.bindings.length > 0) {
+    const bindBar = el('div', null, 'st-archify-bindings');
+    bindBar.append(el('span', `图节点「${archifyContext.label || archifyContext.nodeId}」关联说明：`, 'st-muted-xs'));
+    for (const b of archifyContext.bindings.slice(0, 8)) {
+      const targetItem = resolveStudioItemByPageId(b.pageId);
+      const labelTxt = `${targetItem?.code || b.pageId}${b.anchor ? ` #${b.anchor}` : ''}`;
+      const isCur = targetItem?.uid === item.uid && (b.anchor || null) === anchorId;
+      const chipBtn = el('button', labelTxt, `st-btn${isCur ? ' is-active' : ''}`);
+      chipBtn.type = 'button';
+      chipBtn.style.height = '26px';
+      chipBtn.style.fontSize = '11.5px';
+      chipBtn.addEventListener('click', () => {
+        if (!targetItem) return;
+        state.selectedUid = targetItem.uid;
+        state.selectedAnchor = b.anchor || null;
+        mountDocumentReader(container, targetItem, { anchorId: state.selectedAnchor, archifyContext });
+      });
+      bindBar.append(chipBtn);
+    }
+    container.append(bindBar);
+  }
+
+  const readerLayout = el('div', null, 'st-reader-layout');
+  const mainCol = el('div', null, 'st-reader-main');
+  const dockCol = el('div', null, 'st-reader-dock');
 
   const quickStatusRow = el('div', null, 'st-graph-toolbar');
   const statusGroup = el('div', null, 'st-graph-controls');
@@ -319,7 +364,10 @@ async function mountDocumentReader(container, item) {
     annBox.append(row);
   }
 
-  container.append(actionBar, quickStatusRow, proseWrap, annBox);
+  mainCol.append(proseWrap);
+  dockCol.append(quickStatusRow, annBox);
+  readerLayout.append(mainCol, dockCol);
+  container.append(readerLayout);
 
   const cacheKey = `${state.repoId}::${item.uid}::${item.path}`;
   let doc = state.docCache.get(cacheKey);
@@ -343,7 +391,7 @@ async function mountDocumentReader(container, item) {
     if (jump) {
       const t = jump.dataset.jumpTarget;
       const hit = (state.snap?.reviewItems || []).find(x => x.uid === t || x.target === t);
-      if (hit) { state.selectedUid = hit.uid; renderActiveTab(); }
+      if (hit) { state.selectedUid = hit.uid; state.selectedAnchor = null; renderActiveTab(); }
     }
     const anc = e.target.closest('[data-anchor-id]');
     if (anc) {
@@ -352,6 +400,15 @@ async function mountDocumentReader(container, item) {
     }
   });
   proseWrap.append(h1, bodyDiv);
+
+  if (anchorId) {
+    const hitHeading = bodyDiv.querySelector(`#${CSS.escape(anchorId)}`)
+      || [...bodyDiv.querySelectorAll('.st-prose-heading')].find(h => String(h.id || '').endsWith(`-${anchorId}`));
+    if (hitHeading) {
+      hitHeading.classList.add('is-anchor-hit');
+      hitHeading.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }
 }
 
 function renderGuidePanel() {
@@ -435,24 +492,47 @@ function renderGraphPanel() {
   if (graphResizeObserver) { graphResizeObserver.disconnect(); graphResizeObserver = null; }
   if (!state.snap) { host.append(el('p', '正在加载仓库制品图谱…', 'st-muted-xs')); return; }
 
-  const split = el('div', null, `st-graph-split${state.fullscreenGraph || state.graphMode === 'archify' ? ' is-fullscreen' : ''}`);
+  const split = el('div', null, `st-graph-split${state.fullscreenGraph ? ' is-fullscreen' : ''}`);
   const leftCard = el('div', null, 'st-card');
   const toolbar = el('div', null, 'st-graph-toolbar');
+
+  const syncArchifyDefaultDoc = fig => {
+    state.archifySelectedNode = null;
+    state.selectedAnchor = null;
+    if (fig?.docPageId) {
+      const docItem = resolveStudioItemByPageId(fig.docPageId);
+      if (docItem) state.selectedUid = docItem.uid;
+    }
+  };
 
   const modeControls = el('div', null, 'st-graph-controls');
   if ((state.snap.archifyDiagrams || []).length > 0) {
     const dagBtn = el('button', `制品依赖图谱 (${state.snap.nodes.length})`, `st-btn${state.graphMode === 'dag' ? ' is-active' : ''}`);
     dagBtn.type = 'button';
-    dagBtn.addEventListener('click', () => { state.graphMode = 'dag'; renderGraphPanel(); });
+    dagBtn.addEventListener('click', () => {
+      state.graphMode = 'dag';
+      state.archifySelectedNode = null;
+      state.selectedAnchor = null;
+      renderGraphPanel();
+    });
     const archBtn = el('button', `Archify 业务逻辑图 (${state.snap.archifyDiagrams.length})`, `st-btn${state.graphMode === 'archify' ? ' is-active' : ''}`);
     archBtn.type = 'button';
-    archBtn.addEventListener('click', () => { state.graphMode = 'archify'; renderGraphPanel(); });
+    archBtn.addEventListener('click', () => {
+      state.graphMode = 'archify';
+      syncArchifyDefaultDoc(state.snap.archifyDiagrams[state.archifyIdx]);
+      renderGraphPanel();
+    });
     modeControls.append(dagBtn, archBtn);
   }
   const guidedBtn = el('button', '▶ 开始按推荐顺序审阅', 'st-btn st-btn-primary');
   guidedBtn.type = 'button';
   guidedBtn.addEventListener('click', startGuidedReview);
   modeControls.append(guidedBtn);
+
+  const rightCard = el('aside', null, 'st-card st-graph-inspector');
+  const floatBar = el('div', null, 'st-archify-float-bar');
+  floatBar.hidden = true;
+  let fsBtnRef = null;
 
   const canvasControls = el('div', null, 'st-graph-controls');
   if (state.graphMode === 'dag') {
@@ -472,6 +552,15 @@ function renderGraphPanel() {
       mkCtrl(state.fullscreenGraph ? '退出全屏画布' : '全屏画布', state.fullscreenGraph, () => { state.fullscreenGraph = !state.fullscreenGraph; renderGraphPanel(); }),
     );
   } else {
+    const totalArch = state.snap.archifyDiagrams.length;
+    const prevArch = el('button', '◀ 上一张', 'st-btn');
+    prevArch.type = 'button';
+    prevArch.disabled = totalArch <= 1;
+    prevArch.addEventListener('click', () => {
+      state.archifyIdx = (state.archifyIdx - 1 + totalArch) % totalArch;
+      syncArchifyDefaultDoc(state.snap.archifyDiagrams[state.archifyIdx]);
+      renderGraphPanel();
+    });
     const sel = el('select', null, 'st-select');
     sel.style.width = 'auto';
     state.snap.archifyDiagrams.forEach((d, idx) => {
@@ -480,8 +569,29 @@ function renderGraphPanel() {
       if (idx === state.archifyIdx) opt.selected = true;
       sel.append(opt);
     });
-    sel.addEventListener('change', () => { state.archifyIdx = Number(sel.value) || 0; renderGraphPanel(); });
-    canvasControls.append(sel);
+    sel.addEventListener('change', () => {
+      state.archifyIdx = Number(sel.value) || 0;
+      syncArchifyDefaultDoc(state.snap.archifyDiagrams[state.archifyIdx]);
+      renderGraphPanel();
+    });
+    const nextArch = el('button', '下一张 ▶', 'st-btn');
+    nextArch.type = 'button';
+    nextArch.disabled = totalArch <= 1;
+    nextArch.addEventListener('click', () => {
+      state.archifyIdx = (state.archifyIdx + 1) % totalArch;
+      syncArchifyDefaultDoc(state.snap.archifyDiagrams[state.archifyIdx]);
+      renderGraphPanel();
+    });
+    fsBtnRef = el('button', state.fullscreenGraph ? '退出全屏展开' : '全屏展开', `st-btn${state.fullscreenGraph ? ' is-active' : ''}`);
+    fsBtnRef.type = 'button';
+    fsBtnRef.addEventListener('click', () => {
+      state.fullscreenGraph = !state.fullscreenGraph;
+      split.classList.toggle('is-fullscreen', state.fullscreenGraph);
+      fsBtnRef.classList.toggle('is-active', state.fullscreenGraph);
+      fsBtnRef.textContent = state.fullscreenGraph ? '退出全屏展开' : '全屏展开';
+      if (!state.fullscreenGraph) floatBar.hidden = true;
+    });
+    canvasControls.append(prevArch, sel, nextArch, fsBtnRef);
   }
   toolbar.append(modeControls, canvasControls);
   leftCard.append(toolbar);
@@ -489,10 +599,67 @@ function renderGraphPanel() {
   let paintSvgCanvas = () => {};
   if (state.graphMode === 'archify' && state.snap.archifyDiagrams[state.archifyIdx]) {
     const fig = state.snap.archifyDiagrams[state.archifyIdx];
+    const curTheme = document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
+    const stage = el('div', null, 'st-archify-stage');
     const iframe = el('iframe', null, 'st-archify-frame');
     iframe.title = fig.title;
-    iframe.src = `/api/studio/archify/${encodeURIComponent(state.repoId)}/${fig.htmlPath}`;
-    leftCard.append(iframe);
+    iframe.src = `/api/studio/archify/${encodeURIComponent(state.repoId)}/${fig.htmlPath}?theme=${encodeURIComponent(curTheme)}&present=1`;
+
+    const bindArchifyNodeSelection = (nodeId, nodeLabel) => {
+      if (!nodeId) return;
+      const allBindings = Array.isArray(fig.bindings) ? fig.bindings : [];
+      const matched = allBindings.filter(b => b.nodeId === nodeId);
+      const primary = matched.find(b => b.pageId === fig.docPageId) || matched[0] || (fig.docPageId ? { pageId: fig.docPageId, anchor: null } : null);
+      const targetItem = resolveStudioItemByPageId(primary?.pageId || fig.docPageId);
+      if (!targetItem) return;
+      state.archifySelectedNode = { nodeId, label: nodeLabel || nodeId, bindings: matched };
+      state.selectedUid = targetItem.uid;
+      state.selectedAnchor = primary?.anchor || null;
+      mountDocumentReader(rightCard, targetItem, {
+        anchorId: state.selectedAnchor,
+        archifyContext: state.archifySelectedNode,
+      });
+      if (state.fullscreenGraph) {
+        floatBar.replaceChildren();
+        floatBar.append(
+          el('span', `已选中图节点「${nodeLabel || nodeId}」，定位至：${targetItem.code || targetItem.title}${primary?.anchor ? ` #${primary.anchor}` : ''}（共 ${matched.length} 处关联）`),
+          (() => {
+            const openBtn = el('button', '展开右侧说明对照 →', 'st-btn st-btn-primary');
+            openBtn.type = 'button';
+            openBtn.style.height = '26px';
+            openBtn.addEventListener('click', () => {
+              state.fullscreenGraph = false;
+              split.classList.remove('is-fullscreen');
+              if (fsBtnRef) {
+                fsBtnRef.classList.remove('is-active');
+                fsBtnRef.textContent = '全屏展开';
+              }
+              floatBar.hidden = true;
+            });
+            return openBtn;
+          })(),
+        );
+        floatBar.hidden = false;
+      }
+    };
+
+    iframe.addEventListener('load', () => {
+      try {
+        const doc = iframe.contentDocument;
+        if (!doc) return;
+        doc.addEventListener('click', ev => {
+          const nodeEl = ev.target?.closest?.('[data-node-id]');
+          const outlineEl = ev.target?.closest?.('[data-outline-node]');
+          const nodeId = nodeEl?.getAttribute('data-node-id') || outlineEl?.getAttribute('data-outline-node');
+          if (!nodeId) return;
+          const label = nodeEl?.getAttribute('data-node-label') || outlineEl?.textContent?.trim() || nodeId;
+          bindArchifyNodeSelection(nodeId, label);
+        }, true);
+      } catch {}
+    });
+
+    stage.append(floatBar, iframe);
+    leftCard.append(stage);
   } else {
     const viewport = el('div', null, 'st-graph-viewport');
     viewport.id = 'st-graph-viewport';
@@ -591,7 +758,6 @@ function renderGraphPanel() {
     });
   }
 
-  const rightCard = el('aside', null, 'st-card st-graph-inspector');
   const activeItem = (state.snap.reviewItems || []).find(i => i.uid === state.selectedUid)
     || (state.snap.nodes || []).find(n => n.uid === state.selectedUid) || null;
   mountDocumentReader(rightCard, activeItem);
@@ -804,6 +970,8 @@ async function selectRepo(repoId) {
   state.repoId = repoId;
   state.graphMode = 'dag';
   state.archifyIdx = 0;
+  state.archifySelectedNode = null;
+  state.selectedAnchor = null;
   state.reviewCategory = 'all';
   const u = new URL(location.href);
   u.searchParams.set('repo', repoId);
@@ -832,6 +1000,8 @@ async function boot() {
     const nxt = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
     document.documentElement.dataset.theme = nxt;
     localStorage.setItem('st-theme', nxt);
+    const frame = document.querySelector('.st-archify-frame');
+    try { frame?.contentDocument?.documentElement?.setAttribute('data-theme', nxt); } catch {}
   });
   document.getElementById('st-help-btn').addEventListener('click', () => switchTab('guide'));
   document.getElementById('st-progress-capsule').addEventListener('click', openExportDrawer);

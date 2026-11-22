@@ -1,0 +1,14 @@
+{
+  "platformId": "claude",
+  "familyId": "skill-family-studio",
+  "version": "0.1.0",
+  "logicalMappings": [
+    {
+      "logicalName": "skill-family-studio",
+      "physicalName": "skill-family-studio",
+      "path": "skills/skill-family-studio/SKILL.md",
+      "entryType": "skill",
+      "userInvocable": true
+    }
+  ]
+}
