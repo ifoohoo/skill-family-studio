@@ -33,7 +33,7 @@ npx skill-family-studio snapshot --root /absolute/project/path
 
 - **Codex / Kimi Code / Qoder / CodeBuddy**：自动映射至 `.agents/skills/skill-family-studio/SKILL.md` 及对应 `.*-plugin/plugin.json`；
 - **Claude Code**：映射至 `.claude/skills/skill-family-studio/SKILL.md` 与 `.claude-plugin/plugin.json`；
-- **Antigravity**：提供符合官方六字段白名单的根级 `plugin.json`（及兼容 `.antigravity-plugin/plugin.json`），支持按宿主规范挂载至项目 `.agents/skills`、`.agent/skills` 或 `.gemini/config/{skills,plugins}`。
+- **Antigravity**：提供严格遵守官方十键白名单（`name` / `displayName` / `version` / `description` / `author` / `repository` 等）的根级 `plugin.json`，支持按宿主规范挂载至项目 `.agents/skills`、`.agent/skills` 或 `.gemini/config/{skills,plugins}`。
 
 详细操作动线与状态说明请参阅包内随附的 [USER-GUIDE.md](USER-GUIDE.md)。
 
