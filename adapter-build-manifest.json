@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "kind": "skill-family.adapter-build-manifest",
+  "hostId": "codex",
+  "pathCategory": {
+    "id": "codex-project-skills",
+    "scope": "project",
+    "anchor": "project-root",
+    "relPath": ".agents/skills"
+  },
+  "sourceClosure": {
+    "digest": "c57914ece5bd51ee35876df20bbd5d580c969526219c26271ef6d77c1c882c9c",
+    "members": [
+      {
+        "sourcePath": "skill-family-studio/SKILL.md",
+        "sha256": "f4433f33a259e4faa166cdc6008b76ce6d1d50b61945a551b243074f70c6d1c9",
+        "bytes": 4269
+      }
+    ]
+  },
+  "members": [
+    {
+      "sourcePath": "skill-family-studio/SKILL.md",
+      "target": ".agents/skills/skill-family-studio/SKILL.md",
+      "sha256": "f4433f33a259e4faa166cdc6008b76ce6d1d50b61945a551b243074f70c6d1c9",
+      "bytes": 4269
+    }
+  ],
+  "digest": "7404bb65cab5dcce89f6e0cbba6f535c6661cfed3c583f29516cc0fac2fd5a32"
+}

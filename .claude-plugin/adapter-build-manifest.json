@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "kind": "skill-family.adapter-build-manifest",
+  "hostId": "claude",
+  "pathCategory": {
+    "id": "claude-project-skills",
+    "scope": "project",
+    "anchor": "project-root",
+    "relPath": ".claude/skills"
+  },
+  "sourceClosure": {
+    "digest": "c57914ece5bd51ee35876df20bbd5d580c969526219c26271ef6d77c1c882c9c",
+    "members": [
+      {
+        "sourcePath": "skill-family-studio/SKILL.md",
+        "sha256": "f4433f33a259e4faa166cdc6008b76ce6d1d50b61945a551b243074f70c6d1c9",
+        "bytes": 4269
+      }
+    ]
+  },
+  "members": [
+    {
+      "sourcePath": "skill-family-studio/SKILL.md",
+      "target": ".claude/skills/skill-family-studio/SKILL.md",
+      "sha256": "f4433f33a259e4faa166cdc6008b76ce6d1d50b61945a551b243074f70c6d1c9",
+      "bytes": 4269
+    }
+  ],
+  "digest": "8994c0b1f9ae15f0e0d90659ced7496ec2c8e90707331d24cf97b6acfa08fbdc"
+}
