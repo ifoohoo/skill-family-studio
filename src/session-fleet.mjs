@@ -9,7 +9,7 @@ import { createInterface } from 'node:readline';
 import { sanitizePublicText } from './markdown-render.mjs';
 
 const SENSITIVE_PATH_RE = /(?:^|[\\/])(?:\.ssh|\.gnupg|\.aws|\.kube|\.docker|\.netrc|\.npmrc|\.pypirc|\.git-credentials|keychains|\.env(?:\.[^\\/]+)?)(?:$|[\\/])/i;
-const SECRET_TOKEN_RE = /(?:sk-[A-Za-z0-9]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|AIza[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{12,}|Bearer\s+[A-Za-z0-9._~+/=-]{12,})/g;
+const SECRET_TOKEN_RE = /(?:sk-(?:proj|ant|svcacct)-[A-Za-z0-9_-]{16,}|sk-(?=[A-Za-z0-9_-]*(?:\d|[A-Z]|_))[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9]{16,}|npm_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|AIza[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{12,}|Bearer\s+[A-Za-z0-9._~+/=-]{12,})/g;
 
 export function sanitizeFleetText(value) {
   return sanitizePublicText(String(value ?? '')).replace(SECRET_TOKEN_RE, '<REDACTED_TOKEN>');
@@ -84,6 +84,19 @@ export function parseAntigravityTranscript(rawLines, conversationId) {
   let userPrompt = '';
   let callerId = null;
   let workspaceHint = '';
+  const workspaceHints = new Set();
+
+  const addHintSegments = rawPath => {
+    const clean = String(rawPath || '').replace(/\\+/g, '/').replace(/["'`),.;:\]]+$/, '');
+    const parts = clean.split('/').map(s => s.trim()).filter(Boolean);
+    for (const seg of parts.slice(-3)) {
+      if (!/^(?:Volumes|Users|home|source|private|tmp|var)$/i.test(seg) && /^[A-Za-z0-9._-]+$/.test(seg)) {
+        workspaceHints.add(seg);
+      }
+    }
+    const tail = parts[parts.length - 1];
+    if (tail && /^[A-Za-z0-9._-]+$/.test(tail)) workspaceHint = tail;
+  };
 
   const pendingSubagentInvokes = [];
   const spawnedChildren = [];
@@ -106,9 +119,9 @@ export function parseAntigravityTranscript(rawLines, conversationId) {
     if (Number.isFinite(rec.output_tokens)) outputTokens += rec.output_tokens;
 
     const content = typeof rec.content === 'string' ? rec.content : '';
-    if (!workspaceHint && content) {
-      const wsMatch = /\/source\/([^/\s"'`]+)/.exec(content);
-      if (wsMatch) workspaceHint = wsMatch[1];
+    if (content) {
+      const wsMatches = content.matchAll(/\/source\/([^\s"'`<>]+)/g);
+      for (const m of wsMatches) addHintSegments(m[1]);
     }
 
     if (rec.type === 'USER_INPUT' && !userPrompt && content) {
@@ -184,7 +197,9 @@ export function parseAntigravityTranscript(rawLines, conversationId) {
               prompt: '',
             };
             const wsUris = Array.isArray(info.workspaceUris) ? info.workspaceUris.map(u => sanitizeFleetText(u)) : [];
-            if (!workspaceHint && wsUris[0]) workspaceHint = basename(decodeURIComponent(wsUris[0]));
+            if (wsUris[0]) {
+              try { addHintSegments(decodeURIComponent(wsUris[0])); } catch { addHintSegments(wsUris[0]); }
+            }
             spawnedChildren.push({
               childId: String(info.conversationId),
               seq: matchedInvoke.seq,
@@ -217,6 +232,7 @@ export function parseAntigravityTranscript(rawLines, conversationId) {
     tokens: { input: inputTokens, cacheRead: cacheReadTokens, output: outputTokens, total: totalTokens },
     callerId,
     workspaceHint,
+    workspaceHints: [...workspaceHints],
     duty: summarizeDutyFromPrompt(userPrompt, '协调会话'),
     prompt: userPrompt,
     spawnedChildren,
@@ -611,6 +627,7 @@ export function parseClaudeSessionJsonl(rawLines, sessionId, subagentLinesMap = 
   let startedAt = null;
   let updatedAt = null;
   let model = '';
+  let repoHint = '';
   let steps = 0;
   let inTok = 0, cacheTok = 0, outTok = 0;
   let duty = 'Claude Code 会话';
@@ -618,6 +635,7 @@ export function parseClaudeSessionJsonl(rawLines, sessionId, subagentLinesMap = 
   const delegations = [];
   const events = [];
   const agents = [];
+  const toolResults = new Map();
 
   for (const raw of lines) {
     let rec;
@@ -625,6 +643,7 @@ export function parseClaudeSessionJsonl(rawLines, sessionId, subagentLinesMap = 
     if (!rec || typeof rec !== 'object') continue;
     steps += 1;
     if (rec.timestamp) { if (!startedAt) startedAt = rec.timestamp; updatedAt = rec.timestamp; }
+    if (rec.cwd && !repoHint) repoHint = sanitizeFleetText(basename(String(rec.cwd)));
     const msg = rec.message && typeof rec.message === 'object' ? rec.message : null;
     if (msg?.model && !model) model = String(msg.model);
     if (msg?.usage) {
@@ -632,9 +651,21 @@ export function parseClaudeSessionJsonl(rawLines, sessionId, subagentLinesMap = 
       cacheTok += Number(msg.usage.cache_read_input_tokens || 0);
       outTok += Number(msg.usage.output_tokens || 0);
     }
-    if (rec.type === 'user' && !prompt && typeof msg?.content === 'string') {
-      prompt = sanitizeFleetText(msg.content.slice(0, 1200));
-      duty = summarizeDutyFromPrompt(prompt, duty);
+    if (rec.type === 'user' && !prompt) {
+      let rawUserText = '';
+      if (typeof msg?.content === 'string') {
+        rawUserText = msg.content;
+      } else if (Array.isArray(msg?.content)) {
+        rawUserText = msg.content
+          .filter(b => b && b.type === 'text' && typeof b.text === 'string')
+          .map(b => b.text)
+          .join('\n');
+      }
+      const cleanedUserText = rawUserText.trim();
+      if (cleanedUserText) {
+        prompt = sanitizeFleetText(cleanedUserText.slice(0, 1200));
+        duty = summarizeDutyFromPrompt(prompt, duty);
+      }
     }
     for (const blk of Array.isArray(msg?.content) ? msg.content : []) {
       if (blk?.type === 'tool_use' && (blk.name === 'Agent' || blk.name === 'Task')) {
@@ -666,6 +697,15 @@ export function parseClaudeSessionJsonl(rawLines, sessionId, subagentLinesMap = 
           body: subPrompt.slice(0, 4000),
           note: '来自 Claude Code 会话日志中的 Agent/Task 委派记录。',
         });
+      } else if (blk?.type === 'tool_result' && blk.tool_use_id) {
+        const resRaw = typeof blk.content === 'string'
+          ? blk.content
+          : (Array.isArray(blk.content) ? blk.content.map(c => c?.text || '').join('\n') : '');
+        const cleanRes = sanitizeFleetText(resRaw.trim());
+        toolResults.set(sanitizeFleetText(blk.tool_use_id), {
+          time: rec.timestamp || updatedAt,
+          summary: cleanRes.slice(0, 4000),
+        });
       }
     }
   }
@@ -693,7 +733,7 @@ export function parseClaudeSessionJsonl(rawLines, sessionId, subagentLinesMap = 
 
   let idx = 1;
   for (const [subName, subRaw] of subagentLinesMap.entries()) {
-    let sSteps = 0, sIn = 0, sOut = 0, sModel = model, sStart = null, sEnd = null;
+    let sSteps = 0, sIn = 0, sOut = 0, sModel = model, sStart = null, sEnd = null, sPrompt = '';
     for (const raw of subRaw) {
       let rec;
       try { rec = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { continue; }
@@ -701,16 +741,23 @@ export function parseClaudeSessionJsonl(rawLines, sessionId, subagentLinesMap = 
       if (rec.timestamp) { if (!sStart) sStart = rec.timestamp; sEnd = rec.timestamp; }
       if (rec.message?.model && !sModel) sModel = rec.message.model;
       if (rec.message?.usage) { sIn += Number(rec.message.usage.input_tokens || 0); sOut += Number(rec.message.usage.output_tokens || 0); }
+      if (rec.type === 'user' && !sPrompt) {
+        const mc = rec.message?.content;
+        const txt = typeof mc === 'string' ? mc : (Array.isArray(mc) ? mc.filter(b => b?.type === 'text').map(b => b.text).join('\n') : '');
+        if (txt.trim()) sPrompt = sanitizeFleetText(txt.trim().slice(0, 1200));
+      }
     }
     const delMatch = delegations[idx - 1];
     const subId = delMatch?.to || subName;
+    const label = delMatch?.label || (sPrompt ? summarizeDutyFromPrompt(sPrompt, `子体 ${subName}`) : `子体 ${subName}`);
+    const isRev = /审阅|复核|review|audit/i.test(label);
     agents.push({
       id: subId,
       parentId: sessionId,
       depth: 1,
-      name: delMatch?.label || `子体 ${subName}`,
-      role: 'subagent',
-      roleShort: inferRoleBadge(delMatch?.label || subName, false, false),
+      name: label,
+      role: isRev ? 'reviewer' : 'subagent',
+      roleShort: inferRoleBadge(label, false, isRev),
       hueIndex: idx % 8,
       model: sanitizeFleetText(sModel || 'claude'),
       status: 'completed',
@@ -720,11 +767,82 @@ export function parseClaudeSessionJsonl(rawLines, sessionId, subagentLinesMap = 
       steps: sSteps,
       tokens: { input: sIn, cacheRead: 0, output: sOut, total: sIn + sOut },
       loadPercent: 0,
-      duty: delMatch?.label || subName,
-      prompt: delMatch?.prompt || '',
+      duty: label,
+      prompt: delMatch?.prompt || sPrompt,
       executionMode: 'Claude 子智能体',
     });
+    if (!delMatch) {
+      delegations.push({
+        id: `cl-del-${subId}`,
+        seq: idx,
+        time: sStart || startedAt,
+        from: sessionId,
+        to: subId,
+        label,
+        mode: 'subagent',
+        status: 'completed',
+        prompt: sPrompt.slice(0, 4000),
+      });
+      events.push({
+        id: `cl-ev-${subId}`,
+        seq: idx,
+        time: sStart || startedAt,
+        kind: 'delegation',
+        kindLabel: '子会话委派',
+        from: sessionId,
+        to: subId,
+        duty: label,
+        executionMode: 'Claude 子智能体',
+        summary: label,
+        body: sPrompt.slice(0, 4000),
+        note: '来自 Claude Code subagents 子日志归并。',
+      });
+    }
     idx += 1;
+  }
+
+  for (const del of delegations) {
+    if (!agents.some(a => a.id === del.to)) {
+      const tr = toolResults.get(del.to);
+      const isRev = /审阅|复核|review|audit/i.test(del.label || '');
+      agents.push({
+        id: del.to,
+        parentId: sessionId,
+        depth: 1,
+        name: del.label || `子体 ${del.to}`,
+        role: isRev ? 'reviewer' : 'subagent',
+        roleShort: inferRoleBadge(del.label || del.to, false, isRev),
+        hueIndex: agents.length % 8,
+        model: sanitizeFleetText(model || 'claude'),
+        status: 'completed',
+        startedAt: del.time || startedAt,
+        updatedAt: tr?.time || del.time || updatedAt,
+        durationMs: del.time && tr?.time ? Math.max(0, Date.parse(tr.time) - Date.parse(del.time)) : 0,
+        steps: tr ? 2 : 1,
+        tokens: { input: 0, cacheRead: 0, output: 0, total: 0 },
+        loadPercent: 0,
+        duty: del.label || del.to,
+        prompt: del.prompt || '',
+        executionMode: 'Claude 子智能体',
+      });
+    }
+    const tr = toolResults.get(del.to);
+    if (tr?.summary) {
+      events.push({
+        id: `cl-ev-res-${del.to}`,
+        seq: del.seq + 1,
+        time: tr.time || del.time || updatedAt,
+        kind: 'report',
+        kindLabel: '完成回报',
+        from: del.to,
+        to: sessionId,
+        duty: del.label,
+        executionMode: 'Claude 子智能体',
+        summary: tr.summary.split(/\r?\n/)[0].slice(0, 120),
+        body: tr.summary,
+        note: '来自 Claude Code 会话日志中的 tool_result 回传结果。',
+      });
+    }
   }
 
   const totalTokens = agents.reduce((s, a) => s + a.tokens.total, 0);
@@ -733,7 +851,7 @@ export function parseClaudeSessionJsonl(rawLines, sessionId, subagentLinesMap = 
     id: `cl:${sessionId}`,
     host: 'claude',
     title: duty,
-    repoHint: '',
+    repoHint,
     startedAt,
     updatedAt,
     summary: {
@@ -753,6 +871,8 @@ export function parseCodexSessionJsonl(rawLines, fileId) {
   const lines = Array.isArray(rawLines) ? rawLines : String(rawLines ?? '').split(/\r?\n/).filter(Boolean);
   let id = fileId;
   let parentId = null;
+  let agentNickname = '';
+  let agentPath = '';
   let cwd = '';
   let startedAt = null;
   let updatedAt = null;
@@ -771,7 +891,10 @@ export function parseCodexSessionJsonl(rawLines, fileId) {
     if (rec.type === 'session_meta' && rec.payload) {
       if (rec.payload.id) id = String(rec.payload.id);
       if (rec.payload.cwd) cwd = sanitizeFleetText(rec.payload.cwd);
-      parentId = rec.payload.parent_thread_id || rec.payload.forked_from_id || null;
+      const sp = rec.payload.source?.subagent?.thread_spawn;
+      parentId = rec.payload.parent_thread_id || rec.payload.forked_from_id || sp?.parent_thread_id || null;
+      if (sp?.agent_nickname) agentNickname = sanitizeFleetText(sp.agent_nickname);
+      if (sp?.agent_path) agentPath = sanitizeFleetText(basename(String(sp.agent_path)));
       if (rec.payload.model) model = sanitizeFleetText(rec.payload.model);
     } else if (rec.type === 'event_msg' && rec.payload?.type === 'token_count') {
       const info = rec.payload.info?.total_token_usage;
@@ -786,16 +909,19 @@ export function parseCodexSessionJsonl(rawLines, fileId) {
       }
     }
   }
+  const tagFallback = [agentNickname, agentPath].filter(Boolean).join(' · ') || `Codex 会话 ${String(id).slice(0, 8)}`;
   return {
     id: String(id),
     parentId: parentId ? String(parentId) : null,
+    agentNickname,
+    agentPath,
     workspaceHint: cwd ? basename(cwd) : '',
     startedAt,
     updatedAt,
     durationMs: startedAt && updatedAt ? Math.max(0, Date.parse(updatedAt) - Date.parse(startedAt)) : 0,
     steps,
     model,
-    duty: summarizeDutyFromPrompt(prompt, `Codex 会话 ${String(id).slice(0, 8)}`),
+    duty: agentPath || summarizeDutyFromPrompt(prompt, tagFallback),
     prompt,
     totalTokens,
     spawned,
@@ -856,16 +982,20 @@ export async function collectSessionFleet({
       if (childIds.has(p.id)) continue;
       if (p.spawnedChildren.length === 0 && p.steps < 3) continue;
       const fam = buildFamilyFromParsedSessions(p, byId);
-      fam.repoMatched = Boolean(p.workspaceHint && repoNames.has(p.workspaceHint));
+      const hintCandidates = new Set([p.workspaceHint, ...(p.workspaceHints || []), fam.repoHint].filter(Boolean));
+      const matchedName = [...repoNames].find(rn => hintCandidates.has(rn) || [...hintCandidates].some(h => h.includes(rn)));
+      if (matchedName && (!fam.repoHint || !repoNames.has(fam.repoHint))) fam.repoHint = matchedName;
+      fam.repoMatched = Boolean(matchedName);
       families.push(fam);
     }
   } catch {}
 
   // 2. 扫描 Claude Code 项目会话与 subagents 目录（有界只读）
   try {
+    const repoNames = new Set([basename(root), ...(catalog?.repos || []).map(r => r.name)].filter(Boolean));
     const projDirs = await readdir(claudeDir, { withFileTypes: true });
     const candFiles = [];
-    for (const pd of projDirs.slice(0, 12)) {
+    for (const pd of projDirs.slice(0, 60)) {
       if (!pd.isDirectory()) continue;
       const pAbs = join(claudeDir, pd.name);
       let files = [];
@@ -874,12 +1004,16 @@ export async function collectSessionFleet({
         if (!f.isFile() || !f.name.endsWith('.jsonl')) continue;
         try {
           const st = await lstat(join(pAbs, f.name));
-          if (st.isFile() && !st.isSymbolicLink()) candFiles.push({ proj: pd.name, id: basename(f.name, '.jsonl'), abs: join(pAbs, f.name), dir: join(pAbs, basename(f.name, '.jsonl'), 'subagents'), mtimeMs: st.mtimeMs });
+          if (!st.isFile() || st.isSymbolicLink()) continue;
+          const subDir = join(pAbs, basename(f.name, '.jsonl'), 'subagents');
+          let hasSub = false;
+          try { hasSub = (await lstat(subDir)).isDirectory(); } catch {}
+          candFiles.push({ proj: pd.name, id: basename(f.name, '.jsonl'), abs: join(pAbs, f.name), dir: subDir, hasSub, mtimeMs: st.mtimeMs });
         } catch {}
       }
     }
-    candFiles.sort((a, b) => b.mtimeMs - a.mtimeMs);
-    for (const cf of candFiles.slice(0, 6)) {
+    candFiles.sort((a, b) => (a.hasSub !== b.hasSub ? (a.hasSub ? -1 : 1) : b.mtimeMs - a.mtimeMs));
+    for (const cf of candFiles.slice(0, 16)) {
       const lines = await readJsonlLinesBounded(cf.abs, 1_000_000, 800);
       const subMap = new Map();
       try {
@@ -892,15 +1026,23 @@ export async function collectSessionFleet({
       } catch {}
       sourcesScanned.claude += 1;
       const fam = parseClaudeSessionJsonl(lines, cf.id, subMap);
+      const matchedName = [...repoNames].find(rn => fam.repoHint === rn || cf.proj.endsWith(rn.replace(/[/.]/g, '-')) || cf.proj.includes(rn));
+      if (matchedName) {
+        if (!fam.repoHint) fam.repoHint = matchedName;
+        fam.repoMatched = true;
+      } else {
+        fam.repoMatched = false;
+      }
       if (fam.agents.length > 1 || fam.delegations.length > 0) families.push(fam);
     }
   } catch {}
 
   // 3. 扫描 Codex 最近会话日志并关联 parent_thread_id / spawned（有界只读）
   try {
+    const repoNames = new Set([basename(root), ...(catalog?.repos || []).map(r => r.name)].filter(Boolean));
     const codexFiles = [];
     const walkCodex = async (dir, depth = 0) => {
-      if (depth > 3 || codexFiles.length >= 24) return;
+      if (depth > 3 || codexFiles.length >= 48) return;
       let ents = [];
       try { ents = await readdir(dir, { withFileTypes: true }); } catch { return; }
       ents.sort((a, b) => b.name.localeCompare(a.name));
@@ -917,8 +1059,9 @@ export async function collectSessionFleet({
     };
     await walkCodex(codexDir);
     codexFiles.sort((a, b) => b.mtimeMs - a.mtimeMs);
-    const parsedCodex = await Promise.all(codexFiles.slice(0, 10).map(async f => parseCodexSessionJsonl(await readJsonlLinesBounded(f.abs, 800_000, 500), basename(f.abs, '.jsonl'))));
+    const parsedCodex = await Promise.all(codexFiles.slice(0, 30).map(async f => parseCodexSessionJsonl(await readJsonlLinesBounded(f.abs, 800_000, 400), basename(f.abs, '.jsonl'))));
     sourcesScanned.codex = parsedCodex.length;
+    const codexById = new Map(parsedCodex.map(c => [c.id, c]));
     const codexChildren = new Map();
     for (const c of parsedCodex) {
       if (c.parentId) {
@@ -926,34 +1069,77 @@ export async function collectSessionFleet({
         codexChildren.get(c.parentId).push(c);
       }
     }
-    for (const rootC of parsedCodex) {
-      const kids = codexChildren.get(rootC.id) || [];
-      if (rootC.parentId || (kids.length === 0 && rootC.spawned.length === 0)) continue;
+    const buildCodexFamily = (rootInfo, kids) => {
       const agents = [{
-        id: rootC.id, parentId: null, depth: 0, name: rootC.duty, role: 'coordinator', roleShort: '主控',
-        hueIndex: 0, model: rootC.model, status: 'completed', startedAt: rootC.startedAt, updatedAt: rootC.updatedAt,
-        durationMs: rootC.durationMs, steps: rootC.steps, tokens: { input: 0, cacheRead: 0, output: 0, total: rootC.totalTokens },
-        loadPercent: 0, duty: rootC.duty, prompt: rootC.prompt, executionMode: 'Codex 主线程',
+        id: rootInfo.id, parentId: null, depth: 0, name: rootInfo.duty, role: 'coordinator', roleShort: '主控',
+        hueIndex: 0, model: rootInfo.model || 'codex', status: 'completed', startedAt: rootInfo.startedAt, updatedAt: rootInfo.updatedAt,
+        durationMs: rootInfo.durationMs || 0, steps: rootInfo.steps || 0, tokens: { input: 0, cacheRead: 0, output: 0, total: rootInfo.totalTokens || 0 },
+        loadPercent: 0, duty: rootInfo.duty, prompt: rootInfo.prompt || '', executionMode: 'Codex 主线程',
       }];
       const delegations = [];
       const events = [];
       kids.forEach((k, i) => {
+        const kName = k.agentNickname ? `${k.agentNickname} · ${k.duty}` : k.duty;
         agents.push({
-          id: k.id, parentId: rootC.id, depth: 1, name: k.duty, role: 'subagent', roleShort: inferRoleBadge(k.duty, false, false),
+          id: k.id, parentId: rootInfo.id, depth: 1, name: kName, role: 'subagent', roleShort: inferRoleBadge(kName, false, /review|audit|审阅|复核/i.test(kName)),
           hueIndex: (i + 1) % 8, model: k.model, status: 'completed', startedAt: k.startedAt, updatedAt: k.updatedAt,
           durationMs: k.durationMs, steps: k.steps, tokens: { input: 0, cacheRead: 0, output: 0, total: k.totalTokens },
-          loadPercent: 0, duty: k.duty, prompt: k.prompt, executionMode: 'Codex 派生线程',
+          loadPercent: 0, duty: kName, prompt: k.prompt, executionMode: 'Codex 派生线程',
         });
-        delegations.push({ id: `cx-del-${k.id}`, seq: i + 1, time: k.startedAt, from: rootC.id, to: k.id, label: k.duty, mode: 'subagent', status: 'completed', prompt: k.prompt });
-        events.push({ id: `cx-ev-${k.id}`, seq: i + 1, time: k.startedAt, kind: 'delegation', kindLabel: '子会话委派', from: rootC.id, to: k.id, duty: k.duty, executionMode: 'Codex 派生线程', summary: k.duty, body: k.prompt, note: '来自 Codex 会话 parent_thread_id 树归并。' });
+        delegations.push({ id: `cx-del-${k.id}`, seq: i + 1, time: k.startedAt, from: rootInfo.id, to: k.id, label: kName, mode: 'subagent', status: 'completed', prompt: k.prompt });
+        events.push({ id: `cx-ev-${k.id}`, seq: i + 1, time: k.startedAt, kind: 'delegation', kindLabel: '子会话委派', from: rootInfo.id, to: k.id, duty: kName, executionMode: 'Codex 派生线程', summary: kName, body: k.prompt, note: '来自 Codex 会话 thread_spawn / parent_thread_id 树归并。' });
       });
+      if (kids.length === 0 && (rootInfo.spawned || []).length > 0) {
+        rootInfo.spawned.forEach((sp, i) => {
+          const spId = `${rootInfo.id}-spawn-${i + 1}`;
+          let spLabel = `Codex 派生子线程 #${i + 1}`;
+          try {
+            const parsedArgs = JSON.parse(sp.rawArgs || '{}');
+            if (parsedArgs.message || parsedArgs.prompt) spLabel = summarizeDutyFromPrompt(parsedArgs.message || parsedArgs.prompt, spLabel);
+          } catch {}
+          agents.push({
+            id: spId, parentId: rootInfo.id, depth: 1, name: spLabel, role: 'subagent', roleShort: inferRoleBadge(spLabel, false, false),
+            hueIndex: (i + 1) % 8, model: rootInfo.model || 'codex', status: 'completed', startedAt: sp.time || rootInfo.startedAt, updatedAt: sp.time || rootInfo.updatedAt,
+            durationMs: 0, steps: 1, tokens: { input: 0, cacheRead: 0, output: 0, total: 0 },
+            loadPercent: 0, duty: spLabel, prompt: sp.rawArgs, executionMode: 'Codex 派生线程',
+          });
+          delegations.push({ id: `cx-del-sp-${i + 1}`, seq: sp.seq, time: sp.time, from: rootInfo.id, to: spId, label: spLabel, mode: 'subagent', status: 'completed', prompt: sp.rawArgs });
+          events.push({ id: `cx-ev-sp-${i + 1}`, seq: sp.seq, time: sp.time, kind: 'delegation', kindLabel: '子会话委派', from: rootInfo.id, to: spId, duty: spLabel, executionMode: 'Codex 派生线程', summary: spLabel, body: sp.rawArgs, note: '来自 Codex 会话 spawn_agent 工具调用。' });
+        });
+      }
       const sumTok = agents.reduce((s, a) => s + a.tokens.total, 0);
       for (const a of agents) a.loadPercent = sumTok > 0 ? Number(((a.tokens.total / sumTok) * 100).toFixed(1)) : 0;
+      const hint = rootInfo.workspaceHint || kids[0]?.workspaceHint || '';
       families.push({
-        id: `cx:${rootC.id}`, host: 'codex', title: rootC.duty, repoHint: rootC.workspaceHint, startedAt: rootC.startedAt, updatedAt: rootC.updatedAt,
+        id: `cx:${rootInfo.id}`, host: 'codex', title: rootInfo.duty, repoHint: hint,
+        repoMatched: Boolean(hint && repoNames.has(hint)),
+        startedAt: rootInfo.startedAt, updatedAt: rootInfo.updatedAt,
         summary: { totalAgents: agents.length, runningAgents: 0, totalDelegations: delegations.length, totalMessages: events.length, totalTokens: sumTok },
         agents, delegations, events,
       });
+    };
+    const builtCodexRoots = new Set();
+    for (const rootC of parsedCodex) {
+      const kids = codexChildren.get(rootC.id) || [];
+      if (rootC.parentId || (kids.length === 0 && rootC.spawned.length === 0)) continue;
+      builtCodexRoots.add(rootC.id);
+      buildCodexFamily(rootC, kids);
+    }
+    for (const [parentId, kids] of codexChildren.entries()) {
+      if (builtCodexRoots.has(parentId) || codexById.has(parentId) || kids.length === 0) continue;
+      const sortedKids = [...kids].sort((a, b) => Date.parse(a.startedAt || 0) - Date.parse(b.startedAt || 0));
+      const latestKid = sortedKids[sortedKids.length - 1];
+      buildCodexFamily({
+        id: parentId,
+        duty: `Codex 编队主线程 · ${kids[0].workspaceHint || parentId.slice(0, 8)}`,
+        workspaceHint: kids.find(k => k.workspaceHint)?.workspaceHint || '',
+        model: sortedKids[0].model || 'codex',
+        startedAt: sortedKids[0].startedAt,
+        updatedAt: latestKid.updatedAt || latestKid.startedAt,
+        steps: sortedKids.length,
+        totalTokens: 0,
+        spawned: [],
+      }, sortedKids);
     }
   } catch {}
 
@@ -989,21 +1175,55 @@ export async function collectSessionFleet({
     }
   } catch {}
 
-  // 若真实机器尚未扫描出任何编队，仍保留可预览状态标记
-  families.sort((a, b) => {
+  // 多智能体协作编队优先，跨宿主保底配额防止单宿主单会话挤出其他宿主（Codex / Claude）编队
+  const isMultiAgent = f => (f.agents?.length || 0) > 1 || (f.delegations?.length || 0) > 0;
+  const compareFamily = (a, b) => {
     if (a.host === 'sandbox' && b.host !== 'sandbox') return -1;
     if (b.host === 'sandbox' && a.host !== 'sandbox') return 1;
+    const am = isMultiAgent(a), bm = isMultiAgent(b);
+    if (am !== bm) return am ? -1 : 1;
     if (Boolean(a.repoMatched) !== Boolean(b.repoMatched)) return a.repoMatched ? -1 : 1;
     return Date.parse(b.updatedAt || 0) - Date.parse(a.updatedAt || 0);
-  });
+  };
+  families.sort(compareFamily);
+
+  const MAX_RETURNED = 16;
+  const PER_HOST_RESERVE = 4;
+  const selected = [];
+  const pickedIds = new Set();
+  const pushFam = fam => {
+    if (!fam || pickedIds.has(fam.id) || selected.length >= MAX_RETURNED) return;
+    pickedIds.add(fam.id);
+    selected.push(fam);
+  };
+
+  for (const fam of families) {
+    if (fam.host === 'sandbox') pushFam(fam);
+  }
+  const hostCounts = new Map();
+  for (const hostName of ['claude', 'codex', 'antigravity', 'local']) {
+    for (const fam of families) {
+      if (fam.host !== hostName) continue;
+      const cur = hostCounts.get(hostName) || 0;
+      if (cur >= PER_HOST_RESERVE) break;
+      pushFam(fam);
+      hostCounts.set(hostName, cur + 1);
+    }
+  }
+  for (const fam of families) {
+    if (selected.length >= MAX_RETURNED) break;
+    pushFam(fam);
+  }
+  selected.sort(compareFamily);
 
   const result = {
     schemaVersion: 1,
     ok: true,
     generatedAt: new Date().toISOString(),
     sourcesScanned,
-    familiesCount: families.length,
-    families: families.slice(0, 12),
+    totalDiscoveredFamilies: families.length,
+    familiesCount: selected.length,
+    families: selected,
   };
   if (!sandboxActive) fleetCache = { key: cacheKey, at: Date.now(), result };
   return result;

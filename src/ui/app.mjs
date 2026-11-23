@@ -7,7 +7,7 @@
 import { computeAdaptiveGraphLayout, pickDefaultArtifactNode } from '../graph-layout.mjs';
 import { buildReviewStatusFlowSvg, buildTriLayerLockSvg } from './diagram-svg.mjs';
 import { mountFleetMonitor } from './fleet-ui.mjs';
-import { closeGlobalTooltip, infoTrigger, initTooltipManager, isTooltipOpen } from './tooltips.mjs';
+import { closeGlobalTooltip, GLOSSARY, infoTrigger, initTooltipManager, isTooltipOpen } from './tooltips.mjs';
 
 const STATUS_META = {
   pending: { label: '待审阅', badge: 'st-badge st-badge-zinc', dot: '⚪', color: '#64748b' },
@@ -383,6 +383,10 @@ function resolveCompanionItem(item) {
     const hit = list.find(x => x.uid === item.pairedUid);
     if (hit) return hit;
   }
+  if (item.pairedPath) {
+    const byPath = list.find(x => x.path === item.pairedPath);
+    if (byPath) return byPath;
+  }
   return null;
 }
 
@@ -448,6 +452,9 @@ async function mountDocumentReader(container, item, options = {}) {
       jumpBtn.addEventListener('click', () => {
         state.selectedUid = companion.uid;
         state.selectedAnchor = null;
+        if (state.reviewCategory !== 'all' && companion.category && state.reviewCategory !== companion.category) {
+          state.reviewCategory = 'all';
+        }
         renderActiveTab();
       });
       pairLeft.append(jumpBtn);
@@ -1405,7 +1412,7 @@ function renderAlignmentOverview(host) {
           const issLine = el('div', null, 'st-graph-controls');
           issLine.style.marginTop = '4px';
           issLine.append(el('span', `${iss.code}：${iss.message}`, 'st-muted-xs'));
-          if (['UNALLOCATED_ACTIVE_DEMAND', 'UPSTREAM_DESIGN_CHANGED', 'DOWNSTREAM_DESIGN_EVOLVED', 'UNRECIPROCATED_ALLOCATION', 'TARGET_MISSING'].includes(iss.code)) {
+          if (GLOSSARY[`err:${iss.code}`]) {
             issLine.append(infoTrigger(`err:${iss.code}`, document));
           }
           tdHealth.append(issLine);
@@ -1459,7 +1466,8 @@ function renderAlignmentOverview(host) {
       tdHealth.append(el('span', b.health?.label || '已绑定', `st-badge st-badge-${b.health?.tone || 'zinc'}`));
       for (const iss of b.issues || []) {
         const row = el('div', null, 'st-graph-controls');
-        row.append(el('span', `${iss.code}：${iss.message}`, 'st-muted-xs'), infoTrigger(`err:${iss.code}`, document));
+        row.append(el('span', `${iss.code}：${iss.message}`, 'st-muted-xs'));
+        if (GLOSSARY[`err:${iss.code}`]) row.append(infoTrigger(`err:${iss.code}`, document));
         tdHealth.append(row);
       }
       tr.append(tdLocal, tdUp, tdHealth);

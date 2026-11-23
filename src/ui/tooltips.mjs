@@ -81,6 +81,7 @@ export const GLOSSARY = Object.freeze({
   'err:DOWNSTREAM_DESIGN_EVOLVED': { title: '🟠 DOWNSTREAM_DESIGN_EVOLVED', meaning: '子仓详设已经演进修改，高阶 portfolio-allocations.json 中的 targetDigest 仍停在旧版。' },
   'err:UNRECIPROCATED_ALLOCATION': { title: '🔴 UNRECIPROCATED_ALLOCATION', meaning: '高阶仓单方面宣称拆给某子仓，但子仓缺少对应的 upstream-bindings.json 回指确认。' },
   'err:TARGET_MISSING': { title: '🔴 TARGET_MISSING', meaning: '高阶清单登记的下游仓库或目标详设文件路径已不存在，可能已被移动或删除。' },
+  'err:SOURCE_ARTIFACT_MISSING': { title: '🔴 SOURCE_ARTIFACT_MISSING', meaning: '高阶清单引用的需求或故事源文件（sourcePath）在仓库磁盘上已不存在，请核对文件是否被重命名、移动或删除。' },
   'err:UNCLAIMED_IMPLEMENTATION_ENTRY': { title: '🟠 UNCLAIMED_IMPLEMENTATION_ENTRY', meaning: '单仓匹配 implementationSurface.entryGlobs 的核心源码或 SKILL.md 入口文件，尚未在版本锁中被任何 @feature/@scenario 认领。' },
   'lockCard:implements': { title: '代码实现锁 (implements)', meaning: '统计源码/技能入口文件通过 @feature/@scenario 注解并与版本锁绑定的一致条数。' },
   'lockCard:verifies': { title: '测试验证锁 (verifies)', meaning: '统计自动化测试文件通过追溯注解绑定需求/特性/场景的新鲜锁条数。' },

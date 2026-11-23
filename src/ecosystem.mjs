@@ -895,26 +895,124 @@ export async function inspectProjectRepo(record, emptyScanDir) {
   }
 
   const designGraphNodes = graphNodes.filter(n => n.isDesignNode);
-  const allReviewItems = sortItemsForGuidedReview([
+  const allReviewItems = [
     ...(designGraphNodes.length ? designGraphNodes : graphNodes),
     ...colResult.extraItems,
-  ]);
+  ];
 
-  // 自动配对同源 Markdown 文稿与 JSON/YAML 数据契约，支持正文顶栏一键互跳
+  // 自动配对同源 Markdown 文稿与 JSON/YAML 数据契约，支持正文顶栏一键互跳；图谱未收录时安全受控探测磁盘派生人读文稿
+  const companionPaths = new Set();
   const humanItems = allReviewItems.filter(i => !i.isMachineContract && i.path);
   const contractItems = allReviewItems.filter(i => i.isMachineContract && i.path);
+  const GENERIC_CONTRACT_STEMS = new Set(['source', 'original', 'story-source.candidate', 'index', 'readme', 'coverage', 'reading']);
   const stemOf = p => basename(String(p || ''), extname(String(p || ''))).toLowerCase();
+  const normCodeToken = v => {
+    const m = /(REQ-\d+|DM-\d+|US-[A-Z]+-\d+|SPEC-[A-Z0-9-]+|LC-\d+)/i.exec(String(v || ''));
+    return m ? m[1].toLowerCase() : '';
+  };
   const findCompanion = (srcItem, candidates) => {
     const srcStem = stemOf(srcItem.path);
     const srcDir = dirname(String(srcItem.path || ''));
     const srcCode = String(srcItem.code || '').toLowerCase();
+    const srcToken = normCodeToken(srcItem.code || srcStem);
     return candidates.find(c => dirname(String(c.path || '')) === srcDir && stemOf(c.path) === srcStem)
-      || candidates.find(c => stemOf(c.path) === srcStem && srcStem.length >= 2)
+      || (!GENERIC_CONTRACT_STEMS.has(srcStem) && srcStem.length >= 2
+        ? candidates.find(c => stemOf(c.path) === srcStem)
+        : null)
       || (srcCode ? candidates.find(c => String(c.code || '').toLowerCase() === srcCode) : null)
+      || (srcToken ? candidates.find(c => normCodeToken(c.code || c.path) === srcToken) : null)
       || null;
   };
+  const extractMdTitle = (rawMd, fallbackTitle) => {
+    const text = String(rawMd || '').replace(/\r\n/g, '\n');
+    const fm = /^---\n([\s\S]*?)\n---/.exec(text);
+    if (fm) {
+      try {
+        const meta = parseYaml(fm[1]);
+        if (meta && typeof meta.title === 'string' && meta.title.trim()) return meta.title.trim();
+      } catch {}
+    }
+    const h1 = /^#\s+(.+)$/m.exec(text);
+    return h1 ? h1[1].trim() : fallbackTitle;
+  };
+  const buildDiskCompanionCandidates = cItem => {
+    const cleanP = String(cItem.path || '').replace(/\\/g, '/').replace(/^\.\//, '');
+    const relDir = dirname(cleanP);
+    const dirPrefix = relDir === '.' ? '' : `${relDir}/`;
+    const stem = basename(cleanP, extname(cleanP));
+    const baseLower = basename(cleanP).toLowerCase();
+    const out = [];
+    out.push(`${dirPrefix}${stem}.md`);
+    if (GENERIC_CONTRACT_STEMS.has(stem.toLowerCase()) || baseLower === 'story-source.candidate.json') {
+      for (const name of ['article.md', 'article.edited.md', 'article.candidate.md', 'README.md', 'index.md']) {
+        out.push(`${dirPrefix}${name}`);
+      }
+      if (relDir !== '.') {
+        const parentDir = dirname(relDir);
+        const parentPrefix = parentDir === '.' ? '' : `${parentDir}/`;
+        out.push(`${parentPrefix}${basename(relDir)}.md`);
+        if (cItem.code && !/[\\/]/.test(cItem.code)) out.push(`${parentPrefix}${cItem.code}.md`);
+      }
+    }
+    const tok = normCodeToken(cItem.code || stem);
+    if (tok) {
+      const upper = tok.toUpperCase();
+      if (relDir !== '.') {
+        const parentDir = dirname(relDir);
+        const parentPrefix = parentDir === '.' ? '' : `${parentDir}/`;
+        out.push(`${parentPrefix}${upper}.md`);
+      }
+      out.push(`artifacts/requirements/${upper}.md`, `artifacts/domain-models/${upper}.md`);
+    }
+    return [...new Set(out)].filter(p => p && !p.startsWith('/') && !p.split('/').includes('..') && p.endsWith('.md'));
+  };
+
   for (const cItem of contractItems) {
-    const peer = findCompanion(cItem, humanItems);
+    let peer = findCompanion(cItem, humanItems);
+    if (!peer) {
+      for (const candRel of buildDiskCompanionCandidates(cItem)) {
+        const existingHuman = humanItems.find(h => h.path === candRel);
+        if (existingHuman) {
+          peer = existingHuman;
+          break;
+        }
+        try {
+          const candAbs = await resolveContained(record.realPath, candRel);
+          const st = await lstat(candAbs);
+          if (!st.isFile() || st.isSymbolicLink()) continue;
+          const mdRaw = await readFileContained(record.realPath, candRel, { encoding: 'utf8' });
+          const mdTitle = extractMdTitle(mdRaw, `${cItem.code || basename(candRel, '.md')} 人读说明`);
+          const safeUid = `companion:${cItem.type}:${candRel.replace(/[^A-Za-z0-9_.:/#-]+/g, '_')}`;
+          const peerItem = {
+            uid: safeUid,
+            target: safeUid,
+            type: cItem.type,
+            typeLabel: `${cItem.typeLabel || TYPE_LABELS[cItem.type] || cItem.type} · 人读文稿`,
+            category: classifyReviewCategory(cItem.type, cItem.layer, false),
+            layer: cItem.layer,
+            layerOrder: cItem.layerOrder,
+            layerLabel: cItem.layerLabel,
+            code: cItem.code || basename(candRel, '.md'),
+            title: sanitizePublicText(mdTitle),
+            path: candRel,
+            line: 1,
+            status: cItem.status ?? null,
+            isDesignNode: true,
+            isMachineContract: false,
+            isCompanionDoc: true,
+            fileFormat: 'markdown',
+            formatLabel: 'Markdown 阅读稿',
+            inDegree: 0,
+            outDegree: 0,
+          };
+          humanItems.push(peerItem);
+          allReviewItems.push(peerItem);
+          companionPaths.add(candRel);
+          peer = peerItem;
+          break;
+        } catch {}
+      }
+    }
     if (peer) {
       cItem.pairedUid = peer.uid;
       cItem.pairedPath = peer.path;
@@ -928,9 +1026,10 @@ export async function inspectProjectRepo(record, emptyScanDir) {
       }
     }
   }
+  const sortedReviewItems = sortItemsForGuidedReview(allReviewItems);
   const graphNodeByUid = new Map(graphNodes.map(n => [n.uid, n]));
-  for (const item of allReviewItems) {
-    if (item.pairedUid && graphNodeByUid.has(item.pairedUid)) {
+  for (const item of sortedReviewItems) {
+    if (item.pairedUid && (graphNodeByUid.has(item.pairedUid) || item.pairedPath)) {
       const gn = graphNodeByUid.get(item.uid);
       if (gn) {
         gn.pairedUid = item.pairedUid;
@@ -945,7 +1044,7 @@ export async function inspectProjectRepo(record, emptyScanDir) {
   for (const item of colResult.extraItems) {
     if (item.inlineDoc) inlineDocs.set(item.uid, item.inlineDoc);
   }
-  const publicItems = allReviewItems.map(({ inlineDoc: _omit, ...rest }) => rest);
+  const publicItems = sortedReviewItems.map(({ inlineDoc: _omit, ...rest }) => rest);
 
   // 按阅读任务主次分组与排序分类胶囊
   const catDefs = [
@@ -995,6 +1094,7 @@ export async function inspectProjectRepo(record, emptyScanDir) {
     },
     contents,
     inlineDocs,
+    companionPaths,
     allowedArchifyDirs: colResult.allowedArchifyDirs,
   };
 }
@@ -1065,6 +1165,8 @@ export async function readRepoDocument(record, cachedEntry, { path: rawPath, uid
   }
   const known = cachedEntry.contents.has(cleanPath)
     || cachedEntry.publicSnapshot.nodes.some(n => n.path === cleanPath)
+    || Boolean(cachedEntry.publicSnapshot.reviewItems?.some(i => i.path === cleanPath))
+    || Boolean(cachedEntry.companionPaths?.has(cleanPath))
     || SAFE_EXTRA_DOCS.has(cleanPath);
   if (!known) {
     throw Object.assign(new Error('请求的文档不在当前仓库制品图受管读取范围内。'), { statusCode: 404 });
