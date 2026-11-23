@@ -2,10 +2,11 @@
 // @feature STU002
 // @feature STU003
 // @feature STU005
+// @feature STU006
 
 import { existsSync, watch } from 'node:fs';
 import { createServer } from 'node:http';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -31,6 +32,8 @@ import {
   registerMonitorTarget,
   runSandboxExercise,
 } from './runtime-bridge.mjs';
+import { collectSessionFleet } from './session-fleet.mjs';
+import { computePathDigest } from './setup-advisor.mjs';
 
 const PKG_SRC_DIR = fileURLToPath(new URL('./', import.meta.url));
 const UI_DIR = join(PKG_SRC_DIR, 'ui');
@@ -140,6 +143,8 @@ export async function createStudioServer({
   env = process.env,
 } = {}) {
   const resolvedRoot = resolve(root);
+  const rootReal = await realpath(resolvedRoot).catch(() => resolvedRoot);
+  const rootDigest = computePathDigest(rootReal);
   const normalizedDefaultTab = normalizeStudioTab(defaultTab);
   const emptyScanDir = await mkdtemp(join(tmpdir(), 'sfs-scan-'));
   let writeChain = Promise.resolve();
@@ -234,6 +239,7 @@ export async function createStudioServer({
           ok: true,
           service: 'skill-family-studio',
           pid: process.pid,
+          rootDigest,
           foundationVersion: FOUNDATION_PACKAGE_VERSION,
           writable,
           at: new Date().toISOString(),
@@ -266,6 +272,7 @@ export async function createStudioServer({
         sendJson(res, 200, {
           ok: true,
           writable,
+          rootDigest,
           defaultTab: normalizedDefaultTab,
           defaultRepo,
           updatedAt: store.updatedAt,
@@ -392,6 +399,19 @@ export async function createStudioServer({
         return;
       }
 
+      if (pathname === '/api/studio/fleet') {
+        if (req.method !== 'GET') { sendJson(res, 405, { ok: false, error: '仅支持 GET 请求。' }); return; }
+        const catalog = await getCatalog(false);
+        const fleet = await collectSessionFleet({
+          root: resolvedRoot,
+          catalog,
+          sandboxActive: Boolean(sandboxHandle),
+          env,
+        });
+        sendJson(res, 200, fleet);
+        return;
+      }
+
       if (req.method === 'POST') {
         if (!isSafeLoopbackOrigin(req)) {
           sendJson(res, 403, { ok: false, error: '已拒绝非本地回环 Origin 来源的写请求。' });
@@ -491,6 +511,9 @@ export async function createStudioServer({
         '/index.html': { file: join(UI_DIR, 'index.html'), type: MIME_TYPES['.html'] },
         '/assets/studio.css': { file: join(UI_DIR, 'studio.css'), type: MIME_TYPES['.css'] },
         '/assets/app.mjs': { file: join(UI_DIR, 'app.mjs'), type: MIME_TYPES['.mjs'] },
+        '/assets/tooltips.mjs': { file: join(UI_DIR, 'tooltips.mjs'), type: MIME_TYPES['.mjs'] },
+        '/assets/diagram-svg.mjs': { file: join(UI_DIR, 'diagram-svg.mjs'), type: MIME_TYPES['.mjs'] },
+        '/assets/fleet-ui.mjs': { file: join(UI_DIR, 'fleet-ui.mjs'), type: MIME_TYPES['.mjs'] },
         '/graph-layout.mjs': { file: join(PKG_SRC_DIR, 'graph-layout.mjs'), type: MIME_TYPES['.mjs'] },
         '/assets/graph-layout.mjs': { file: join(PKG_SRC_DIR, 'graph-layout.mjs'), type: MIME_TYPES['.mjs'] },
       };
@@ -580,6 +603,8 @@ export async function collectStudioSnapshot({
   env = process.env,
 } = {}) {
   const resolvedRoot = resolve(root);
+  const rootReal = await realpath(resolvedRoot).catch(() => resolvedRoot);
+  const rootDigest = computePathDigest(rootReal);
   const emptyScanDir = await mkdtemp(join(tmpdir(), 'sfs-snap-'));
   try {
     const catalog = await discoverStudioRepos(resolvedRoot, { scanRoots, env });

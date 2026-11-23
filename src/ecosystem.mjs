@@ -1,5 +1,7 @@
 // @feature STU004
+// @feature STU006
 
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { lstat, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -113,7 +115,8 @@ function classifyLayer(type, configuredLayer) {
   return LAYER_MATCH[3];
 }
 
-function classifyReviewCategory(type, layerId) {
+function classifyReviewCategory(type, layerId, isMachineContract = false) {
+  if (isMachineContract) return 'contracts';
   if (['user_story', 'story', 'lifecycle', 'lifecycle_story'].includes(type)) return 'stories';
   if (['requirement', 'prd', 'spec'].includes(type)) return 'requirements';
   if (type === 'scenario') return 'scenarios';
@@ -486,6 +489,7 @@ export async function discoverStudioRepos(workspaceRoot, { scanRoots, env } = {}
       repoRoleLabel: meta.repoRoleLabel,
       hasStudioConfig: Boolean(meta.studioCfg?.hasConfig),
       isPrimary: primaryReal !== null && realPath === primaryReal,
+      pathDigest: createHash('sha256').update(realPath, 'utf8').digest('hex').slice(0, 16),
       lockPresent: meta.lockPresent,
       lockedCount: meta.lockedCount,
       versionLockLabel: meta.versionLockLabel,
@@ -771,7 +775,13 @@ export async function inspectProjectRepo(record, emptyScanDir) {
     const tc = schema.types?.[nd.type] ?? {};
     const ld = classifyLayer(nd.type, tc.layer);
     const isCode = nd.type === 'test' || nd.type === 'implementation' || CODE_EXT_RE.test(nd.path);
-    const category = classifyReviewCategory(nd.type, ld.id);
+    const ext = extname(nd.path || '').toLowerCase();
+    const isMachineContract = !isCode && (ext === '.json' || ext === '.yaml' || ext === '.yml');
+    const fileFormat = isCode ? 'code' : (ext === '.json' ? 'json' : (ext === '.yaml' || ext === '.yml' ? 'yaml' : 'markdown'));
+    const formatLabel = isMachineContract
+      ? (fileFormat === 'yaml' ? 'YAML 数据契约' : 'JSON 数据契约')
+      : (isCode ? '代码与验证文件' : 'Markdown 阅读稿');
+    const category = classifyReviewCategory(nd.type, ld.id, isMachineContract);
     return {
       uid: nd.uid,
       target: nd.uid,
@@ -787,10 +797,67 @@ export async function inspectProjectRepo(record, emptyScanDir) {
       line: nd.line,
       status: nd.status ?? null,
       isDesignNode: !isCode,
+      isMachineContract,
+      fileFormat,
+      formatLabel,
       inDegree: inDeg.get(nd.uid) ?? 0,
       outDegree: outDeg.get(nd.uid) ?? 0,
     };
   });
+
+  // 对已在 artifact-graph.config.yaml `paths` 中声明但未被内置 parser 转成节点的 JSON/YAML 契约，补齐为受管机器契约节点
+  const coveredPaths = new Set(graphNodes.map(n => n.path).filter(Boolean));
+  const typeEntries = Object.entries(schema.types ?? {}).sort((a, b) => {
+    const score = def => Math.max(...(def?.paths ?? []).map(p => (p.includes('*') ? 0 : 1e5) + p.length - ((p.match(/\*/g) ?? []).length * 1e3)), 0);
+    return score(b[1]) - score(a[1]) || a[0].localeCompare(b[0]);
+  });
+  for (const [rel, rawContent] of [...contents.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    if (!rel || coveredPaths.has(rel) || CODE_EXT_RE.test(rel)) continue;
+    const ext = extname(rel).toLowerCase();
+    if (ext !== '.json' && ext !== '.yaml' && ext !== '.yml') continue;
+    let matchedType = null;
+    let matchedDef = null;
+    for (const [tName, tDef] of typeEntries) {
+      if (matchesConfiguredArtifactPath(rel, { types: { [tName]: tDef } })) {
+        matchedType = tName;
+        matchedDef = tDef;
+        break;
+      }
+    }
+    if (!matchedType) continue;
+    let parsedMeta = null;
+    try {
+      parsedMeta = ext === '.json' ? JSON.parse(rawContent) : parseYaml(rawContent);
+    } catch {}
+    const ld = classifyLayer(matchedType, matchedDef?.layer);
+    const stemCode = basename(rel, ext);
+    const metaObj = parsedMeta && typeof parsedMeta === 'object' && !Array.isArray(parsedMeta) ? parsedMeta : null;
+    const code = String(metaObj?.id || metaObj?.code || stemCode);
+    const title = String(metaObj?.title || metaObj?.name || basename(rel));
+    const fileFormat = ext === '.json' ? 'json' : 'yaml';
+    const uid = `${matchedType}:${code}:${rel}`;
+    graphNodes.push({
+      uid,
+      target: uid,
+      type: matchedType,
+      typeLabel: matchedDef?.displayName || TYPE_LABELS[matchedType] || matchedType,
+      category: 'contracts',
+      layer: ld.id,
+      layerOrder: ld.order,
+      layerLabel: ld.label,
+      code,
+      title: sanitizePublicText(title),
+      path: rel,
+      line: 1,
+      status: metaObj?.status ? String(metaObj.status) : null,
+      isDesignNode: true,
+      isMachineContract: true,
+      fileFormat,
+      formatLabel: fileFormat === 'yaml' ? 'YAML 数据契约' : 'JSON 数据契约',
+      inDegree: 0,
+      outDegree: 0,
+    });
+  }
 
   const relSem = schema.relationSemantics ?? {};
   const edges = graph.edges.map(e => ({
@@ -832,6 +899,48 @@ export async function inspectProjectRepo(record, emptyScanDir) {
     ...(designGraphNodes.length ? designGraphNodes : graphNodes),
     ...colResult.extraItems,
   ]);
+
+  // 自动配对同源 Markdown 文稿与 JSON/YAML 数据契约，支持正文顶栏一键互跳
+  const humanItems = allReviewItems.filter(i => !i.isMachineContract && i.path);
+  const contractItems = allReviewItems.filter(i => i.isMachineContract && i.path);
+  const stemOf = p => basename(String(p || ''), extname(String(p || ''))).toLowerCase();
+  const findCompanion = (srcItem, candidates) => {
+    const srcStem = stemOf(srcItem.path);
+    const srcDir = dirname(String(srcItem.path || ''));
+    const srcCode = String(srcItem.code || '').toLowerCase();
+    return candidates.find(c => dirname(String(c.path || '')) === srcDir && stemOf(c.path) === srcStem)
+      || candidates.find(c => stemOf(c.path) === srcStem && srcStem.length >= 2)
+      || (srcCode ? candidates.find(c => String(c.code || '').toLowerCase() === srcCode) : null)
+      || null;
+  };
+  for (const cItem of contractItems) {
+    const peer = findCompanion(cItem, humanItems);
+    if (peer) {
+      cItem.pairedUid = peer.uid;
+      cItem.pairedPath = peer.path;
+      cItem.pairedTitle = peer.title;
+      cItem.pairedFormat = 'markdown';
+      if (!peer.pairedUid) {
+        peer.pairedUid = cItem.uid;
+        peer.pairedPath = cItem.path;
+        peer.pairedTitle = cItem.title;
+        peer.pairedFormat = cItem.fileFormat || 'json';
+      }
+    }
+  }
+  const graphNodeByUid = new Map(graphNodes.map(n => [n.uid, n]));
+  for (const item of allReviewItems) {
+    if (item.pairedUid && graphNodeByUid.has(item.pairedUid)) {
+      const gn = graphNodeByUid.get(item.uid);
+      if (gn) {
+        gn.pairedUid = item.pairedUid;
+        gn.pairedPath = item.pairedPath;
+        gn.pairedTitle = item.pairedTitle;
+        gn.pairedFormat = item.pairedFormat;
+      }
+    }
+  }
+
   const inlineDocs = new Map();
   for (const item of colResult.extraItems) {
     if (item.inlineDoc) inlineDocs.set(item.uid, item.inlineDoc);
@@ -850,6 +959,7 @@ export async function inspectProjectRepo(record, emptyScanDir) {
     { id: 'business_articles', label: '业务专题文稿', group: 'supporting', groupLabel: '关联依据' },
     { id: 'architecture', label: '架构与规格', group: 'supporting', groupLabel: '关联依据' },
     { id: 'verification', label: '测试与实现追溯', group: 'supporting', groupLabel: '关联依据' },
+    { id: 'contracts', label: '结构化数据契约 (.json/.yaml)', group: 'contracts', groupLabel: '结构化数据契约（供脚本校验）' },
   ];
   const categories = [
     { id: 'all', label: '全部审阅项', group: 'all', groupLabel: '全部', count: publicItems.length },
@@ -889,6 +999,50 @@ export async function inspectProjectRepo(record, emptyScanDir) {
   };
 }
 
+function buildStructuredContractHtml(parsed, cleanPath) {
+  const fmtVal = v => {
+    if (v === null || v === undefined) return '—';
+    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v);
+    if (Array.isArray(v)) return `[${v.length} 项] ${v.slice(0, 4).map(x => (typeof x === 'object' ? (x?.id || x?.name || x?.title || '{…}') : String(x))).join(' · ')}`;
+    return JSON.stringify(v).slice(0, 120);
+  };
+  const blocks = [
+    `<div class="st-contract-notice"><strong>🗂️ 结构化数据契约（${escapeHtml(basename(cleanPath))}）</strong><div class="st-muted-xs">本文件供自动化脚本、状态机校验或工程门禁读取，已自动整理为可读字段摘要；若需查看原始文本，可点上方「{ } 原始源码」切换。</div></div>`,
+  ];
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const scalars = [];
+    const collections = [];
+    const nested = [];
+    for (const [k, v] of Object.entries(parsed)) {
+      if (['__proto__', 'constructor', 'prototype'].includes(k)) continue;
+      if (v === null || ['string', 'number', 'boolean'].includes(typeof v)) scalars.push([k, v]);
+      else if (Array.isArray(v)) collections.push([k, v]);
+      else nested.push([k, v]);
+    }
+    if (scalars.length > 0) {
+      blocks.push(`<h3 class="st-prose-heading">核心基础字段</h3><div class="st-table-wrap"><table class="st-prose-table"><thead><tr><th>字段键名</th><th>字段值</th></tr></thead><tbody>${scalars.slice(0, 30).map(([k, v]) => `<tr><td><code>${escapeHtml(k)}</code></td><td>${escapeHtml(String(v ?? '—'))}</td></tr>`).join('')}</tbody></table></div>`);
+    }
+    for (const [k, arr] of collections.slice(0, 8)) {
+      blocks.push(`<h3 class="st-prose-heading">${escapeHtml(k)}（共 ${arr.length} 项）</h3>`);
+      if (arr.length === 0) {
+        blocks.push('<p class="st-muted-xs">空列表 []</p>');
+      } else if (arr.every(x => x && typeof x === 'object' && !Array.isArray(x))) {
+        const colKeys = [...new Set(arr.slice(0, 20).flatMap(o => Object.keys(o)))].slice(0, 6);
+        blocks.push(`<div class="st-table-wrap"><table class="st-prose-table"><thead><tr>${colKeys.map(c => `<th>${escapeHtml(c)}</th>`).join('')}</tr></thead><tbody>${arr.slice(0, 40).map(row => `<tr>${colKeys.map(c => `<td>${escapeHtml(fmtVal(row[c]))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`);
+      } else {
+        blocks.push(`<ul>${arr.slice(0, 30).map(x => `<li><code>${escapeHtml(fmtVal(x))}</code></li>`).join('')}</ul>`);
+      }
+    }
+    for (const [k, obj] of nested.slice(0, 8)) {
+      const subRows = Object.entries(obj).slice(0, 20).map(([sk, sv]) => `<tr><td><code>${escapeHtml(sk)}</code></td><td>${escapeHtml(fmtVal(sv))}</td></tr>`).join('');
+      blocks.push(`<h3 class="st-prose-heading">${escapeHtml(k)}</h3><div class="st-table-wrap"><table class="st-prose-table"><thead><tr><th>键名</th><th>值</th></tr></thead><tbody>${subRows}</tbody></table></div>`);
+    }
+  } else if (Array.isArray(parsed)) {
+    blocks.push(`<p class="st-muted-xs">顶层数组，共 ${parsed.length} 条记录。</p><ul>${parsed.slice(0, 40).map(x => `<li><code>${escapeHtml(fmtVal(x))}</code></li>`).join('')}</ul>`);
+  }
+  return blocks.join('\n');
+}
+
 export async function readRepoDocument(record, cachedEntry, { path: rawPath, uid: rawUid } = {}) {
   if (rawUid && cachedEntry.inlineDocs.has(rawUid)) {
     const inline = cachedEntry.inlineDocs.get(rawUid);
@@ -898,6 +1052,7 @@ export async function readRepoDocument(record, cachedEntry, { path: rawPath, uid
       uid: rawUid,
       path: rawPath || rawUid,
       format: 'markdown',
+      isMachineContract: false,
       title: inline.title,
       frontmatter: {},
       headings: inline.headings,
@@ -920,7 +1075,8 @@ export async function readRepoDocument(record, cachedEntry, { path: rawPath, uid
     catch { throw Object.assign(new Error('未找到对应的制品原件文件。'), { statusCode: 404 }); }
   }
   const sanitized = sanitizePublicText(rawText);
-  if (extname(cleanPath).toLowerCase() === '.md') {
+  const ext = extname(cleanPath).toLowerCase();
+  if (ext === '.md') {
     let frontmatter = {};
     let body = sanitized;
     const fm = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(sanitized.replace(/\r\n/g, '\n'));
@@ -941,17 +1097,39 @@ export async function readRepoDocument(record, cachedEntry, { path: rawPath, uid
       repoId: record.id,
       path: cleanPath,
       format: 'markdown',
+      isMachineContract: false,
       title: rendered.title || String(frontmatter.title ?? basename(cleanPath)),
       frontmatter,
       headings: rendered.headings,
       html: rendered.html,
     };
   }
+  if (ext === '.json' || ext === '.yaml' || ext === '.yml') {
+    let parsed = null;
+    try { parsed = ext === '.json' ? JSON.parse(sanitized) : parseYaml(sanitized); } catch {}
+    const html = parsed !== null
+      ? buildStructuredContractHtml(parsed, cleanPath)
+      : `<pre class="st-code-block"><code>${escapeHtml(sanitized)}</code></pre>`;
+    return {
+      ok: true,
+      repoId: record.id,
+      path: cleanPath,
+      format: ext === '.json' ? 'json' : 'yaml',
+      isMachineContract: true,
+      rawText: sanitized,
+      title: String(parsed?.title || basename(cleanPath)),
+      frontmatter: {},
+      headings: [],
+      html,
+    };
+  }
   return {
     ok: true,
     repoId: record.id,
     path: cleanPath,
-    format: extname(cleanPath).slice(1) || 'text',
+    format: ext.slice(1) || 'text',
+    isMachineContract: false,
+    rawText: sanitized,
     title: basename(cleanPath),
     frontmatter: {},
     headings: [],

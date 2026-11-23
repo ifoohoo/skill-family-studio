@@ -1,87 +1,172 @@
 // @feature STU002
+// @feature STU006
 
 export const STUDIO_GUIDE_MODEL = Object.freeze({
   title: 'Skill Family Studio 使用说明书',
-  subtitle: '单端口统一承载跨仓需求进展对齐、故事优先宽屏审阅与 Foundation 运行态监控。',
+  subtitle: '不用背命令行、不用猜读取顺序——一个本地端口统一搞定跨仓需求对齐、故事优先审阅、长任务推进树与多智能体会话编队。',
   whyItExists: [
-    '无论是独立维护一个技能族仓库，还是协同管理“1 个高阶规划仓 + 多个子技能族详设仓”的业务域套组，团队在审阅与验收时最常遇到四个断点：不知道从哪篇文档读起、看不出高阶需求有没有真正拆到底下仓库并写锁测试、改完代码或详设后上下游逐渐脱节、以及设计图谱和运行监控分在两个端口来回跳转。',
-    'Skill Family Studio 把这四件事收拢进同一个本地回环端口（默认 127.0.0.1:57630）和同一套顶栏导航：左上角切换项目，中间固定「使用说明、制品图谱、逐项审阅、运行监控」四个页签，右上角随时查看审阅进度并导出验收单。所有批注与结论集中在 Studio 自管台账（默认 .skill-family-studio/reviews.json），绝不修改任何受审仓库受 Git 跟踪的源码或文档。',
+    '无论是独自维护一个技能族仓库，还是协助管理“1 个高阶规划仓 + 多个子技能族详设仓”的业务域套组，初次打开或验收项目时最常遇到五个困惑：不知道先对智能体说什么就能打开界面、不知道上百份文档该从哪篇读起、分不清哪条需求只是“派了单”还是“真写完了代码并跑通测试”、看不清长任务执行树推进到哪一步以及派出去的多个子智能体正在干什么、还经常在点击图表或目录时被页面跳回顶部打断阅读。',
+    'Skill Family Studio 把这些场景全部收拢进单一本地回环端口（默认 127.0.0.1:57630）：左上角切换当前项目，中间固定「使用说明、制品图谱、逐项审阅、运行监控」四个页签，右上角随时查看审阅进度并导出验收单。界面里所有概念旁都有就地「ⓘ」悬停气泡可随时查阅；所有批注和结论均保存在 Studio 自管目录（默认 .skill-family-studio/reviews.json），绝不改动任何受审仓库受 Git 跟踪的文件。',
   ],
+  conversationalStart: {
+    title: '一、零门槛开启：直接对智能体说一句话即可',
+    intro: '你不需要记住任何启动参数，也不用先写配置文件。在正在工作的项目目录里直接对你的智能体（如 Antigravity / Claude Code / Codex）说出你的意图即可：',
+    samplePrompts: [
+      { intent: '想看全盘结构或开始审阅', say: '“打开工作台，带我看下这个项目的设计。”' },
+      { intent: '想核对需求拆分与实现对齐', say: '“打开逐项审阅，帮我核对需求进展和代码锁有没有漂移。”' },
+      { intent: '想盯长程任务和多智能体协作', say: '“打开运行监控，看看任务推进树和派出去的子会话跑到哪一步了。”' },
+    ],
+    behindTheScenes: [
+      '第一步（静默体检）：智能体先只读运行环境探针（inspect-setup），自动识别当前目录属于单技能族仓库、高阶规划仓、详设子仓还是多仓父目录，同时探测是否已经绑定了上下游仓库或存在活跃运行源。',
+      '第二步（智能决策）：如果是无上下游绑定的单技能族项目，智能体默认只扫描当前这一个仓库（--scan-roots none），避免把父目录里无关仓库全塞进下拉框，直接拉起控制台并给你一条明确的固定审阅路线。',
+      '第三步（仅当必要时问一道三选题）：如果检测到当前仓已与上下游仓关联但还没有 .studio-workspace.json，智能体只用大白话问你一次三选一：① 仅聚焦当前仓；② 自动纳入关联上下游仓以支持跨仓互跳；③ 指定业务域扫描目录并由智能体代写配置。',
+    ],
+  },
   usageModes: [
     {
       id: 'single-repo',
-      title: '单技能族项目模式（零配置开箱即用）',
-      audience: '适合独立开发或维护单一技能族的外部业务域开发者',
-      whenToUse: '当你只关心自己仓库里的“需求 / 用户故事 → 详设 → 代码与测试锁”闭环时，直接在项目根目录启动控制台即可，无需编写任何额外配置文件。',
-      howItWorks: '控制台自动读取本仓的 artifact-graph.config.yaml，同时轻量发现同一父目录下的兄弟受管仓库；自动识别标准 artifacts/ 下的故事、需求、图表与设计制品，并在「逐项审阅」中体检本仓代码入口是否都已被 traceability-version-lock.json 认领。',
-      command: 'npx skill-family-studio ensure --root . --port 57630',
+      title: '单技能族项目模式（聚焦本仓、零配置即开）',
+      audience: '适合独立开发或验收单一技能族的开发者与审阅者',
+      whenToUse: '当你只关心当前这一个仓库里的“用户故事 / 需求 → 详设 → 代码与测试锁”闭环时使用。',
+      howItWorks: '系统自动只读取本仓 artifact-graph.config.yaml 与标准 artifacts/ 目录（故事、需求、场景、架构与代码测试锁），不混入父目录里其他项目，同时在「逐项审阅」体检本仓核心源码和 SKILL.md 入口是否都已被版本锁认领。',
     },
     {
       id: 'domain-portfolio',
       title: '业务域多仓套组模式（1 个高阶规划仓 + N 个子技能族详设仓）',
-      audience: '适合跨仓规划架构师、产品经理与多仓协同团队',
-      whenToUse: '当一个业务域由“1 个高阶规划仓（负责总体需求拆分与业务闭环） + 多个子技能族仓（各自落地详设与代码）”组成时，在高阶仓根目录放置声明式的 .studio-workspace.json（或写在 artifact-graph.config.yaml 的 studio 节）来组织跨仓视图。',
-      howItWorks: '通过 scanRoots 指定跨组扫描目录、groupLabels 定义自然分组标签、collections 挂载自定义故事包（lifecycle-story-pack）或 Archify 业务闭环图（archify-model-scenes）。高阶仓通过 artifacts/portfolio-allocations.json 登记拆分去向，子仓通过 artifacts/upstream-bindings.json 回指上游，实现双向对齐与一键跨仓互跳。',
-      command: 'npx skill-family-studio ensure --root /absolute/portfolio/repo --port 57630',
+      audience: '适合跨仓规划架构师、产品负责人与多仓协同团队',
+      whenToUse: '当一个业务域由“1 个高阶规划仓（总体需求与业务闭环） + 多个子技能族仓（各自落地详设与代码）”组成时使用。',
+      howItWorks: '由智能体代写或在项目根目录放置 .studio-workspace.json（也可写在 artifact-graph.config.yaml 顶层 studio 节），声明跨组扫描目录 scanRoots、自然分组名 groupLabels 与扩展故事/Archify 集合 collections。即可在同一界面查看高阶拆分三列一览表并实现一键跨仓互跳。',
     },
   ],
-  readingOrderGuide: [
+  roleRoutes: [
     {
-      step: 1,
-      stage: '理解诉求 · 用户故事',
-      why: '先读用户故事（US），搞清楚“谁在什么处境下想完成什么任务、期待什么可观察结果”，避免一开始就陷入技术字段和文件树里迷路。',
+      id: 'pm-review',
+      roleTitle: '动线一：产品负责人 / 业务需求验收（4 步闭环）',
+      when: '适合刚接手项目、需要按“诉求 → 拆解去向 → 验收结论”系统过一遍全部设计的人，照着顺序走完即可，无需自由抽样。',
+      steps: [
+        {
+          step: 1,
+          title: '在顶栏左上角确认当前项目',
+          detail: '点击左上角「当前项目」确认自己正处在高阶规划仓还是某个具体子仓（角色徽章会直接写明；点空白处或按 Escape 即可随时收起下拉框）。',
+          actionId: 'open-repo-switcher',
+          actionLabel: '打开项目切换器 →',
+        },
+        {
+          step: 2,
+          title: '核对「需求进展与双向对齐总览表」',
+          detail: '切到「📝 逐项审阅」，先看总览表的三列核心信息：这条需求分给了谁、由下游文件和代码测试锁机器算出的真实「满足概况」是什么、是否存在漏拆或摘要漂移；点任意下游胶囊可直接跨仓跳入子仓详设。',
+          actionId: 'go-tab-alignment',
+          actionLabel: '看三列进展总览 →',
+        },
+        {
+          step: 3,
+          title: '按「故事 → 需求 → 场景」主线批注签收',
+          detail: '点击「▶ 开始按推荐顺序审阅」，工作台按“理解诉求（用户故事）→ 核对边界（需求总纲）→ 细看行为（场景剧本）”带你逐篇读完人读文稿（机器 .json 契约已自动单独收纳到底部，不会打断阅读）；写下第一条未解决批注自动转「🔵 审阅中」，确认无误点击「✓ 通过并审下一项 →」。',
+          actionId: 'start-guided-review',
+          actionLabel: '开始按推荐顺序审阅 →',
+        },
+        {
+          step: 4,
+          title: '导出完整 Markdown 审阅验收单',
+          detail: '点右上角「审阅进度胶囊」，抽屉自动汇总各仓已通过、审阅中、需修改与待解决批注清单，支持一键复制或下载存档（按 Escape 或点击遮罩空白即可关闭）。',
+          actionId: 'open-export-drawer',
+          actionLabel: '打开导出抽屉 →',
+        },
+      ],
     },
     {
-      step: 2,
-      stage: '核对进展 · 需求进展与双向对齐三列一览表',
-      why: '在「逐项审阅」顶部的三列一览表核对每条需求“分给了谁、由代码/测试锁机器算出的真实满足概况是什么、上下游有没有漂移”，再点击具体需求查看正文或跨仓跳到子项目。',
+      id: 'dev-arch',
+      roleTitle: '动线二：架构师 / 技能族开发者（3 步对齐与排错）',
+      when: '适合改完详细设计或新增代码与技能入口后，快速确认上下游依赖没断链、代码已被版本锁认领、没有跨仓漂移。',
+      steps: [
+        {
+          step: 1,
+          title: '在「🕸️ 制品图谱」看全局依赖与业务闭环',
+          detail: '在宽屏图谱中点击任意节点，右侧直接弹出正文阅读，画布坐标 100% 恒定不会乱跳；顶部面包屑定位条显示所属分层和上下游条数，可按需开启「仅看上下游关联子图」。若有 Archify 业务逻辑图可切换并一键全屏对照。',
+          actionId: 'go-tab-graph',
+          actionLabel: '打开宽屏制品图谱 →',
+        },
+        {
+          step: 2,
+          title: '检查单仓代码/技能入口认领覆盖率',
+          detail: '打开「📝 逐项审阅 → 需求进展与双向对齐总览」，看页面下方「单仓内部详设 ↔ 代码与测试双向互锁」KPI，确认未认领入口（UNCLAIMED_IMPLEMENTATION_ENTRY）与锁漂移均为 0。',
+          actionId: 'go-tab-alignment',
+          actionLabel: '查单仓代码锁体检 →',
+        },
+        {
+          step: 3,
+          title: '点选胶囊跨仓互跳修补漂移条目',
+          detail: '若看到「高阶已变待同步详设」或「详设已演进待回写高阶」，直接在表格点下游胶囊或正文顶部的「↖ 上游高阶来源」跨仓定位原文核对，再刷新版本锁与双向绑定。',
+          actionId: 'go-tab-review',
+          actionLabel: '进入跨仓正文对照 →',
+        },
+      ],
     },
     {
-      step: 3,
-      stage: '看清全局 · 宽屏制品图谱与 Archify 业务闭环',
-      why: '切到「🕸️ 制品图谱」看清上下游依赖全貌；若项目配有 Archify 业务闭环图，可全屏展开并点击图节点直接跳到对应的说明章节。',
-    },
-    {
-      step: 4,
-      stage: '细看行为与依据 · 场景剧本、领域决策与测试追溯',
-      why: '最后按需核对场景剧本（前提/动作/预期结果）、架构设计与实现/测试锁覆盖，确认每项承诺都有真实代码和测试承接。',
+      id: 'fleet-supervisor',
+      roleTitle: '动线三：长程任务与多智能体监督（3 步盯控）',
+      when: '适合你让主智能体拆了好几个波次或派出一队子智能体干活，想直观掌握推进卡点、协作往来和每条委派详情时使用。',
+      steps: [
+        {
+          step: 1,
+          title: '看「🌳 任务推进树」掌握当前处于哪一环节',
+          detail: '进入「⚡ 运行监控」默认即进入任务推进树。顶部聚焦横幅直接亮出当前正在执行的具体路径与完成比例，下方可逐层展开“迭代波次 → 父任务 → 子步骤”及前置依赖 blockedBy。',
+          actionId: 'go-tab-runtime',
+          actionLabel: '打开任务推进树 →',
+        },
+        {
+          step: 2,
+          title: '看「🛰️ 会话与子会话编队」掌握多智能体协同全貌',
+          detail: '切到第二子页签，左侧树状网络展示主会话与全部子会话的型号、运行状态与上下文负载（点击任意卡片位置不变且高亮链路），右侧泳道画出委派与回报时序箭头，底部检查器可查看每次委派的任务简报并切换「原文 / Markdown」。',
+          actionId: 'go-tab-fleet',
+          actionLabel: '打开会话编队面板 →',
+        },
+        {
+          step: 3,
+          title: '仅在疑似卡死或超时时点开「🩺 底层排障」',
+          detail: '日常监督完全不需要看第三子页签；只有当任务长时间停滞、怀疑写锁没释放或子进程超时代杀时，再点开底层排障查看实时锁读秒、事件哈希链并点击「🔓 释放沙箱锁」。',
+          actionId: 'go-tab-diag',
+          actionLabel: '打开底层排障诊断 →',
+        },
+      ],
     },
   ],
-  fiveSteps: [
+  perPageAnatomy: [
     {
-      step: 1,
-      title: '在顶栏左侧选定要看的项目或业务域套组',
-      whenAndWhat: '点击左上角「当前项目」下拉框，按当前工作区声明的分组浏览或关键字过滤仓库。每个项目会直接标注角色（如高阶规划仓 / 详设子仓）、制品节点数、版本锁新鲜度与是否有活跃运行任务；工作区配置中的扩展故事包与 Archify 图谱会自动汇总到对应仓库分类中。',
-      actionId: 'open-repo-switcher',
-      actionLabel: '立即体验：展开项目切换器 →',
+      page: '全局顶栏（所有页面固定可见）',
+      when: '无论处于哪个页签，随时切换仓库、识别角色健康度和导出成果。',
+      areas: [
+        '左侧「当前项目」切换器：按工作区分组展示所有仓库与角色徽章（高阶规划仓 / 详设子仓 / 单项目仓）；点触发器外任意空白或按 Escape 立即收起。',
+        '角色与版本锁徽章：实时标出本仓制品版本锁是否新鲜（如 锁新鲜 102/102）及未闭合告警；悬停「ⓘ」即可看清含义。',
+        '右侧进度胶囊与外观切换：统计「已通过 / 审阅中 / 需修改 / 共 N 项」，点击展开导出抽屉；支持浅色 / 深色双主题一键切换。',
+      ],
     },
     {
-      step: 2,
-      title: '在「制品图谱」看清全局依赖与业务闭环',
-      whenAndWhat: '切到「🕸️ 制品图谱」页签，画布按显示器真实宽度（1920px、2560px 2K、3440px 带鱼屏）自适应铺满，单层超多节点自动折成多行网格，无需横向拖拽滚动条。包含 Archify 业务图时可一键全屏展开，点击图节点直接定位右侧关联说明文档与章节锚点。',
-      actionId: 'go-tab-graph',
-      actionLabel: '立即体验：打开宽屏制品图谱 →',
+      page: '🕸️ 制品图谱页（全局结构与关系视图）',
+      when: '第一次熟悉陌生项目架构、核对需求到场景/测试的连线、或对照 Archify 业务逻辑图阅读时使用。',
+      areas: [
+        '左/主画布区：支持在「制品依赖图谱（6 层结构）」与「Archify 业务逻辑图」之间切换；开启「适应屏宽」与「自动折行排布」后在 1920px / 2560px / 3440px 下无横向溢出。',
+        '防跳变定位条与全屏模式：点击任何矩形节点时全图坐标 100% 保持不动，仅原地高亮连线与顶部面包屑定位条；可点击「仅看上下游关联子图」过滤无关节点，全屏下按 Escape 平滑退出。',
+        '右侧联动阅读区：即时打开当前选中节点的全文、章节锚点、审阅结论按钮及批注列表。',
+      ],
     },
     {
-      step: 3,
-      title: '先查「需求进展与双向对齐总览」，再跨仓互跳对照原件',
-      whenAndWhat: '进入「📝 逐项审阅」页签，可一键在「📋 需求进展与双向对齐总览表」和「📖 按阅读任务逐篇审阅」之间切换。高阶规划仓展示业务处置与去向、机器派生满足概况、双向健康度三列；点击下游承接胶囊直接跨仓跳到子项目详设，在子项目阅读页顶部点击「↖ 上游高阶来源」即可跳回高阶条目。',
-      actionId: 'go-tab-alignment',
-      actionLabel: '立即体验：查看需求对齐总览 →',
+      page: '📝 逐项审阅页（核对齐与批注签收主阵地）',
+      when: '需要核对需求是否真正拆分并满足、逐篇阅读设计文档写修改意见并签署结论时使用。',
+      areas: [
+        '顶部双视角切换条：在「📋 需求进展与双向对齐总览表」和「📖 按阅读任务逐篇审阅」之间一键切换；配「▶ 跳至下一项待审条目」顺着主线推进。',
+        '对齐总览三列表 + 单仓锁指标：高阶仓看「业务处置与去向 / 机器派生满足概况 / 双向健康度」三列并直接点击下游跨仓跳转；子仓看上游绑定列表与「↖ 上游高阶来源」回指；底部看本仓代码/技能认领情况。',
+        '逐篇阅读三栏区：左侧目录按「首要阅读（故事/需求/场景）」「关联依据（领域/架构/验证）」「结构化数据契约（.json/.yaml 单独收纳）」清晰分层；点开 .json 文件默认呈现结构化摘要表格，同时在顶部提供「📖 切换到对应的人读版 Markdown 文档」与「📊 摘要 / { } 源码」切换。',
+      ],
     },
     {
-      step: 4,
-      title: '按推荐顺序逐篇阅读、记批注并流转四态签收',
-      whenAndWhat: '点击「▶ 开始按推荐顺序审阅」，系统按「用户故事 → 需求总纲 → 场景剧本 → 领域与架构依据」定位到第一篇待审条目。写下第一条未解决批注会自动点亮「🔵 审阅中」；批注全部解决或清空且未给终态结论时自动回到「⚪ 待审阅」；确认无误点击「✓ 通过并审下一项 →」连贯推进。',
-      actionId: 'start-guided-review',
-      actionLabel: '立即体验：按推荐顺序开始审阅 →',
-    },
-    {
-      step: 5,
-      title: '导出验收单，或在「运行监控」实时排查卡点',
-      whenAndWhat: '顶栏右侧胶囊实时统计「已通过 / 审阅中 / 需修改 / 共 N 项」，点击即可复制或下载 Markdown 验收单与 JSON 台账。排查长程任务卡点时切到「⚡ 运行监控」，在当前项目与全工作区活跃源之间切换，直接钻取里程碑进度、实时文件锁读秒、事件哈希链与子进程轨迹。',
-      actionId: 'open-export-drawer',
-      actionLabel: '立即体验：打开审阅汇总与导出 →',
+      page: '⚡ 运行监控页（三大场景化观测视图）',
+      when: '需要实时盯控长程任务树、追踪多智能体会话委派与回报、或排查卡死锁冲突时使用。',
+      areas: [
+        '🌳 任务推进树（默认首屏）：顶部聚焦横幅直接告诉你当前正在执行哪一环，下方可折叠展开「波次 → 阶段 → 子任务 → 步骤」并支持 [全部 | 仅看未完成 | 聚焦当前活跃链路] 过滤。',
+        '🛰️ 会话与子会话编队：顶部 4 项脉冲指标 + 左「Agent 会话网络」拓扑卡片（点击位置不动）+ 右上「跨会话协作泳道」时序连线 + 下「协作任务 & 事件检查器」（[Markdown 渲染 | 原文] 切换）。',
+        '🩺 底层排障与健康诊断（按需展开）：平时顶部一行绿灯汇总健康态即可，异常时再点开检查文件锁每秒读秒、state-store 哈希链完整性与受管子进程超时标记，并可一键「🔓 释放沙箱锁」。',
+      ],
     },
   ],
   alignmentGuide: {
@@ -89,7 +174,7 @@ export const STUDIO_GUIDE_MODEL = Object.freeze({
       {
         code: 'verified_satisfied',
         badge: '🟢 已验证满足',
-        meaning: '下游全部承接目标存在、上下游摘要双向一致，且下游仓库的 traceability-version-lock.json 具备新鲜的代码实现锁与测试验证锁（只读冻结仓含有效的 verifiedReceiptPath 验证收据）。绝不靠手工台账声称满足。',
+        meaning: '下游全部承接目标存在、上下游摘要双向一致，且下游仓库的 traceability-version-lock.json 同时具备新鲜的 implements 代码锁与 verifies 测试验证锁（只读冻结仓含有效的 verifiedReceiptPath 验证收据）。绝不靠手工台账声称满足。',
       },
       {
         code: 'partially_allocated',
@@ -160,38 +245,27 @@ export const STUDIO_GUIDE_MODEL = Object.freeze({
       meaning: '当前轮次已有明确裁决，自动引导动线会跳过该篇并定位下一篇未签收条目。',
     },
   ],
-  widescreenTips: [
-    '画布容器解除固定宽度上限（max-width: none），在 1920px、2560px 2K 屏与 3440px 21:9 超宽带鱼屏上均 100% 利用横向视口，少节点层自动居中保持舒展间距。',
-    '开启「自动折行排布」后，单层包含几十个节点的仓库会自动排成多行网格，既不横向溢出，也不会把节点字号压缩到 11px 以下。',
-    '切换到 Archify 业务逻辑图时默认按宽屏满视口渲染并保持左右对照：工具栏支持上一张/下一张切换与一键全屏展开，点击图中任意业务节点即可直接定位并高亮右侧对应说明章节。',
-    '在「逐项审阅」页签的大屏视口（>= 1920px）下，界面自动升级为「左目录列表 + 中间舒适正文区 + 右侧粘滞审阅操作与批注栏」三栏布局，可一边对照正文一边批注签收；点击正文右上角「铺满全屏阅读」也可切换通栏显示。',
-  ],
-  runtimeSubpanels: [
+  faq: [
     {
-      id: 'tasks',
-      title: 'A. 任务与里程碑推进矩阵',
-      detail: '自动解析执行计划（Markdown 复选框与进度表、JSON tasks/steps、CSV 清单），渲染多段彩色进度条（已完成/进行中/阻断/待推进），支持按里程碑、状态胶囊与关键字筛选每一条任务明细。',
+      q: '为什么我在项目下拉框里只看到了当前一个仓库？以前怎么把整个目录都扫进来了？',
+      a: '当你在一个没有绑定上下游关系的独立单仓启动时，智能体会默认传入 --scan-roots none 只聚焦当前仓库，避免把同级无关目录全部塞进列表。如果你确实需要跨仓联动，对智能体说“帮我把同级兄弟仓或关联上下游也纳入工作台”或点击生成 .studio-workspace.json 即可。',
     },
     {
-      id: 'locks',
-      title: 'B. 文件锁与并发写集雷达',
-      detail: '实时扫面活跃 token-lock、state-store 写入锁与仓库静态 traceability-version-lock.json 概览；前端每秒跳字显示当前持锁时长，超过阈值（默认 30 秒）高亮琥珀色「⚠️ 持锁超时预警」，并可一键释放沙箱排他锁。',
+      q: '为什么在「逐项审阅」里点击文件或点击图谱节点时，画面不会再把节点挪到最前面或跳回顶部了？',
+      a: '画布布局引擎现已保证全图坐标 100% 恒定：点选节点只原地高亮关联连线、更新顶部位置面包屑并打开右侧正文，不会打乱你的空间记忆；审阅页切换或提交批注时也会原位保留滚动条进度。',
     },
     {
-      id: 'chain',
-      title: 'C. Foundation 事件溯源哈希链（state-store）',
-      detail: '逐条校验证明链从创世摘要（STATE_GENESIS_DIGEST）到最新事件的 SHA-256 哈希连续性，直接展示 VALID / CHAIN_BROKEN / STALE_HEAD 徽章与 #000001..#NNNNNN 事件时间线明细。',
+      q: '列表最下面新增的「结构化数据契约 (.json/.yaml)」是什么？审阅时一定要一个个点开吗？',
+      a: '它们是供自动化脚本、状态机检查与门禁校验读取的结构化数据契约，正常引导审阅流程（「▶ 开始按推荐顺序审阅」）会自动跳过它们、优先带你读完人读 Markdown 文稿。当你想核对字段细节时点开即可，界面默认整理为表格卡片，且顶部支持直接切到配对的 Markdown 原文或源码。',
     },
     {
-      id: 'processes',
-      title: 'D. 受管子进程监督轨迹（supervise-process）',
-      detail: '记录每条子进程调用的脚本标签、RUNNING / EXITED / TIMED_OUT / TERMINATED 状态、退出码、耗时以及超时代杀保护标记。',
+      q: '日常监督长程任务时，「🩺 底层排障与健康诊断」里的文件锁与哈希链什么时候才需要看？',
+      a: '平时看进度只盯第一页签「🌳 任务推进树」和第二页签「🛰️ 会话与子会话编队」就够了。只有当页面提示告警数字、任务长时间停滞不前、或者怀疑有未释放的排他写锁阻断后续步骤时，再展开「🩺 底层排障」定位超时锁并一键释放。',
     },
-  ],
-  runtimeTips: [
-    '顶栏与范围切换联动：切换顶栏「当前项目」时，监控页自动切换范围；点击顶部范围胶囊可在「聚焦当前项目」与「全工作区活跃告警聚合」之间随时切换，也可通过单源下拉筛选器钻取单个运行源。',
-    '页内直接挂载与沙箱自检：点击右上角「+ 挂载运行源」填写目标 ID、标题及 stateDir/planPath/runsDir/lockPaths 即可持久化接入新任务源；暂无活跃任务时点击「▶ 运行隔离沙箱演练」生成真实锁与事件链，演练后可点「🔓 释放沙箱锁」即时释放排他锁。',
-    'SSE 实时自动同步：服务端监听注册表与沙箱状态变更并通过 SSE 推送 runtime-change 事件，文件锁获取、释放或新事件写入后界面自动更新，无需手动刷新浏览器。',
+    {
+      q: '我在界面里点「已通过」或记了好多批注，会不会弄脏受审项目的 Git 工作区？',
+      a: '不会。所有审阅结论和批注都统一存放在工作台启动根目录的 .skill-family-studio/reviews.json 中，受审兄弟仓库完全保持只读、零写入。',
+    },
   ],
 });
 
@@ -205,25 +279,106 @@ export function renderUserGuideMarkdown() {
     '## 一、这款工具解决什么问题',
     '',
     ...m.whyItExists.flatMap(p => [p, '']),
-    '## 二、两种开箱即用的工作模式（零硬编码通用适配）',
+    `## ${m.conversationalStart.title.replace(/^一、/, '二、')}`,
+    '',
+    m.conversationalStart.intro,
+    '',
+    '| 你的目的 | 对智能体说的一句话示例 |',
+    '| --- | --- |',
+    ...m.conversationalStart.samplePrompts.map(s => `| ${s.intent} | ${s.say} |`),
+    '',
+    ...m.conversationalStart.behindTheScenes.map(step => `- ${step}`),
+    '',
+    '### 两种工作模式（由智能体自动适配或代配）',
     '',
   ];
   for (const mode of m.usageModes) {
     lines.push(
-      `### ${mode.title}`,
+      `#### ${mode.title}`,
       '',
       `- **适用读者**：${mode.audience}`,
       `- **何时选用**：${mode.whenToUse}`,
       `- **工作方式**：${mode.howItWorks}`,
       '',
-      '```bash',
-      mode.command,
-      '```',
-      '',
     );
   }
+  lines.push('## 三、按你的角色与来意选一条动线', '');
+  for (const r of m.roleRoutes) {
+    lines.push(`### ${r.roleTitle}`, '', `> ${r.when}`, '');
+    for (const s of r.steps) {
+      lines.push(`${s.step}. **${s.title}**：${s.detail}`);
+    }
+    lines.push('');
+  }
+  lines.push('## 四、逐页界面全拆解（每个区域是什么、什么时候看、怎么用）', '');
+  for (const p of m.perPageAnatomy) {
+    lines.push(`### ${p.page}`, '', `- **什么时候看这里**：${p.when}`, ...p.areas.map(a => `- ${a}`), '');
+  }
   lines.push(
-    '声明式多仓配置文件 `.studio-workspace.json` 示例（可放在高阶规划仓根目录，或等价写入 `artifact-graph.config.yaml` 的顶层 `studio` 节）：',
+    '## 五、状态流转图与三层双向互锁原理图',
+    '',
+    '### 1. 审阅四态自动与手动迁移图',
+    '',
+    '```mermaid',
+    'stateDiagram-v2',
+    '  [*] --> pending: 初次进入',
+    '  pending --> reviewing: 添加第1条未解决批注（自动）',
+    '  reviewing --> pending: 批注全部解决/清空且无终态结论（自动）',
+    '  pending --> approved: 点击「已通过」',
+    '  reviewing --> approved: 点击「通过并审下一项」',
+    '  reviewing --> changes_requested: 点击「需修改」',
+    '  pending --> deferred: 点击「暂缓」',
+    '```',
+    '',
+    '| 状态标识 | 触发与自动感知条件 | 业务含义 |',
+    '| --- | --- | --- |',
+    ...m.statusRules.map(r => `| **${r.badge}** (\`${r.code}\`) | ${r.trigger} | ${r.meaning} |`),
+    '',
+    '### 2. 高阶 ⇄ 详设 ⇄ 代码测试三层双向互锁闭环图',
+    '',
+    '```mermaid',
+    'flowchart LR',
+    '  P["高阶规划仓<br/>(portfolio-allocations.json)"] <-->|"sourceDigest / targetDigest 双向校对"| S["子仓详细设计<br/>(upstream-bindings.json)"]',
+    '  S <-->|"implements 代码锁 + verifies 验证锁"| C["真实源码与测试<br/>(traceability-version-lock.json)"]',
+    '  C -->|"同时新鲜才判定已满足"| V["🟢 verified_satisfied"]',
+    '```',
+    '',
+    '| 满足概况徽章 | 机器派生依据与业务含义 |',
+    '| --- | --- |',
+    ...m.alignmentGuide.satisfactionStates.map(s => `| **${s.badge}** (\`${s.code}\`) | ${s.meaning} |`),
+    '',
+    '| 告警徽章与错误码 | 识别到什么问题 | 推荐处理动作 |',
+    '| --- | --- | --- |',
+    ...m.alignmentGuide.driftChecks.map(d => `| **${d.badge}** (\`${d.code}\`) | ${d.meaning} | ${d.action} |`),
+    '',
+    '## 六、高频疑问解答 FAQ',
+    '',
+  );
+  for (const f of m.faq) {
+    lines.push(`### Q：${f.q}`, '', `A：${f.a}`, '');
+  }
+  lines.push(
+    '<details>',
+    '<summary>附录：脚本自动化 CLI 与 `.studio-workspace.json` 配置参考（日常由智能体代劳，按需展开）</summary>',
+    '',
+    '```bash',
+    '# 只读探测当前仓库角色（单仓 / 高阶仓 / 详设子仓）与推荐启动参数',
+    'npx skill-family-studio inspect-setup --root /absolute/project/path --json',
+    '',
+    '# 按单仓或关联套组安全生成 .studio-workspace.json',
+    'npx skill-family-studio init-workspace --root /absolute/project/path --mode related',
+    '',
+    '# 幂等守护启动或复用单端口控制台（若已有实例未收录当前仓，会自动隔离分配空闲端口）',
+    'npx skill-family-studio ensure --root /absolute/project/path --port 57630',
+    '',
+    '# 离线导出设计态、双向对齐与运行态快照',
+    'npx skill-family-studio snapshot --root /absolute/project/path',
+    '',
+    '# 核验本地 Node.js 版本、离线前端资产与仓库发现状态',
+    'npx skill-family-studio doctor --root /absolute/project/path',
+    '```',
+    '',
+    '声明式多仓配置 `.studio-workspace.json` 示例（可放在高阶规划仓根目录，或等价写入 `artifact-graph.config.yaml` 顶层 `studio` 节）：',
     '',
     '```json',
     '{',
@@ -231,86 +386,15 @@ export function renderUserGuideMarkdown() {
     '  "role": "portfolio",',
     '  "title": "我的业务域规划工作区",',
     '  "scanRoots": ["..", "../sub-skills"],',
-    '  "groupLabels": {',
-    '    "my-domain": "业务域技能族"',
-    '  },',
+    '  "groupLabels": { "my-domain": "业务域技能族" },',
     '  "collections": [',
-    '    {',
-    '      "id": "domain-stories",',
-    '      "kind": "lifecycle-story-pack",',
-    '      "storiesJson": "artifacts/stories/stories.json",',
-    '      "explanationsDir": "artifacts/stories/explanations"',
-    '    },',
-    '    {',
-    '      "id": "business-diagrams",',
-    '      "kind": "archify-model-scenes",',
-    '      "manifestJson": "artifacts/diagrams/model-and-scenes.json"',
-    '    }',
+    '    { "id": "domain-stories", "kind": "lifecycle-story-pack", "storiesJson": "artifacts/stories/stories.json", "explanationsDir": "artifacts/stories/explanations" },',
+    '    { "id": "business-diagrams", "kind": "archify-model-scenes", "manifestJson": "artifacts/diagrams/model-and-scenes.json" }',
     '  ]',
     '}',
     '```',
     '',
-    '## 三、按阅读任务分主次的审阅动线',
-    '',
-  );
-  for (const r of m.readingOrderGuide) {
-    lines.push(`${r.step}. **${r.stage}**：${r.why}`);
-  }
-  lines.push('', '### 五步走通一次设计审阅与对齐验收', '');
-  for (const s of m.fiveSteps) {
-    lines.push(`#### 第 ${s.step} 步：${s.title}`, '', s.whenAndWhat, '');
-  }
-  lines.push(
-    '## 四、三层双向一致性体检怎么看、怎么跨仓互跳',
-    '',
-    '在「📝 逐项审阅」页签的 **「📋 需求进展与双向对齐总览表」** 中，「满足概况」全部由下游仓库的真实文件存在性与代码/测试锁状态机器派生，严禁人工篡改统计口径：',
-    '',
-    '| 满足概况徽章 | 机器派生依据与业务含义 |',
-    '| --- | --- |',
-    ...m.alignmentGuide.satisfactionStates.map(s => `| **${s.badge}** (\`${s.code}\`) | ${s.meaning} |`),
-    '',
-    '常见的四类双向漂移与缺口告警及处理方式：',
-    '',
-    '| 告警徽章与错误码 | 识别到什么问题 | 推荐操作 |',
-    '| --- | --- | --- |',
-    ...m.alignmentGuide.driftChecks.map(d => `| **${d.badge}** (\`${d.code}\`) | ${d.meaning} | ${d.action} |`),
-    '',
-    '**一键跨仓互跳**：在高阶规划仓的总览表中，点击任意下游承接胶囊可直接跳到目标子技能族仓库并定位该详细设计文档；在子技能族阅读页顶部点击「↖ 上游高阶来源」胶囊，可直接切回高阶规划仓并打开对应的上游需求。',
-    '',
-    '## 五、四种审阅状态的准确含义与流转条件',
-    '',
-    '| 状态标识 | 触发与流转条件 | 业务含义 |',
-    '| --- | --- | --- |',
-    ...m.statusRules.map(r => `| **${r.badge}** (\`${r.code}\`) | ${r.trigger} | ${r.meaning} |`),
-    '',
-    '## 六、宽屏图谱与正文阅读操作技巧',
-    '',
-    ...m.widescreenTips.map(t => `- ${t}`),
-    '',
-    '## 七、迭代版「⚡ 运行监控」四大观测子视图与实操指南',
-    '',
-  );
-  for (const sub of m.runtimeSubpanels) {
-    lines.push(`### ${sub.title}`, '', sub.detail, '');
-  }
-  lines.push(
-    ...m.runtimeTips.map(t => `- ${t}`),
-    '',
-    '## 八、常用命令行入口',
-    '',
-    '```bash',
-    '# 启动单端口控制台（默认监听 127.0.0.1:57630）',
-    'npx skill-family-studio serve --root /absolute/project/path --port 57630',
-    '',
-    '# 幂等守护启动（若已在线则直接复用，供技能与自动化脚本调用）',
-    'npx skill-family-studio ensure --root /absolute/project/path --port 57630',
-    '',
-    '# 离线导出设计态 + 审阅台账 + 双向对齐 + 运行态聚合快照',
-    'npx skill-family-studio snapshot --root /absolute/project/path',
-    '',
-    '# 检查本地 Node.js 版本、依赖包与离线前端资产完整性',
-    'npx skill-family-studio doctor --root /absolute/project/path',
-    '```',
+    '</details>',
   );
   return `${lines.join('\n')}\n`;
 }

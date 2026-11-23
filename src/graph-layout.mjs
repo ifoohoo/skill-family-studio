@@ -110,8 +110,6 @@ export function computeAdaptiveGraphLayout(
 
   for (const layer of activeLayers) {
     const sorted = [...layer.nodes].sort((a, b) => {
-      if (a.uid === selectedUid) return -1;
-      if (b.uid === selectedUid) return 1;
       const degDiff = ((b.inDegree ?? 0) + (b.outDegree ?? 0)) - ((a.inDegree ?? 0) + (a.outDegree ?? 0));
       if (degDiff !== 0) return degDiff;
       return String(a.code ?? a.uid).localeCompare(String(b.code ?? b.uid), 'zh-CN', { numeric: true });
@@ -244,7 +242,8 @@ export function pickDefaultArtifactNode(nodes = []) {
     decision: 68,
     design: 64,
   };
-  const designPool = nodes.filter(n => n.isDesignNode !== false);
+  const humanDesignPool = nodes.filter(n => n.isDesignNode !== false && !n.isMachineContract);
+  const designPool = humanDesignPool.length > 0 ? humanDesignPool : nodes.filter(n => n.isDesignNode !== false);
   const pool = designPool.length > 0 ? designPool : nodes;
   const score = nd => {
     const s = String(nd.status ?? '').trim();

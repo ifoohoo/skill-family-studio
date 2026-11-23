@@ -369,8 +369,8 @@ const READING_ORDER_TIER = Object.freeze({
 
 export function sortItemsForGuidedReview(items = []) {
   return [...items].sort((a, b) => {
-    const tierA = READING_ORDER_TIER[a.type] ?? (typeof a.layerOrder === 'number' ? 10 + a.layerOrder * 10 : 45);
-    const tierB = READING_ORDER_TIER[b.type] ?? (typeof b.layerOrder === 'number' ? 10 + b.layerOrder * 10 : 45);
+    const tierA = a.isMachineContract ? 52 : (READING_ORDER_TIER[a.type] ?? (typeof a.layerOrder === 'number' ? 10 + a.layerOrder * 10 : 45));
+    const tierB = b.isMachineContract ? 52 : (READING_ORDER_TIER[b.type] ?? (typeof b.layerOrder === 'number' ? 10 + b.layerOrder * 10 : 45));
     if (tierA !== tierB) return tierA - tierB;
     return String(a.code ?? a.uid ?? '').localeCompare(String(b.code ?? b.uid ?? ''), 'zh-CN', { numeric: true });
   });
@@ -378,17 +378,19 @@ export function sortItemsForGuidedReview(items = []) {
 
 export function findNextGuidedReviewItem(orderedItems, store, repoId, currentTarget = null) {
   if (!Array.isArray(orderedItems) || orderedItems.length === 0) return null;
+  const humanItems = orderedItems.filter(i => !i.isMachineContract);
+  const pool = humanItems.length > 0 ? humanItems : orderedItems;
   const startIdx = currentTarget
-    ? orderedItems.findIndex(item => (item.uid || item.target) === currentTarget)
+    ? pool.findIndex(item => (item.uid || item.target) === currentTarget)
     : -1;
   const rotated = startIdx >= 0
-    ? [...orderedItems.slice(startIdx + 1), ...orderedItems.slice(0, startIdx + 1)]
-    : orderedItems;
+    ? [...pool.slice(startIdx + 1), ...pool.slice(0, startIdx + 1)]
+    : pool;
 
-  // 优先找下一篇尚未终态签收（待审阅或审阅中）的条目
+  // 优先找下一篇尚未终态签收（待审阅或审阅中）的人读文稿条目
   for (const item of rotated) {
     const rawId = item.uid || item.target;
-    if (rawId === currentTarget && orderedItems.length > 1) continue;
+    if (rawId === currentTarget && pool.length > 1) continue;
     const eff = computeEffectiveReviewStatus(qualifyRepoTargetId(repoId, rawId), store);
     if (eff === 'pending' || eff === 'reviewing') return item;
   }

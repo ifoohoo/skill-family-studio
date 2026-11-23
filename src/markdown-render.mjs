@@ -41,45 +41,171 @@ function renderInlineMarkdown(text) {
   return out;
 }
 
-function renderMermaidOffline(rawLines) {
+export function renderMermaidOffline(rawLines) {
   const cleanLines = rawLines.map(l => l.trim()).filter(l => l && !l.startsWith('%%'));
   const first = cleanLines[0] || '';
   const kindLabel = /^(?:flowchart|graph)\b/i.test(first) ? '流程图'
     : /^sequenceDiagram\b/i.test(first) ? '时序图'
-      : /^stateDiagram(?:-v2)?\b/i.test(first) ? '状态图'
+      : /^stateDiagram(?:-v2)?\b/i.test(first) ? '状态流转图'
         : /^classDiagram\b/i.test(first) ? '类图'
           : /^erDiagram\b/i.test(first) ? '实体关系图' : '结构图';
 
   const nodeLabels = new Map();
+  const nodeOrder = [];
+  const ensureNode = (id, label) => {
+    if (!id) return '';
+    if (!nodeLabels.has(id)) {
+      nodeLabels.set(id, label || id);
+      nodeOrder.push(id);
+    } else if (label && label !== id && nodeLabels.get(id) === id) {
+      nodeLabels.set(id, label);
+    }
+    return id;
+  };
   const regNode = token => {
     const t = String(token ?? '').trim();
     if (!t) return '';
-    if (t === '[*]') return '起点/终点';
+    if (t === '[*]') return ensureNode('__start_end__', '起点 / 终点');
     const m = /^([A-Za-z0-9_.-]+)\s*(?:\["([^"]+)"\]|\[([^\]]+)\]|\("([^"]+)"\)|\(([^)]+)\)|\{([^}]+)\})?$/.exec(t);
-    if (!m) return t.replace(/^["']|["']$/g, '');
+    if (!m) {
+      const clean = t.replace(/^["']|["']$/g, '');
+      return ensureNode(clean, clean);
+    }
     const id = m[1];
     const lbl = (m[2] || m[3] || m[4] || m[5] || m[6] || '').trim().replace(/^["']|["']$/g, '');
-    if (lbl) nodeLabels.set(id, lbl);
-    return nodeLabels.get(id) || id;
+    return ensureNode(id, lbl || id);
   };
 
   const steps = [];
   for (const line of cleanLines.slice(1)) {
-    if (/^(?:subgraph|end|direction|style|classDef|class|click)\b/i.test(line)) continue;
+    if (/^(?:subgraph|end|direction|style|classDef|class|click|participant|actor)\b/i.test(line)) {
+      const pMatch = /^(?:participant|actor)\s+([^\s]+)(?:\s+as\s+(.+))?$/i.exec(line);
+      if (pMatch) ensureNode(pMatch[1], (pMatch[2] || pMatch[1]).trim());
+      continue;
+    }
+    const stateDesc = /^([A-Za-z0-9_.-]+)\s*:\s*([^>-].*)$/.exec(line);
+    if (stateDesc && !line.includes('-->')) {
+      ensureNode(stateDesc[1], stateDesc[2].trim());
+      continue;
+    }
     const seq = /^([^\s:-]+)\s*(?:-+>>?|--+>>?|\.+>>?|-+\))\s*([^\s:]+)\s*:\s*(.+)$/.exec(line);
     if (seq) { steps.push({ from: regNode(seq[1]), to: regNode(seq[2]), rel: seq[3].trim() }); continue; }
-    const pipe = /^(.+?)\s*(?:--+>|==+>|\.-+>)\s*\|([^|]+)\|\s*(.+)$/.exec(line);
+    const pipe = /^(.+?)\s*(?:--+>|==+>|\.-+>|<--+>)\s*\|([^|]+)\|\s*(.+)$/.exec(line);
     if (pipe) { steps.push({ from: regNode(pipe[1]), to: regNode(pipe[3]), rel: pipe[2].trim() }); continue; }
-    const plain = /^(.+?)\s*(?:--+>|==+>|\.-+>)\s*(.+?)(?:\s*:\s*(.+))?$/.exec(line);
+    const plain = /^(.+?)\s*(?:--+>|==+>|\.-+>|<--+>)\s*(.+?)(?:\s*:\s*(.+))?$/.exec(line);
     if (plain) { steps.push({ from: regNode(plain[1]), to: regNode(plain[2]), rel: (plain[3] || '').trim() }); continue; }
-    regNode(line);
+  }
+
+  let svgHtml = '';
+  if (nodeOrder.length > 0 && steps.length > 0) {
+    const inDeg = new Map(nodeOrder.map(id => [id, 0]));
+    const adj = new Map(nodeOrder.map(id => [id, []]));
+    for (const s of steps) {
+      if (s.from !== s.to) {
+        adj.get(s.from)?.push(s.to);
+        inDeg.set(s.to, (inDeg.get(s.to) || 0) + 1);
+      }
+    }
+    const depth = new Map();
+    const queue = nodeOrder.filter(id => (inDeg.get(id) || 0) === 0);
+    if (queue.length === 0) queue.push(nodeOrder[0]);
+    for (const r of queue) depth.set(r, 0);
+    let head = 0;
+    while (head < queue.length) {
+      const cur = queue[head++];
+      const d = depth.get(cur) || 0;
+      for (const nxt of adj.get(cur) || []) {
+        if (!depth.has(nxt) && d < 8) {
+          depth.set(nxt, d + 1);
+          queue.push(nxt);
+        }
+      }
+    }
+    for (const id of nodeOrder) if (!depth.has(id)) depth.set(id, 0);
+    const cols = new Map();
+    for (const id of nodeOrder) {
+      const c = depth.get(id) || 0;
+      if (!cols.has(c)) cols.set(c, []);
+      cols.get(c).push(id);
+    }
+    const colKeys = [...cols.keys()].sort((a, b) => a - b);
+    const boxW = 174;
+    const boxH = 44;
+    const colGap = 54;
+    const rowGap = 24;
+    const padX = 20;
+    const padY = 18;
+    const maxRows = Math.max(1, ...[...cols.values()].map(arr => arr.length));
+    const totalW = padX * 2 + colKeys.length * boxW + Math.max(0, colKeys.length - 1) * colGap;
+    const totalH = padY * 2 + maxRows * boxH + Math.max(0, maxRows - 1) * rowGap;
+    const pos = new Map();
+    colKeys.forEach((ck, ci) => {
+      const arr = cols.get(ck);
+      const colSpanH = arr.length * boxH + Math.max(0, arr.length - 1) * rowGap;
+      const offsetY = padY + Math.round((totalH - padY * 2 - colSpanH) / 2);
+      arr.forEach((id, ri) => {
+        pos.set(id, {
+          x: padX + ci * (boxW + colGap),
+          y: offsetY + ri * (boxH + rowGap),
+          label: nodeLabels.get(id) || id,
+        });
+      });
+    });
+
+    const arrowId = `mmd-arrow-${rawLines.length}-${nodeOrder.length}`;
+    const edgeParts = [];
+    for (const s of steps.slice(0, 40)) {
+      const p1 = pos.get(s.from);
+      const p2 = pos.get(s.to);
+      if (!p1 || !p2) continue;
+      let pathD = '';
+      let lx = 0;
+      let ly = 0;
+      if (p1.x === p2.x && p1.y === p2.y) {
+        const cx = p1.x + boxW / 2;
+        const cy = p1.y;
+        pathD = `M ${cx - 18} ${cy} C ${cx - 18} ${cy - 26}, ${cx + 18} ${cy - 26}, ${cx + 18} ${cy}`;
+        lx = cx;
+        ly = cy - 22;
+      } else if (p2.x > p1.x) {
+        const x1 = p1.x + boxW;
+        const y1 = p1.y + boxH / 2;
+        const x2 = p2.x;
+        const y2 = p2.y + boxH / 2;
+        const mx = (x1 + x2) / 2;
+        pathD = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`;
+        lx = mx;
+        ly = (y1 + y2) / 2 - 6;
+      } else {
+        const x1 = p1.x + boxW / 2;
+        const y1 = p1.y + boxH;
+        const x2 = p2.x + boxW / 2;
+        const y2 = p2.y + boxH;
+        const bow = Math.max(y1, y2) + 22;
+        pathD = `M ${x1} ${y1} C ${x1} ${bow}, ${x2} ${bow}, ${x2} ${y2}`;
+        lx = (x1 + x2) / 2;
+        ly = bow - 4;
+      }
+      edgeParts.push(`<path d="${pathD}" fill="none" stroke="var(--st-accent)" stroke-width="1.6" stroke-opacity="0.82" marker-end="url(#${arrowId})" />`);
+      if (s.rel) {
+        const cleanRel = s.rel.length > 18 ? `${s.rel.slice(0, 17)}…` : s.rel;
+        edgeParts.push(`<text x="${lx}" y="${ly}" text-anchor="middle" fill="var(--st-fg-muted)" font-size="10.5">${escapeHtml(cleanRel)}</text>`);
+      }
+    }
+    const nodeParts = [];
+    for (const id of nodeOrder) {
+      const p = pos.get(id);
+      const lbl = p.label.length > 16 ? `${p.label.slice(0, 15)}…` : p.label;
+      nodeParts.push(`<g><rect x="${p.x}" y="${p.y}" width="${boxW}" height="${boxH}" rx="8" fill="var(--st-surface)" stroke="var(--st-border-strong)" stroke-width="1.4" /><text x="${p.x + boxW / 2}" y="${p.y + 26}" text-anchor="middle" fill="var(--st-fg)" font-size="12" font-weight="600">${escapeHtml(lbl)}</text></g>`);
+    }
+    svgHtml = `<div class="st-mermaid-svg-wrap"><svg class="st-mermaid-svg" viewBox="0 0 ${totalW} ${totalH}" width="${totalW}" height="${totalH}" role="img" aria-label="${escapeHtml(kindLabel)}"><defs><marker id="${arrowId}" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="var(--st-accent)" /></marker></defs>${edgeParts.join('')}${nodeParts.join('')}</svg></div>`;
   }
 
   const stepsHtml = steps.length
-    ? `<ol class="st-mermaid-steps">${steps.slice(0, 40).map(s => `<li><span class="st-chip">${escapeHtml(s.from)}</span><span class="st-mermaid-rel">${escapeHtml(s.rel || '→')}</span><span class="st-chip">${escapeHtml(s.to)}</span></li>`).join('')}</ol>`
+    ? `<ol class="st-mermaid-steps">${steps.slice(0, 40).map(s => `<li><span class="st-chip">${escapeHtml(nodeLabels.get(s.from) || s.from)}</span><span class="st-mermaid-rel">${escapeHtml(s.rel || '→')}</span><span class="st-chip">${escapeHtml(nodeLabels.get(s.to) || s.to)}</span></li>`).join('')}</ol>`
     : '';
   const codeHtml = `<pre class="st-code-block" data-lang="mermaid"><code>${rawLines.map(escapeHtml).join('\n')}</code></pre>`;
-  return `<div class="st-mermaid-card"><div class="st-mermaid-head"><span class="st-badge st-badge-indigo">Mermaid ${escapeHtml(kindLabel)}（离线结构化解析）</span><span class="st-muted-xs">${steps.length ? `共 ${steps.length} 条流转边` : '源码预览'}</span></div>${stepsHtml}${steps.length ? `<details class="st-mermaid-raw"><summary class="st-muted-xs">展开 Mermaid 源码</summary>${codeHtml}</details>` : codeHtml}</div>`;
+  return `<div class="st-mermaid-card"><div class="st-mermaid-head"><span class="st-badge st-badge-indigo">Mermaid ${escapeHtml(kindLabel)}（离线可视化图）</span><span class="st-muted-xs">${steps.length ? `共 ${nodeOrder.length} 个节点 · ${steps.length} 条流转边` : '源码预览'}</span></div>${svgHtml}${steps.length ? `<details class="st-mermaid-raw"><summary class="st-muted-xs">展开关系明细与 Mermaid 源码</summary>${stepsHtml}${codeHtml}</details>` : codeHtml}</div>`;
 }
 
 export function renderMarkdownToHtml(markdown, { idPrefix = 'sec', stripNavLine = false } = {}) {
@@ -111,6 +237,23 @@ export function renderMarkdownToHtml(markdown, { idPrefix = 'sec', stripNavLine 
       blocks.push(lang === 'mermaid'
         ? renderMermaidOffline(codeLines)
         : `<pre class="st-code-block"${lang ? ` data-lang="${escapeHtml(lang)}"` : ''}><code>${codeLines.map(escapeHtml).join('\n')}</code></pre>`);
+      continue;
+    }
+    if (/^<details(?:\s+open)?>$/i.test(trimmed)) {
+      const inner = [];
+      let sumText = '展开详细内容';
+      i++;
+      if (i < lines.length) {
+        const sm = /^<summary>([\s\S]*?)<\/summary>$/i.exec(lines[i].trim());
+        if (sm) { sumText = sm[1].trim(); i++; }
+      }
+      while (i < lines.length && !/^<\/details>$/i.test(lines[i].trim())) {
+        inner.push(lines[i]);
+        i++;
+      }
+      if (i < lines.length) i++;
+      const sub = renderMarkdownToHtml(inner.join('\n'), { idPrefix: `${idPrefix}-d${++seq}` });
+      blocks.push(`<details class="st-details-box"><summary>${escapeHtml(sumText)}</summary><div class="st-details-body">${sub.html}</div></details>`);
       continue;
     }
     const hMatch = /^(#{2,4})\s+(.+?)(?:\s*\{#([A-Za-z0-9_-]+)\})?$/.exec(trimmed);

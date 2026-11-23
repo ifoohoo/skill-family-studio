@@ -3,6 +3,7 @@
 // @feature STU003
 // @feature STU004
 // @feature STU005
+// @feature STU006
 
 export {
   DEFAULT_STUDIO_REVIEWS_PATH,
@@ -57,6 +58,28 @@ export {
   STUDIO_GUIDE_MODEL,
   renderUserGuideMarkdown,
 } from './guide-content.mjs';
+
+export {
+  escapeHtml,
+  renderMarkdownToHtml,
+  renderMermaidOffline,
+  sanitizePublicText,
+} from './markdown-render.mjs';
+
+export {
+  computePathDigest,
+  initWorkspaceConfig,
+  inspectSetup,
+} from './setup-advisor.mjs';
+
+export {
+  buildSandboxFleetSample,
+  collectSessionFleet,
+  parseAntigravityTranscript,
+  parseClaudeSessionJsonl,
+  parseCodexSessionJsonl,
+  sanitizeFleetText,
+} from './session-fleet.mjs';
 
 export {
   DEFAULT_LOCK_WARN_MS,

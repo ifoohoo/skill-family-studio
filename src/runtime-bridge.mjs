@@ -210,9 +210,83 @@ function summarizeMilestones(tasks) {
   return milestones;
 }
 
+function aggregateTreeNode(node) {
+  if (!node.children || node.children.length === 0) {
+    const st = node.status || 'todo';
+    node.total = 1;
+    node.done = st === 'done' ? 1 : 0;
+    node.running = st === 'running' ? 1 : 0;
+    node.blocked = st === 'blocked' ? 1 : 0;
+    node.todo = st === 'todo' ? 1 : 0;
+    node.percent = st === 'done' ? 100 : 0;
+    return node;
+  }
+  let total = 0, done = 0, running = 0, blocked = 0, todo = 0;
+  for (const ch of node.children) {
+    aggregateTreeNode(ch);
+    total += ch.total;
+    done += ch.done;
+    running += ch.running;
+    blocked += ch.blocked;
+    todo += ch.todo;
+  }
+  node.total = total;
+  node.done = done;
+  node.running = running;
+  node.blocked = blocked;
+  node.todo = todo;
+  node.percent = total > 0 ? Math.round((done / total) * 100) : 0;
+  node.status = blocked > 0 ? 'blocked' : (running > 0 ? 'running' : (done === total && total > 0 ? 'done' : 'todo'));
+  return node;
+}
+
+function collectLeafTasks(tree, out = []) {
+  for (const node of tree) {
+    if (!node.children || node.children.length === 0) {
+      out.push(node);
+    } else {
+      collectLeafTasks(node.children, out);
+    }
+  }
+  return out;
+}
+
+function buildFocusBanner(tree, tasks) {
+  const runningLeaf = tasks.find(t => t.status === 'running') || tasks.find(t => t.status === 'blocked') || tasks.find(t => t.status === 'todo') || null;
+  const activePath = [];
+  const findPath = (nodes, targetId, trail) => {
+    for (const n of nodes) {
+      const next = [...trail, n.title];
+      if (n.id === targetId && (!n.children || n.children.length === 0)) return next;
+      if (n.children?.length) {
+        const hit = findPath(n.children, targetId, next);
+        if (hit) return hit;
+      }
+    }
+    return null;
+  };
+  if (runningLeaf) {
+    const p = findPath(tree, runningLeaf.id, []);
+    if (p) activePath.push(...p);
+  }
+  return {
+    activePath,
+    currentTaskId: runningLeaf?.id || null,
+    currentTitle: runningLeaf?.title || (tasks.length ? '全部任务已完结' : '暂无活跃任务'),
+    currentStatus: runningLeaf?.status || (tasks.length ? 'done' : 'none'),
+  };
+}
+
+function extractBlockedBy(text) {
+  const m = /(?:\(|（|\b)(?:blockedBy|dependsOn|依赖)\s*[:：]\s*([^)）]+)(?:\)|）)?/i.exec(String(text ?? ''));
+  if (!m) return [];
+  return m[1].split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
+}
+
 export function parsePlanSummary(content, ext = '.md', sourceLabel = 'plan') {
   const cleanExt = String(ext ?? '.md').toLowerCase();
   const tasks = [];
+  let tree = [];
   let format = 'markdown';
 
   if (cleanExt === '.csv' || cleanExt === 'csv') {
@@ -226,47 +300,72 @@ export function parsePlanSummary(content, ext = '.md', sourceLabel = 'plan') {
       const statusIdx = findIdx(['status', 'state', 'phase', '状态', '阶段']);
       const groupIdx = findIdx(['group', 'milestone', 'stage', '里程碑', '分组']);
       const detailIdx = findIdx(['detail', 'note', 'owner', '说明', '负责人']);
+      const stageMap = new Map();
       for (let i = 1; i < rows.length; i += 1) {
         const cols = rows[i];
         const rawTitle = titleIdx >= 0 ? cols[titleIdx] : cols[1] ?? cols[0];
         if (!rawTitle) continue;
         const rawStatus = statusIdx >= 0 ? cols[statusIdx] : 'todo';
         const status = normalizeTaskStatus(rawStatus) ?? 'todo';
-        tasks.push({
+        const grp = sanitizePublicText((groupIdx >= 0 && cols[groupIdx]) ? cols[groupIdx] : 'CSV 进度清单');
+        const leaf = {
           id: (idIdx >= 0 && cols[idIdx]) ? cols[idIdx] : `CSV-${i}`,
           title: sanitizePublicText(rawTitle),
+          kind: 'step',
+          depth: 1,
           status,
           rawStatus: rawStatus || status,
-          group: sanitizePublicText((groupIdx >= 0 && cols[groupIdx]) ? cols[groupIdx] : 'CSV 进度清单'),
+          group: grp,
           detail: sanitizePublicText((detailIdx >= 0 && cols[detailIdx]) ? cols[detailIdx] : ''),
+          blockedBy: [],
           sourceType: 'csv',
           sourceLabel,
-        });
+          children: [],
+        };
+        tasks.push(leaf);
+        if (!stageMap.has(grp)) {
+          const stNode = { id: `GRP:${grp}`, title: grp, kind: 'stage', depth: 0, children: [], sourceLabel };
+          stageMap.set(grp, stNode);
+          tree.push(stNode);
+        }
+        stageMap.get(grp).children.push(leaf);
       }
     }
   } else if (cleanExt === '.json' || cleanExt === 'json') {
     format = 'json';
     try {
       const parsed = JSON.parse(String(content ?? ''));
-      const list = Array.isArray(parsed)
-        ? parsed
-        : (Array.isArray(parsed?.tasks) ? parsed.tasks : (Array.isArray(parsed?.steps) ? parsed.steps : (Array.isArray(parsed?.actual_steps) ? parsed.actual_steps : [])));
-      list.forEach((entry, idx) => {
-        if (!entry || typeof entry !== 'object') return;
+      const convertNode = (entry, idx, depth, groupName) => {
+        if (!entry || typeof entry !== 'object') return null;
+        const rawChildren = entry.children || entry.subtasks || entry.steps || entry.tasks || entry.stages || entry.phases || null;
+        const title = sanitizePublicText(String(entry.title ?? entry.name ?? entry.id ?? `节点 ${idx + 1}`));
+        const curGroup = depth === 0 ? title : groupName;
+        const children = Array.isArray(rawChildren)
+          ? rawChildren.map((ch, ci) => convertNode(ch, ci, depth + 1, curGroup)).filter(Boolean)
+          : [];
         const status = entry.status
           ? (normalizeTaskStatus(entry.status) ?? 'todo')
           : (typeof entry.exitCode === 'number' ? (entry.exitCode === 0 ? 'done' : 'blocked') : (entry.done === true ? 'done' : 'todo'));
-        tasks.push({
-          id: String(entry.id ?? entry.code ?? `STEP-${idx + 1}`),
-          title: sanitizePublicText(String(entry.title ?? entry.name ?? entry.id ?? `步骤 ${idx + 1}`)),
+        return {
+          id: String(entry.id ?? entry.code ?? `STEP-${depth}-${idx + 1}`),
+          title,
+          kind: children.length ? (depth === 0 ? 'wave' : 'task') : 'step',
+          depth,
           status,
           rawStatus: String(entry.status ?? (typeof entry.exitCode === 'number' ? `exit=${entry.exitCode}` : status)),
-          group: sanitizePublicText(String(entry.group ?? entry.milestone ?? 'JSON 阶段步骤')),
+          group: sanitizePublicText(String(entry.group ?? entry.milestone ?? curGroup ?? 'JSON 阶段步骤')),
           detail: sanitizePublicText(typeof entry.durationMs === 'number' ? `耗时 ${(entry.durationMs / 1000).toFixed(2)}s` : String(entry.detail ?? '')),
+          blockedBy: Array.isArray(entry.blockedBy) ? entry.blockedBy.map(String) : [],
           sourceType: 'json',
           sourceLabel,
-        });
-      });
+          children,
+        };
+      };
+      const topList = Array.isArray(parsed)
+        ? parsed
+        : (parsed?.waves || parsed?.phases || parsed?.milestones || parsed?.tasks || parsed?.steps || parsed?.actual_steps || []);
+      tree = (Array.isArray(topList) ? topList : []).map((e, i) => convertNode(e, i, 0, 'JSON 阶段步骤')).filter(Boolean);
+      tasks.push(...collectLeafTasks(tree));
     } catch {}
   } else {
     const lines = String(content ?? '').split(/\r?\n/);
@@ -274,6 +373,30 @@ export function parsePlanSummary(content, ext = '.md', sourceLabel = 'plan') {
     let currentGroup = '核心待办与执行阶段';
     let checkboxSeq = 0;
     let tableSeq = 0;
+    const headingStack = [];
+    const cbStack = [];
+    const rootTreeNodes = [];
+
+    const attachHeading = (level, cleanHeading) => {
+      while (headingStack.length > 0 && headingStack[headingStack.length - 1].level >= level) {
+        headingStack.pop();
+      }
+      cbStack.length = 0;
+      const node = {
+        id: `HD-${headingStack.length + 1}-${cleanHeading.slice(0, 24)}`,
+        title: cleanHeading,
+        kind: level <= 2 ? 'wave' : 'stage',
+        depth: headingStack.length,
+        level,
+        group: cleanHeading,
+        blockedBy: [],
+        sourceLabel,
+        children: [],
+      };
+      if (headingStack.length > 0) headingStack[headingStack.length - 1].children.push(node);
+      else rootTreeNodes.push(node);
+      headingStack.push(node);
+    };
 
     for (let i = 0; i < lines.length; i += 1) {
       const line = lines[i];
@@ -281,27 +404,48 @@ export function parsePlanSummary(content, ext = '.md', sourceLabel = 'plan') {
       if (inFence) continue;
       const headingMatch = /^(#{1,4})\s+(.+)$/.exec(line);
       if (headingMatch) {
-        const cleanHeading = cleanMarkdownInline(headingMatch[2]);
-        if (cleanHeading) currentGroup = sanitizePublicText(cleanHeading);
+        const level = headingMatch[1].length;
+        const cleanHeading = sanitizePublicText(cleanMarkdownInline(headingMatch[2]));
+        if (cleanHeading) {
+          currentGroup = cleanHeading;
+          if (level >= 2) attachHeading(level, cleanHeading);
+        }
         continue;
       }
-      const cbMatch = /^\s*[-*+]\s+\[([ xX/\-~!])\]\s+(.+)$/.exec(line);
+      const cbMatch = /^(\s*)[-*+]\s+\[([ xX/\-~!])\]\s+(.+)$/.exec(line);
       if (cbMatch) {
         checkboxSeq += 1;
-        const mark = cbMatch[1].toLowerCase();
+        const indent = cbMatch[1].replace(/\t/g, '  ').length;
+        const mark = cbMatch[2].toLowerCase();
         const status = mark === 'x' ? 'done' : (mark === '!' ? 'blocked' : ((mark === '/' || mark === '-' || mark === '~') ? 'running' : 'todo'));
-        const cleaned = sanitizePublicText(cleanMarkdownInline(cbMatch[2]));
+        const cleaned = sanitizePublicText(cleanMarkdownInline(cbMatch[3]));
         const idExtract = /^\[([A-Za-z0-9_.-]+)\]\s*(.+)$/.exec(cleaned);
-        tasks.push({
+        const blockedBy = extractBlockedBy(cleaned);
+        while (cbStack.length > 0 && cbStack[cbStack.length - 1].indent >= indent) cbStack.pop();
+        const parentContainer = cbStack.length > 0
+          ? cbStack[cbStack.length - 1].node
+          : (headingStack.length > 0 ? headingStack[headingStack.length - 1] : null);
+        const node = {
           id: idExtract ? idExtract[1] : `TASK-${String(checkboxSeq).padStart(2, '0')}`,
           title: idExtract ? idExtract[2] : cleaned,
+          kind: 'step',
+          depth: parentContainer ? parentContainer.depth + 1 : 0,
           status,
           rawStatus: `[${mark}]`,
           group: currentGroup,
           detail: '',
+          blockedBy,
           sourceType: 'markdown-checkbox',
           sourceLabel,
-        });
+          children: [],
+        };
+        if (parentContainer) {
+          if (parentContainer.kind === 'step') parentContainer.kind = 'task';
+          parentContainer.children.push(node);
+        } else {
+          rootTreeNodes.push(node);
+        }
+        cbStack.push({ indent, node });
         continue;
       }
       if (/^\s*\|.+\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
@@ -328,31 +472,63 @@ export function parsePlanSummary(content, ext = '.md', sourceLabel = 'plan') {
           if (detectedStatus) {
             tableSeq += 1;
             const titleCell = cells.find((c, idx) => idx !== statusColIdx && c.length > 0) || `条目 ${tableSeq}`;
-            tasks.push({
+            const parentContainer = headingStack.length > 0 ? headingStack[headingStack.length - 1] : null;
+            const leaf = {
               id: `ROW-${String(tableSeq).padStart(2, '0')}`,
               title: sanitizePublicText(titleCell),
+              kind: 'step',
+              depth: parentContainer ? parentContainer.depth + 1 : 0,
               status: detectedStatus,
               rawStatus: rawStatusText || detectedStatus,
               group: currentGroup,
               detail: sanitizePublicText(cells.slice(1).filter(Boolean).slice(0, 2).join(' · ')),
+              blockedBy: [],
               sourceType: 'markdown-table',
               sourceLabel,
-            });
+              children: [],
+            };
+            if (parentContainer) parentContainer.children.push(leaf);
+            else rootTreeNodes.push(leaf);
           }
           i += 1;
         }
         i -= 1;
       }
     }
+
+    const pruneEmptyContainers = nodes => nodes
+      .map(n => {
+        if (n.kind === 'wave' || n.kind === 'stage') {
+          n.children = pruneEmptyContainers(n.children);
+          return n.children.length > 0 ? n : null;
+        }
+        return n;
+      })
+      .filter(Boolean);
+    tree = pruneEmptyContainers(rootTreeNodes);
+    tasks.push(...collectLeafTasks(tree));
   }
 
+  for (const rootNode of tree) aggregateTreeNode(rootNode);
   const total = tasks.length;
   const done = tasks.filter(t => t.status === 'done').length;
   const running = tasks.filter(t => t.status === 'running').length;
   const blocked = tasks.filter(t => t.status === 'blocked').length;
   const todo = tasks.filter(t => t.status === 'todo').length;
   const percent = total > 0 ? Math.round((done / total) * 100) : 0;
-  return { format, total, done, running, blocked, todo, percent, tasks, milestones: summarizeMilestones(tasks) };
+  return {
+    format,
+    total,
+    done,
+    running,
+    blocked,
+    todo,
+    percent,
+    tasks,
+    milestones: summarizeMilestones(tasks),
+    tree,
+    focusBanner: buildFocusBanner(tree, tasks),
+  };
 }
 export async function inspectStateStoreReadOnly(stateDir, { lockWarnMs = DEFAULT_LOCK_WARN_MS, nowMs = Date.now() } = {}) {
   if (!stateDir) return null;
@@ -767,13 +943,15 @@ export async function runSandboxExercise({ holdLock = true, simulateTimeout = tr
     [
       '# 隔离沙箱演练计划',
       '',
-      '## 阶段一：并发写集锁与哈希链初始化',
-      '- [x] [SBX-01] 获取 Foundation 令牌排他锁 (`token-lock`)',
-      '- [x] [SBX-02] 追加 `state-store` SHA-256 创世与步骤事件链',
+      '## Wave 1 · 沙箱三层长任务推进树',
       '',
-      '## 阶段二：子进程监督与超时保护',
-      '- [x] [SBX-03] 运行正常退出的轻量探针进程 (`EXITED`)',
-      '- [/] [SBX-04] 运行受管超时强杀探针并保持沙箱排他锁待手动释放',
+      '### 阶段一：并发写集锁与哈希链初始化',
+      '- [x] [SBX-01] 获取 Foundation 令牌排他锁 (`token-lock`)',
+      '- [x] [SBX-02] 追加 `state-store` SHA-256 创世与步骤事件链 (blockedBy: SBX-01)',
+      '',
+      '### 阶段二：子进程监督与超时保护',
+      '- [x] [SBX-03] 运行正常退出的轻量探针进程 (`EXITED`, blockedBy: SBX-02)',
+      '- [/] [SBX-04] 运行受管超时强杀探针并保持沙箱排他锁待手动释放 (blockedBy: SBX-03)',
       '',
     ].join('\n'),
     'utf8',
@@ -911,7 +1089,14 @@ export async function collectStudioRuntimeView({
       }
       const runsDir = join(rec.realPath, '.runs');
       const stateDir = (await safeLstat(join(rec.realPath, '.artifacts/state-store'))) ? join(rec.realPath, '.artifacts/state-store') : undefined;
-      if ((await safeLstat(runsDir)) || stateDir) {
+      let autoPlanPath;
+      for (const candPlan of ['PLAN.md', 'execution-plan.md', 'artifacts/plan.md', '.runs/execution-plan.md']) {
+        if ((await safeLstat(join(rec.realPath, candPlan)))?.isFile()) {
+          autoPlanPath = join(rec.realPath, candPlan);
+          break;
+        }
+      }
+      if ((await safeLstat(runsDir)) || stateDir || autoPlanPath) {
         autoTargets.push({
           id: `auto:${rec.id}`,
           repoId: rec.id,
@@ -919,6 +1104,7 @@ export async function collectStudioRuntimeView({
           badge: '自动发现',
           runsDir: (await safeLstat(runsDir)) ? runsDir : undefined,
           stateDir,
+          planPath: autoPlanPath,
           lockPaths: hasVlock ? [vlockPath] : [],
         });
       }
