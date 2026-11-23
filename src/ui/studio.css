@@ -1244,9 +1244,11 @@ html, body {
 .st-fleet-ev-fields { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 6px 12px; padding: 10px 0; border-bottom: 1px dashed var(--st-border); font-size: 12.5px; }
 .st-fleet-ev-val { font-weight: 600; color: var(--st-fg); }
 .st-fleet-ev-body { margin-top: 8px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--st-border); background: var(--st-subtle); font-size: 12.5px; }
-.st-fleet-md-h { margin: 8px 0 4px; font-size: 13.5px; }
-.st-fleet-md-p { margin: 4px 0; }
-.st-fleet-md-list { margin: 4px 0 6px 18px; padding: 0; }
+.st-fleet-md-h { margin: 12px 0 6px; font-size: 13.5px; }
+.st-fleet-md-p { margin: 5px 0; line-height: 1.65; }
+.st-fleet-md-list { margin: 5px 0 8px 18px; padding: 0; line-height: 1.6; }
+.st-fleet-md-quote { margin: 8px 0; padding: 8px 12px; border-left: 3px solid var(--st-indigo-bd); background: var(--st-subtle); border-radius: 6px; }
+.st-fleet-md-hr { border: 0; border-top: 1px solid var(--st-border); margin: 12px 0; }
 
 /* Wave 12 & Wave 13：自引导三步条、只读条、轻量撤销提示条与防呆锚点 */
 .st-tab-aux {

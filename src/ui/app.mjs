@@ -6,7 +6,7 @@
 
 import { computeAdaptiveGraphLayout, pickDefaultArtifactNode } from '../graph-layout.mjs';
 import { buildReviewStatusFlowSvg, buildTriLayerLockSvg } from './diagram-svg.mjs';
-import { mountFleetMonitor } from './fleet-ui.mjs';
+import { mountFleetMonitor, renderSafeMarkdownToDom } from './fleet-ui.mjs';
 import { closeGlobalTooltip, GLOSSARY, infoTrigger, initTooltipManager, isTooltipOpen, renderEntityBrief, thWithInfo } from './tooltips.mjs';
 
 const STATUS_META = {
@@ -32,7 +32,6 @@ const state = {
   reviewMode: 'reader', // 'alignment' | 'reader'
   alignFilter: 'all',
   alignQuery: '',
-  reviewCategory: 'all',
   reviewStatusFilter: 'all',
   reviewQuery: '',
   reviewManualToggles: new Map(),
@@ -310,6 +309,7 @@ function openAddRepoModal() {
   };
   const fPath = mkField('本地仓库路径 *', '例如：../another-skill-repo 或本地绝对路径', '', true);
   const fTitle = mkField('自定义显示名称（可选）', '留空则自动采用 package.json / .studio-workspace.json 名称', '');
+  const fGroup = mkField('所属分组标签（可选）', '例如：我的技能域（留空则自动按父目录分组）', '');
   const fDesc = mkField('自定义项目说明（可选）', '留空则自动读取 package.json#description 或 README.md 首段', '');
   const errEl = el('div', '', 'st-guard-error');
   errEl.hidden = true;
@@ -338,6 +338,7 @@ function openAddRepoModal() {
         body: JSON.stringify({
           repoPath: fPath.inp.value.trim(),
           title: fTitle.inp.value.trim(),
+          groupLabel: fGroup.inp.value.trim(),
           description: fDesc.inp.value.trim(),
         }),
       });
@@ -352,7 +353,7 @@ function openAddRepoModal() {
     }
   });
   actions.append(cancelBtn, submitBtn);
-  modal.append(head, desc, fPath.box, fTitle.box, fDesc.box, errEl, actions);
+  modal.append(head, desc, fPath.box, fTitle.box, fGroup.box, fDesc.box, errEl, actions);
   backdrop.append(modal);
   backdrop.addEventListener('click', ev => { if (ev.target === backdrop) backdrop.remove(); });
   document.body.append(backdrop);
@@ -606,7 +607,6 @@ async function jumpToRepoAndItem(targetRepoId, targetUidOrCode, nextTab = 'revie
       || list.find(i => clean.includes(':') && (i.uid === clean || i.code === clean.split(':').slice(1).join(':')));
     if (hit) state.selectedUid = hit.uid;
   }
-  state.reviewCategory = 'all';
   state.reviewStatusFilter = 'all';
   state.reviewQuery = '';
   state.selectedAnchor = null;
@@ -824,16 +824,14 @@ async function mountDocumentReader(container, item, options = {}) {
     const pairLeft = el('div', null, 'st-graph-controls');
     if (companion) {
       const jumpLabel = item.isMachineContract
-        ? `📖 切换到对应的人读版 Markdown 文档（${companion.code || companion.title}）→`
-        : `🗂️ 查看对应的结构化数据契约（${companion.path || companion.code}）→`;
+        ? `📖 切换到对应的人读版 Markdown 文档（${companion.title || companion.code}）→`
+        : `🗂️ 查看对应的结构化数据契约（${companion.title || companion.code}）→`;
       const jumpBtn = el('button', jumpLabel, 'st-jump-pill');
       jumpBtn.type = 'button';
+      jumpBtn.title = companion.path || '';
       jumpBtn.addEventListener('click', () => {
         state.selectedUid = companion.uid;
         state.selectedAnchor = null;
-        if (state.reviewCategory !== 'all' && companion.category && state.reviewCategory !== companion.category) {
-          state.reviewCategory = 'all';
-        }
         renderActiveTab();
       });
       pairLeft.append(jumpBtn);
@@ -883,10 +881,11 @@ async function mountDocumentReader(container, item, options = {}) {
     bindBar.append(el('span', `图节点「${archifyContext.label || archifyContext.nodeId}」关联说明：`, 'st-muted-xs'));
     for (const b of archifyContext.bindings.slice(0, 8)) {
       const targetItem = resolveStudioItemByPageId(b.pageId);
-      const labelTxt = `${targetItem?.code || b.pageId}${b.anchor ? ` #${b.anchor}` : ''}`;
+      const labelTxt = `${targetItem?.title || b.pageId}${b.anchor ? ` #${b.anchor}` : ''}`;
       const isCur = targetItem?.uid === item.uid && (b.anchor || null) === anchorId;
       const chipBtn = el('button', labelTxt, `st-btn${isCur ? ' is-active' : ''}`);
       chipBtn.type = 'button';
+      chipBtn.title = `${targetItem?.code || b.pageId}${targetItem?.path ? ` · ${targetItem.path}` : ''}`;
       chipBtn.style.height = '26px';
       chipBtn.style.fontSize = '11.5px';
       chipBtn.addEventListener('click', () => {
@@ -1619,7 +1618,8 @@ function renderGraphPanel() {
       el('span', '当前位置：', 'st-muted-xs'),
       el('span', curNode.layerLabel || curNode.layer, 'st-badge st-badge-indigo'),
       infoTrigger(`layer:${curNode.layer}`, document),
-      el('strong', `${curNode.code} · ${curNode.title}`),
+      el('strong', curNode.title || curNode.code),
+      ...(curNode.code && curNode.code !== curNode.title ? [el('span', curNode.code, 'st-badge st-badge-zinc')] : []),
       el('span', `上游 ${upEdges.length} 项 / 下游 ${downEdges.length} 项`, 'st-muted-xs'),
     );
     if (state.focusSubgraph && upEdges.length === 0 && downEdges.length === 0) {
@@ -1885,16 +1885,17 @@ function renderGraphPanel() {
         const g = svgEl('g', { class: `st-node-group${nd.uid === state.selectedUid ? ' is-selected' : ''}` });
         g.dataset.uid = nd.uid;
         g.append(svgEl('rect', { x: nd.x, y: nd.y, width: nd.w, height: nd.h, rx: 8, class: 'st-node-rect' }));
-        const cTxt = svgEl('text', { x: nd.x + 10, y: nd.y + 21, class: 'st-node-code' });
-        const rawCodeLine = `${nd.code} · ${nd.typeLabel}`;
-        const maxCodeChars = Math.max(8, Math.floor((nd.w - 92) / 7.5));
-        cTxt.textContent = rawCodeLine.length > maxCodeChars ? `${rawCodeLine.slice(0, maxCodeChars - 1)}…` : rawCodeLine;
+        const tTxt = svgEl('text', { x: nd.x + 10, y: nd.y + 21, class: 'st-node-title' });
+        const maxTitleChars = Math.max(8, Math.floor((nd.w - 94) / 13));
+        const rawTitle = nd.title || nd.code;
+        tTxt.textContent = rawTitle.length > maxTitleChars ? `${rawTitle.slice(0, maxTitleChars - 1)}…` : rawTitle;
         const sTxt = svgEl('text', { x: nd.x + nd.w - 10, y: nd.y + 21, 'text-anchor': 'end', fill: sm.color, class: 'st-node-status' });
         sTxt.textContent = `${sm.dot} ${sm.label}`;
-        const tTxt = svgEl('text', { x: nd.x + 10, y: nd.y + 44, class: 'st-node-title' });
-        const maxChars = Math.max(12, Math.floor((nd.w - 20) / 13));
-        tTxt.textContent = nd.title.length > maxChars ? `${nd.title.slice(0, maxChars - 1)}…` : nd.title;
-        g.append(cTxt, sTxt, tTxt);
+        const cTxt = svgEl('text', { x: nd.x + 10, y: nd.y + 44, class: 'st-node-code' });
+        const rawCodeLine = `${nd.code} · ${nd.typeLabel}`;
+        const maxCodeChars = Math.max(12, Math.floor((nd.w - 20) / 7.5));
+        cTxt.textContent = rawCodeLine.length > maxCodeChars ? `${rawCodeLine.slice(0, maxCodeChars - 1)}…` : rawCodeLine;
+        g.append(tTxt, sTxt, cTxt);
         g.addEventListener('click', ev => {
           ev.stopPropagation();
           state.selectedUid = nd.uid;
@@ -2375,10 +2376,20 @@ function renderReviewPanel() {
   ];
 
   const resetReviewFilters = () => {
-    state.reviewCategory = 'all';
     state.reviewStatusFilter = 'all';
     state.reviewQuery = '';
     renderReviewPanel();
+  };
+
+  const getFilteredReviewItems = () => {
+    const q = state.reviewQuery.trim().toLowerCase();
+    const allItems = state.snap.reviewItems || [];
+    return allItems.filter(item => {
+      const eff = getEffectiveStatus(item.target || item.uid);
+      if (state.reviewStatusFilter !== 'all' && eff !== state.reviewStatusFilter) return false;
+      if (q && !`${item.code} ${item.title} ${item.summary || ''} ${item.typeLabel}`.toLowerCase().includes(q)) return false;
+      return true;
+    });
   };
 
   const syncReaderToFiltered = filteredItems => {
@@ -2401,18 +2412,12 @@ function renderReviewPanel() {
     mountDocumentReader(readerCard, targetItem);
   };
 
-  const paintList = () => {
+  const paintList = (matchedInput = null) => {
     listWrap.replaceChildren();
     const q = state.reviewQuery.trim().toLowerCase();
     const hasFilter = Boolean(q || state.reviewStatusFilter !== 'all');
     const allItems = state.snap.reviewItems || [];
-    const matchedItems = allItems.filter(item => {
-      if (state.reviewCategory !== 'all' && item.category !== state.reviewCategory) return false;
-      const eff = getEffectiveStatus(item.target || item.uid);
-      if (state.reviewStatusFilter !== 'all' && eff !== state.reviewStatusFilter) return false;
-      if (q && !`${item.code} ${item.title} ${item.summary || ''} ${item.typeLabel}`.toLowerCase().includes(q)) return false;
-      return true;
-    });
+    const matchedItems = Array.isArray(matchedInput) ? matchedInput : getFilteredReviewItems();
     if (!matchedItems.length) {
       listWrap.append(el('p', '当前筛选条件下暂无匹配项。', 'st-muted-xs'));
       const clrBtn = el('button', '🔄 清空筛选条件', 'st-btn');
@@ -2505,18 +2510,27 @@ function renderReviewPanel() {
     }
     return matchedItems;
   };
+  const renderSidebarAndReader = (forceSyncReader = true) => {
+    const matched = getFilteredReviewItems();
+    const selValid = matched.some(i => i.uid === state.selectedUid);
+    if (matched.length > 0 && !selValid) {
+      state.selectedUid = matched[0].uid;
+      state.selectedAnchor = null;
+    }
+    paintList(matched);
+    if (forceSyncReader || !selValid || !matched.length) {
+      syncReaderToFiltered(matched);
+    }
+  };
   statusSel.addEventListener('change', () => {
     state.reviewStatusFilter = statusSel.value;
-    syncReaderToFiltered(paintList());
+    renderSidebarAndReader(true);
   });
   searchInp.addEventListener('input', () => {
     state.reviewQuery = searchInp.value;
-    const filtered = paintList();
-    if (!filtered.length || !filtered.some(i => i.uid === state.selectedUid)) {
-      syncReaderToFiltered(filtered);
-    }
+    renderSidebarAndReader(false);
   });
-  syncReaderToFiltered(paintList());
+  renderSidebarAndReader(true);
 
   split.append(sidebar, readerCard);
   host.append(split);
@@ -2559,7 +2573,10 @@ export function buildRuntimeTargetsTable(targetsToShow = [], doc = document, opt
   for (const t of targetsToShow) {
     const tr = mk('tr');
     const tdTitle = mk('td');
-    tdTitle.append(mk('strong', t.title ?? ''), mk('br'), mk('span', t.badge || '', 'st-muted-xs'));
+    const titleChildren = [mk('strong', t.title ?? '')];
+    if (t.summary) titleChildren.push(mk('div', t.summary, 'st-entity-summary'));
+    titleChildren.push(mk('div', [t.repoName, t.badge].filter(Boolean).join(' · '), 'st-muted-xs'));
+    tdTitle.append(...titleChildren);
     const tdProg = mk('td', `${t.taskSummary?.done ?? 0}/${t.taskSummary?.total ?? 0} (${t.taskSummary?.percent ?? 0}%)`);
     const tdLock = mk('td', `${t.activeLockCount ?? 0} 把活跃${(t.locks || []).some(l => l.isStaleWarning) ? ' · ⚠️ 持锁超时' : ''}`);
     const tdChain = mk('td');
@@ -2690,7 +2707,7 @@ function renderTaskTreeView(host, scopedTargets, { plans = [], fleetFamCount = 0
 
   const scopedPlans = plans.filter(p => {
     if (state.rtSelectedTargetId !== '__all__' && p.targetId !== state.rtSelectedTargetId) return false;
-    if (state.rtScope === 'repo' && p.repoId && p.repoId !== state.repoId && !p.isSandbox) return false;
+    if (state.rtScope === 'repo' && p.repoId !== state.repoId && !p.isSandbox) return false;
     return true;
   });
 
@@ -2698,17 +2715,26 @@ function renderTaskTreeView(host, scopedTargets, { plans = [], fleetFamCount = 0
     const emptyCard = el('div', null, 'st-card st-guide-section');
     emptyCard.append(
       el('h3', '当前范围内暂无活跃或历史执行计划文件', ''),
-      el('p', '支持多级标题/缩进复选框的 .md、嵌套 .json 或 .csv；若你正在观测本机已运行的多智能体协作会话，可直接点下方按钮切换编队视图，或一键体验沙箱演练 / 挂载计划文件。', 'st-muted-xs'),
+      el('p', '支持多级标题/缩进复选框的 .md、嵌套 .json 或 .csv；若你正在观测本机已运行的多智能体协作会话，或想查看工作区及相邻目录历史规划，可直接点下方按钮切换，或体验沙箱演练 / 挂载计划文件。', 'st-muted-xs'),
     );
     emptyCard.firstChild.style.marginTop = '0';
     const actRow = el('div', null, 'st-empty-actions');
+    if (state.rtScope === 'repo' && plans.length > 0) {
+      const wsPlansBtn = el('button', `🌐 查看全工作区历史与规划 (${plans.length})`, 'st-btn st-btn-primary');
+      wsPlansBtn.type = 'button';
+      wsPlansBtn.addEventListener('click', () => {
+        state.rtScope = 'workspace';
+        renderRuntimePanel();
+      });
+      actRow.append(wsPlansBtn);
+    }
     if (fleetFamCount > 0 && typeof onGoFleet === 'function') {
-      const fleetBtn = el('button', `🛰️ 查看本机 ${fleetFamCount} 组智能体会话 →`, 'st-btn st-btn-primary');
+      const fleetBtn = el('button', `🛰️ 查看本机 ${fleetFamCount} 组智能体会话 →`, `st-btn${state.rtScope === 'repo' && plans.length > 0 ? '' : ' st-btn-primary'}`);
       fleetBtn.type = 'button';
       fleetBtn.addEventListener('click', onGoFleet);
       actRow.append(fleetBtn);
     }
-    const sbxEmptyBtn = el('button', '▶ 运行隔离沙箱演练', `st-btn${fleetFamCount > 0 ? '' : ' st-btn-primary'}`);
+    const sbxEmptyBtn = el('button', '▶ 运行隔离沙箱演练', `st-btn${fleetFamCount > 0 || (state.rtScope === 'repo' && plans.length > 0) ? '' : ' st-btn-primary'}`);
     sbxEmptyBtn.type = 'button';
     sbxEmptyBtn.disabled = !state.writable;
     sbxEmptyBtn.addEventListener('click', () => onRunSandbox?.(sbxEmptyBtn));
@@ -2845,12 +2871,24 @@ function renderTaskTreeView(host, scopedTargets, { plans = [], fleetFamCount = 0
     const card = el('div', null, 'st-card st-guide-section');
     const treeRoots = ts.tree || [];
     if (!treeRoots.length) {
-      card.append(
-        el('h3', '文档型历史规划 / 规格说明摘要', ''),
-        el('p', `该文档以自然章节描述波次目标（当前含 ${total} 条复选框步骤），已展示中文标题、摘要与最新更新时间；如需进入实时 6 节点编队或 3 层复选框演练，可运行沙箱演练或切换到编队视图。`, 'st-muted-xs'),
-      );
-      card.firstChild.style.marginTop = '0';
+      if (plan.markdownText) {
+        card.append(
+          el('h3', '规划 / 规格完整正文', ''),
+          el('p', `该文档以自然章节描述阶段目标（当前含 ${total} 条复选框步骤），已直接呈现完整格式化 Markdown 正文。`, 'st-muted-xs'),
+        );
+        card.firstChild.style.marginTop = '0';
+        const proseBox = el('div', null, 'st-prose-container');
+        proseBox.append(renderSafeMarkdownToDom(plan.markdownText, document));
+        card.append(proseBox);
+      } else {
+        card.append(
+          el('h3', '文档型历史规划 / 规格说明摘要', ''),
+          el('p', `该文档以自然章节描述波次目标（当前含 ${total} 条复选框步骤），已展示中文标题、摘要与最新更新时间；如需进入实时 6 节点编队或 3 层复选框演练，可运行沙箱演练或切换到编队视图。`, 'st-muted-xs'),
+        );
+        card.firstChild.style.marginTop = '0';
+      }
       const quickRow = el('div', null, 'st-empty-actions');
+      quickRow.style.marginTop = '12px';
       if (fleetFamCount > 0 && typeof onGoFleet === 'function') {
         const fb = el('button', `🛰️ 查看本机 ${fleetFamCount} 组智能体会话 →`, 'st-btn st-btn-primary');
         fb.type = 'button';
@@ -3463,7 +3501,6 @@ async function selectRepo(repoId, { skipRender = false } = {}) {
   state.archifyIdx = 0;
   state.archifySelectedNode = null;
   state.selectedAnchor = null;
-  state.reviewCategory = 'all';
   state.rtSelectedTargetId = '__all__';
   if (!skipRender) renderActiveTab();
   const u = new URL(location.href);

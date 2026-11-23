@@ -84,6 +84,9 @@ export function renderSafeMarkdownToDom(markdown, doc = document) {
   const wrap = mk(doc, 'div', null, 'st-fleet-md-body');
   const lines = String(markdown ?? '').replace(/\r\n/g, '\n').split('\n');
   let i = 0;
+  const parseTableCells = row => row.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+  const isTableSep = row => /^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?$/.test(row.trim());
+
   while (i < lines.length) {
     const trimmed = lines[i].trim();
     if (!trimmed) { i++; continue; }
@@ -97,12 +100,61 @@ export function renderSafeMarkdownToDom(markdown, doc = document) {
       wrap.append(pre);
       continue;
     }
+    if (/^(---|\*\*\*|___)$/.test(trimmed)) {
+      wrap.append(mk(doc, 'hr', null, 'st-fleet-md-hr'));
+      i++;
+      continue;
+    }
     const hm = /^(#{1,4})\s+(.+)$/.exec(trimmed);
     if (hm) {
       const h = mk(doc, `h${Math.min(4, hm[1].length + 1)}`, null, 'st-fleet-md-h');
       appendInlineFormatted(h, hm[2], doc);
       wrap.append(h);
       i++;
+      continue;
+    }
+    if (/^>\s?/.test(trimmed)) {
+      const bq = mk(doc, 'blockquote', null, 'st-fleet-md-quote');
+      while (i < lines.length && /^>\s?/.test(lines[i].trim())) {
+        const lineTxt = lines[i].trim().replace(/^>\s?/, '');
+        if (lineTxt) {
+          const p = mk(doc, 'p', null, 'st-fleet-md-p');
+          appendInlineFormatted(p, lineTxt, doc);
+          bq.append(p);
+        }
+        i++;
+      }
+      if (bq.children.length) wrap.append(bq);
+      continue;
+    }
+    if (trimmed.includes('|') && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+      const headers = parseTableCells(trimmed);
+      i += 2;
+      const tblWrap = mk(doc, 'div', null, 'st-table-wrap');
+      const tbl = mk(doc, 'table', null, 'st-table');
+      const thead = mk(doc, 'thead');
+      const thr = mk(doc, 'tr');
+      for (const hCell of headers) {
+        const th = mk(doc, 'th');
+        appendInlineFormatted(th, hCell, doc);
+        thr.append(th);
+      }
+      thead.append(thr);
+      const tbody = mk(doc, 'tbody');
+      while (i < lines.length && lines[i].trim().includes('|') && !lines[i].trim().startsWith('```')) {
+        const rowCells = parseTableCells(lines[i]);
+        const tr = mk(doc, 'tr');
+        for (let c = 0; c < headers.length; c++) {
+          const td = mk(doc, 'td');
+          appendInlineFormatted(td, rowCells[c] ?? '', doc);
+          tr.append(td);
+        }
+        tbody.append(tr);
+        i++;
+      }
+      tbl.append(thead, tbody);
+      tblWrap.append(tbl);
+      wrap.append(tblWrap);
       continue;
     }
     if (/^[-*]\s+/.test(trimmed)) {
@@ -647,7 +699,13 @@ export function mountFleetMonitor(host, {
       const leftT = mk(doc, 'div', null, 'st-graph-controls');
       const av = mk(doc, 'span', toAg?.roleShort || '子', 'st-fleet-avatar st-fleet-avatar-sm');
       av.style.setProperty('--st-fleet-hue', hue);
-      leftT.append(av, mk(doc, 'strong', d.label), mk(doc, 'span', d.mode === 'reviewer' ? '只读复核' : '子会话', 'st-badge st-badge-zinc'));
+      const briefNode = renderEntityBrief(doc, {
+        title: d.label || '未命名委派任务',
+        summary: (d.prompt || '').replace(/\s+/g, ' ').trim(),
+        code: d.mode === 'reviewer' ? '只读复核' : '子会话',
+        typeLabel: toAg?.name ? `承接：${toAg.name}` : '',
+      }, { compact: true, showPath: false, maxSummaryChars: 96 });
+      leftT.append(av, briefNode);
       const stBadge = mk(
         doc,
         'span',
@@ -655,8 +713,7 @@ export function mountFleetMonitor(host, {
         `st-badge ${d.status === 'in_progress' ? 'st-badge-indigo' : (d.status === 'completed' ? 'st-badge-emerald' : 'st-badge-zinc')}`,
       );
       top.append(leftT, stBadge);
-      const prev = mk(doc, 'div', (d.prompt || '').replace(/\s+/g, ' ').slice(0, 140), 'st-muted-xs');
-      itemBox.append(top, prev);
+      itemBox.append(top);
       itemBox.addEventListener('click', () => {
         const hitEv = allEvents.find(e => e.kind === 'delegation' && e.to === d.to && e.from === d.from);
         if (hitEv) {

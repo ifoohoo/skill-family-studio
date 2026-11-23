@@ -118,12 +118,12 @@ function renderDocHeroHtml({ title, summary, code, typeLabel, path, status, fron
       else if ((typeof fv === 'string' || typeof fv === 'number') && String(fv).trim()) extraKeys.push(`${fk}: ${fv}`);
     }
   }
-  const metaChips = extraKeys.slice(0, 4).map(m => `<span class="st-doc-meta-chip">${escapeHtml(m)}</span>`).join('');
+  const metaChips = extraKeys.slice(0, 4).map(m => `<span class="st-doc-hero-chip">${escapeHtml(m)}</span>`).join('');
   return [
     '<header class="st-doc-hero">',
-    `<div class="st-doc-hero-top"><div class="st-graph-controls">${badges.join('')}</div>${path ? `<span class="st-doc-path-chip">${escapeHtml(path)}</span>` : ''}</div>`,
+    `<div class="st-doc-hero-top"><div class="st-graph-controls">${badges.join('')}</div>${path ? `<span class="st-doc-hero-path">${escapeHtml(path)}</span>` : ''}</div>`,
     `<h1 class="st-doc-hero-title">${escapeHtml(title || '制品文档')}</h1>`,
-    summary ? `<p class="st-doc-hero-lead">${escapeHtml(summary)}</p>` : '',
+    summary ? `<p class="st-doc-hero-summary">${escapeHtml(summary)}</p>` : '',
     metaChips ? `<div class="st-doc-hero-meta">${metaChips}</div>` : '',
     '</header>',
   ].join('');
@@ -434,6 +434,22 @@ export function renderMarkdownToHtml(markdown, { idPrefix = 'sec', stripNavLine 
       i++;
     }
     const paraText = p.join(' ');
+    const hasExplicitFmSummary = Boolean(
+      heroMeta?.frontmatter && typeof heroMeta.frontmatter === 'object'
+      && (heroMeta.frontmatter.summary || heroMeta.frontmatter.description || heroMeta.frontmatter.purpose),
+    );
+    const hasMoreLinesAfter = lines.slice(i).some(l => {
+      const lt = l.trim();
+      return lt && !lt.startsWith('# ');
+    });
+    const isHeroDuplicateLead = Boolean(
+      heroMeta?.summary
+      && !hasExplicitFmSummary
+      && blocks.length === 0
+      && hasMoreLinesAfter
+      && cleanInlinePlain(paraText) === cleanInlinePlain(heroMeta.summary),
+    );
+    if (isHeroDuplicateLead) continue;
     if (/^(?:\*\*)?(?:作为|作为一名)[^。]{2,}(?:我希望|我想|需要)[^。]+/.test(paraText)) {
       blocks.push(`<div class="st-story-card"><span class="st-story-pill">👤 用户故事诉求</span><p>${renderInlineMarkdown(paraText)}</p></div>`);
     } else if (/^(?:\*\*)?(?:前提条件|触发动作|预期结果|验收标准|场景[一二三四五六七八九十0-9]+)[：:\s\*]/.test(paraText)) {

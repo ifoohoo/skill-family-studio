@@ -322,13 +322,13 @@ export function renderUserGuideMarkdown() {
   for (const r of m.roleRoutes) {
     lines.push(`### ${r.roleTitle}`, '', `> ${r.when}`, '');
     for (const s of r.steps) {
-      lines.push(`${s.step}. **${s.title}**：${s.detail}（界面实操按钮：**\`${s.actionLabel}\`**）`);
+      lines.push(`${s.step}. **${s.title}**：${s.detail}`);
     }
     lines.push('');
   }
   lines.push('## 四、逐页界面全拆解（每个区域是什么、什么时候看、怎么用）', '');
   for (const p of m.perPageAnatomy) {
-    lines.push(`### ${p.page}`, '', `- **什么时候看这里**：${p.when}`, ...p.areas.map(a => `- ${a}`), `- **直达操作按钮**：**\`${p.actionLabel}\`**`, '');
+    lines.push(`### ${p.page}`, '', `- **什么时候看这里**：${p.when}`, ...p.areas.map(a => `- ${a}`), '');
   }
   lines.push(
     '## 五、状态流转图、三层双向互锁原理图与防呆速查',

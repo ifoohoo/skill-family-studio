@@ -1268,10 +1268,16 @@ async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHist
     if (ts.total > 0 && ts.done === ts.total && ts.running === 0 && ts.blocked === 0) status = 'completed';
     else if (ts.running > 0 || ts.done > 0 || ts.blocked > 0 || t.activeLockCount > 0) status = 'in_progress';
     let summary = ts.focusBanner?.detail || '';
-    if (!summary && t.planPath) {
+    let liveMarkdown = '';
+    if ((!summary || ts.total === 0) && t.planPath) {
       try {
         const raw = await readFile(t.planPath, 'utf8');
-        summary = extractArtifactBrief({ rawText: raw, fallbackTitle: t.title, typeLabel: '活跃执行计划', path: t.planPath }).summary;
+        if (!summary) {
+          summary = extractArtifactBrief({ rawText: raw, fallbackTitle: t.title, typeLabel: '活跃执行计划', path: t.planPath }).summary;
+        }
+        if (ts.total === 0) {
+          liveMarkdown = sanitizePublicText(raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '')).trim().slice(0, 60000);
+        }
       } catch {}
     }
     if (!summary) summary = `${t.badge || '运行计划'}：共 ${ts.total} 步，已完成 ${ts.done} 步（${ts.percent}%）。`;
@@ -1294,6 +1300,7 @@ async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHist
       totalSteps: ts.total,
       percent: ts.percent,
       taskSummary: ts,
+      markdownText: liveMarkdown || undefined,
       target: t,
     }));
   }
@@ -1374,6 +1381,9 @@ async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHist
       totalSteps: ts.total,
       percent,
       taskSummary: ts,
+      markdownText: ts.total === 0
+        ? sanitizePublicText(raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '')).trim().slice(0, 60000)
+        : undefined,
       target: null,
     }));
   }

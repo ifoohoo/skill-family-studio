@@ -322,11 +322,63 @@ async function countConfiguredArtifactFiles(repoReal) {
 
 export const STUDIO_WORKSPACE_PROJECTS_PATH = '.skill-family-studio/workspace-projects.json';
 
+const SENSITIVE_SYSTEM_PREFIXES = ['/etc', '/private/etc', '/System', '/Library', '/var/root', '/private/var/root', '/root'];
+const SENSITIVE_PATH_SEGMENTS = new Set([
+  '.ssh', '.gnupg', '.aws', '.kube', '.docker', '.netrc', '.npmrc', '.pypirc', '.git-credentials', 'keychains',
+]);
+
+function isSensitiveSystemOrCredentialPath(absPath) {
+  const clean = resolve(String(absPath || ''));
+  for (const prefix of SENSITIVE_SYSTEM_PREFIXES) {
+    if (clean === prefix || clean.startsWith(`${prefix}/`)) {
+      return `系统受限目录 (${prefix})`;
+    }
+  }
+  for (const seg of clean.split(/[\\/]+/)) {
+    const low = seg.toLowerCase();
+    if (!low) continue;
+    if (SENSITIVE_PATH_SEGMENTS.has(low) || low === '.env' || low.startsWith('.env.')) {
+      return `包含敏感凭据路径段 (${seg})`;
+    }
+  }
+  return null;
+}
+
+async function validateSafeLocalRepoPath(rawOrAbs, rootReal = null) {
+  const candidateAbs = isAbsolute(rawOrAbs) ? resolve(rawOrAbs) : resolve(rootReal || '.', rawOrAbs);
+  const rawHit = isSensitiveSystemOrCredentialPath(candidateAbs);
+  if (rawHit) {
+    throw Object.assign(new Error(`安全守卫拒绝接入目录：${rawHit}。`), { statusCode: 403 });
+  }
+  let cur = candidateAbs;
+  while (cur && cur !== dirname(cur)) {
+    let st;
+    try {
+      st = await lstat(cur);
+    } catch (err) {
+      throw Object.assign(new Error(`未找到可读取的本地目录：${sanitizePublicText(rawOrAbs)}（${err.message}）`), { statusCode: 400 });
+    }
+    if (st.isSymbolicLink() && cur !== '/var' && cur !== '/tmp') {
+      throw Object.assign(new Error('安全守卫拒绝接入目录：目标路径或父级路径存在符号链接跳板。'), { statusCode: 403 });
+    }
+    cur = dirname(cur);
+  }
+  const stSelf = await lstat(candidateAbs);
+  if (stSelf.isSymbolicLink() || !stSelf.isDirectory()) {
+    throw Object.assign(new Error('目标路径必须是真实存在的普通本地目录（不可为文件或符号链接）。'), { statusCode: 400 });
+  }
+  const targetReal = await realpath(candidateAbs);
+  const realHit = isSensitiveSystemOrCredentialPath(targetReal);
+  if (realHit) {
+    throw Object.assign(new Error(`安全守卫拒绝接入目录：${realHit}。`), { statusCode: 403 });
+  }
+  return targetReal;
+}
+
 async function loadWorkspaceProjectOverrides(workspaceRoot) {
   let rootReal;
   try { rootReal = await realpath(resolve(workspaceRoot)); } catch { return { storagePath: STUDIO_WORKSPACE_PROJECTS_PATH, extraRepos: [], excludedRepos: [], repoMeta: {} }; }
   const hasWsJson = await exists(join(rootReal, '.studio-workspace.json'));
-  const storagePath = hasWsJson ? '.studio-workspace.json' : STUDIO_WORKSPACE_PROJECTS_PATH;
   const wsDoc = hasWsJson ? await readJsonSafeContained(rootReal, '.studio-workspace.json') : null;
   const localDoc = await readJsonSafeContained(rootReal, STUDIO_WORKSPACE_PROJECTS_PATH);
 
@@ -339,17 +391,17 @@ async function loadWorkspaceProjectOverrides(workspaceRoot) {
     ...(Array.isArray(localDoc?.excludedRepos) ? localDoc.excludedRepos : []),
   ];
   const repoMeta = {};
-  for (const src of [localDoc?.repoMeta, wsDoc?.repoMeta]) {
+  for (const src of [wsDoc?.repoMeta, localDoc?.repoMeta]) {
     if (src && typeof src === 'object' && !Array.isArray(src)) {
       for (const [k, v] of Object.entries(src)) {
-        if (['__proto__', 'constructor', 'prototype'].includes(k) || !v || typeof v !== 'object') continue;
-        repoMeta[k] = v;
+        if (['__proto__', 'constructor', 'prototype'].includes(k) || !v || typeof v !== 'object' || Array.isArray(v)) continue;
+        repoMeta[k] = { ...(Object.hasOwn(repoMeta, k) ? repoMeta[k] : {}), ...v };
       }
     }
   }
   return {
     rootReal,
-    storagePath,
+    storagePath: STUDIO_WORKSPACE_PROJECTS_PATH,
     extraRepos: [...new Set(rawExtra.map(s => String(s ?? '').trim()).filter(Boolean))],
     excludedRepos: [...new Set(rawExcl.map(s => String(s ?? '').trim()).filter(Boolean))],
     repoMeta,
@@ -358,10 +410,9 @@ async function loadWorkspaceProjectOverrides(workspaceRoot) {
 
 async function mutateWorkspaceProjectOverrides(workspaceRoot, mutator) {
   const rootReal = await realpath(resolve(workspaceRoot));
-  const hasWsJson = await exists(join(rootReal, '.studio-workspace.json'));
-  const relPath = hasWsJson ? '.studio-workspace.json' : STUDIO_WORKSPACE_PROJECTS_PATH;
+  const relPath = STUDIO_WORKSPACE_PROJECTS_PATH;
   const existing = await readJsonSafeContained(rootReal, relPath)
-    || (hasWsJson ? {} : { schemaVersion: 1, extraRepos: [], excludedRepos: [], repoMeta: {} });
+    || { schemaVersion: 1, extraRepos: [], excludedRepos: [], repoMeta: {} };
   if (!Array.isArray(existing.extraRepos)) existing.extraRepos = [];
   if (!Array.isArray(existing.excludedRepos)) existing.excludedRepos = [];
   if (!existing.repoMeta || typeof existing.repoMeta !== 'object' || Array.isArray(existing.repoMeta)) {
@@ -388,17 +439,7 @@ export async function registerStudioRepo(workspaceRoot, input = {}) {
     throw Object.assign(new Error('请提供有效的本地仓库目录路径。'), { statusCode: 400 });
   }
   const rootReal = await realpath(resolve(workspaceRoot));
-  const candidateAbs = isAbsolute(rawPath) ? resolve(rawPath) : resolve(rootReal, rawPath);
-  let targetReal;
-  try {
-    const st = await lstat(candidateAbs);
-    if (st.isSymbolicLink() || !st.isDirectory()) {
-      throw new Error('目标不是普通目录');
-    }
-    targetReal = await realpath(candidateAbs);
-  } catch (err) {
-    throw Object.assign(new Error(`未找到可读取的本地目录：${sanitizePublicText(rawPath)}（${err.message}）`), { statusCode: 400 });
-  }
+  const targetReal = await validateSafeLocalRepoPath(rawPath, rootReal);
   if (!(await exists(join(targetReal, 'artifact-graph.config.yaml')))) {
     throw Object.assign(new Error('目标目录缺少 artifact-graph.config.yaml；请确认路径指向技能族或受管制品仓库根目录。'), { statusCode: 400 });
   }
@@ -417,7 +458,7 @@ export async function registerStudioRepo(workspaceRoot, input = {}) {
     });
     if (!alreadyInExtra) doc.extraRepos.push(ref);
     if (title || groupLabel || description) {
-      const prev = doc.repoMeta[ref] || {};
+      const prev = Object.hasOwn(doc.repoMeta, ref) ? doc.repoMeta[ref] : {};
       doc.repoMeta[ref] = {
         ...prev,
         ...(title ? { title } : {}),
@@ -462,13 +503,28 @@ export async function updateStudioRepoMeta(workspaceRoot, input = {}, catalog = 
 
   const rootReal = await realpath(resolve(workspaceRoot));
   const ref = portableRepoRef(rootReal, rec.realPath);
+
+  if (input.reset === true) {
+    const saved = await mutateWorkspaceProjectOverrides(workspaceRoot, async doc => {
+      for (const k of [ref, repoId, rec.realPath]) {
+        if (k && Object.hasOwn(doc.repoMeta, k)) delete doc.repoMeta[k];
+      }
+    });
+    return { ok: true, repoId, reset: true, storagePath: saved.storagePath };
+  }
+
   const title = typeof input.title === 'string' ? input.title.trim().slice(0, 120) : undefined;
   const groupLabel = typeof input.groupLabel === 'string' ? input.groupLabel.trim().slice(0, 80) : undefined;
   const description = typeof input.description === 'string' ? input.description.trim().slice(0, 400) : undefined;
 
   const saved = await mutateWorkspaceProjectOverrides(workspaceRoot, async doc => {
-    const key = Object.hasOwn(doc.repoMeta, ref) ? ref : (Object.hasOwn(doc.repoMeta, repoId) ? repoId : ref);
-    const nextMeta = { ...(doc.repoMeta[key] || {}) };
+    const key = Object.hasOwn(doc.repoMeta, ref)
+      ? ref
+      : (Object.hasOwn(doc.repoMeta, repoId) ? repoId : ref);
+    const prev = Object.hasOwn(doc.repoMeta, key) && doc.repoMeta[key] && typeof doc.repoMeta[key] === 'object'
+      ? doc.repoMeta[key]
+      : {};
+    const nextMeta = { ...prev };
     if (title !== undefined) {
       if (title) nextMeta.title = title;
       else delete nextMeta.title;
@@ -484,7 +540,7 @@ export async function updateStudioRepoMeta(workspaceRoot, input = {}, catalog = 
     if (Object.keys(nextMeta).length > 0) doc.repoMeta[key] = nextMeta;
     else delete doc.repoMeta[key];
   });
-  return { ok: true, repoId, storagePath: saved.storagePath };
+  return { ok: true, repoId, reset: false, storagePath: saved.storagePath };
 }
 
 export async function readQuickRepoMeta(repoReal) {
@@ -635,8 +691,8 @@ export async function discoverStudioRepos(workspaceRoot, { scanRoots, env } = {}
   if (primaryReal) await tryAdd(primaryReal);
   for (const ex of overrides.extraRepos) {
     try {
-      const cand = isAbsolute(ex) ? resolve(ex) : resolve(overrides.rootReal, ex);
-      await tryAdd(cand, { isExtra: true });
+      const safeExReal = await validateSafeLocalRepoPath(ex, overrides.rootReal);
+      await tryAdd(safeExReal, { isExtra: true });
     } catch {}
   }
 
@@ -686,7 +742,10 @@ export async function discoverStudioRepos(workspaceRoot, { scanRoots, env } = {}
     if (!extraSet.has(realPath) && excludedIdSet.has(id)) continue;
 
     const pRef = portableRepoRef(overrides.rootReal, realPath);
-    const metaOverride = overrides.repoMeta[pRef] || overrides.repoMeta[id] || overrides.repoMeta[realPath] || {};
+    const metaOverride = (Object.hasOwn(overrides.repoMeta, pRef) ? overrides.repoMeta[pRef] : null)
+      || (Object.hasOwn(overrides.repoMeta, id) ? overrides.repoMeta[id] : null)
+      || (Object.hasOwn(overrides.repoMeta, realPath) ? overrides.repoMeta[realPath] : null)
+      || {};
     const naturalGroupLabel = resolveGroupLabel(group, mergedGroupLabels);
     const originalTitle = meta.studioCfg?.title || name;
     const displayName = metaOverride.title ? sanitizePublicText(metaOverride.title) : originalTitle;
