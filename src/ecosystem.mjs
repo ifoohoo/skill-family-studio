@@ -1,6 +1,8 @@
+// @feature STU004
+
 import { tmpdir } from 'node:os';
 import { lstat, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises';
-import { basename, dirname, extname, join, relative, resolve } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
   VERSION_LOCK_PATH,
   auditVersionLock,
@@ -23,17 +25,27 @@ const SKIP_DIRS = new Set([
 const SKIP_CLONE_DIR_RE = /(?:-hotfix-|-smoke-|-self-governance-renewal-|\.release-skill-archive$|\.pre-migration-archive$)/i;
 const shouldSkipDir = name => name.startsWith('.') || SKIP_DIRS.has(name) || SKIP_CLONE_DIR_RE.test(name);
 const CODE_EXT_RE = /\.(?:[cm]?[jt]sx?|py|rs|go|sh|java|kt)$/i;
-const DEFAULT_CATEGORY_DIRS = ['skill-family', 'artifact-ecosystem', 'glaf4-skills'];
-const SAFE_EXTRA_DOCS = new Set(['README.md', 'README.zh-CN.md', 'docs/USER-GUIDE.md', 'USER-GUIDE.md', 'artifacts/README.md', 'artifact-graph.config.yaml']);
+const SAFE_EXTRA_DOCS = new Set([
+  'README.md',
+  'README.zh-CN.md',
+  'docs/USER-GUIDE.md',
+  'USER-GUIDE.md',
+  'artifacts/README.md',
+  'artifact-graph.config.yaml',
+  '.studio-workspace.json',
+  'artifacts/portfolio-allocations.json',
+  'artifacts/upstream-bindings.json',
+]);
 
-export const GROUP_LABELS = Object.freeze({
-  'skill-family': 'Skill Family 支撑线',
-  'artifact-ecosystem': 'Artifact 制品线',
-  'glaf4-skills': 'GLAF4 业务线',
-});
+export const GROUP_LABELS = Object.freeze({});
 
-export function resolveGroupLabel(group) {
-  return GROUP_LABELS[group] || '当前工作区与其他项目';
+export function resolveGroupLabel(group, customLabels = {}) {
+  const key = String(group ?? '').trim();
+  if (customLabels && typeof customLabels[key] === 'string' && customLabels[key].trim()) {
+    return customLabels[key].trim();
+  }
+  if (!key || key === 'workspace') return '当前工作区';
+  return key;
 }
 
 const TYPE_LABELS = Object.freeze({
@@ -82,8 +94,8 @@ const EDGE_LABELS = Object.freeze({
 });
 
 const LAYER_MATCH = [
-  { ...DEFAULT_LAYERS[0], match: new Set(['requirement', 'spec']) },
-  { ...DEFAULT_LAYERS[1], match: new Set(['prd', 'feature', 'user_story', 'story', 'lifecycle', 'lifecycle_story']) },
+  { ...DEFAULT_LAYERS[0], match: new Set(['requirement', 'spec', 'prd']) },
+  { ...DEFAULT_LAYERS[1], match: new Set(['feature', 'user_story', 'story', 'lifecycle', 'lifecycle_story']) },
   { ...DEFAULT_LAYERS[2], match: new Set(['entity', 'domain_model', 'domain-glossary', 'bounded-context-map', 'decision']) },
   { ...DEFAULT_LAYERS[3], match: new Set(['design', 'interface_contracts', 'data_contracts', 'application_state_machines', 'error_model', 'agent_skill']) },
   { ...DEFAULT_LAYERS[4], match: new Set(['scenario']) },
@@ -101,10 +113,80 @@ function classifyLayer(type, configuredLayer) {
   return LAYER_MATCH[3];
 }
 
+function classifyReviewCategory(type, layerId) {
+  if (['user_story', 'story', 'lifecycle', 'lifecycle_story'].includes(type)) return 'stories';
+  if (['requirement', 'prd', 'spec'].includes(type)) return 'requirements';
+  if (type === 'scenario') return 'scenarios';
+  if (['domain_model', 'entity', 'domain-glossary', 'bounded-context-map', 'decision', 'business_article'].includes(type)) return 'domain';
+  if (['e2e_test', 'e2e_registry', 'test-strategy', 'rule-golden-cases', 'test', 'implementation'].includes(type)) return 'verification';
+  if (['feature', 'design', 'interface_contracts', 'data_contracts', 'application_state_machines', 'error_model', 'agent_skill'].includes(type)) {
+    return 'architecture';
+  }
+  if (layerId === 'requirements') return 'requirements';
+  if (layerId === 'scenarios') return 'scenarios';
+  if (layerId === 'domain') return 'domain';
+  if (layerId === 'verification') return 'verification';
+  return 'architecture';
+}
+
 async function exists(absPath) {
   try { await lstat(absPath); return true; } catch { return false; }
 }
 
+async function readJsonSafeContained(repoReal, relPath) {
+  try {
+    const abs = await resolveContained(repoReal, relPath);
+    const st = await lstat(abs);
+    if (!st.isFile()) return null;
+    const parsed = JSON.parse(await readFileContained(repoReal, relPath, { encoding: 'utf8' }));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function loadStudioWorkspaceConfig(repoReal) {
+  const wsJson = await readJsonSafeContained(repoReal, '.studio-workspace.json');
+  let yamlStudio = null;
+  try {
+    const rawCfg = await readFileContained(repoReal, 'artifact-graph.config.yaml', { encoding: 'utf8' });
+    const parsed = parseYaml(rawCfg);
+    if (parsed?.studio && typeof parsed.studio === 'object' && !Array.isArray(parsed.studio)) {
+      yamlStudio = parsed.studio;
+    }
+  } catch {}
+
+  const mergedLabels = {};
+  for (const src of [yamlStudio?.groupLabels, wsJson?.groupLabels]) {
+    if (src && typeof src === 'object' && !Array.isArray(src)) {
+      for (const [k, v] of Object.entries(src)) {
+        if (!['__proto__', 'constructor', 'prototype'].includes(k) && typeof v === 'string' && v.trim()) {
+          mergedLabels[k] = v.trim();
+        }
+      }
+    }
+  }
+
+  const rawScanRoots = Array.isArray(wsJson?.scanRoots)
+    ? wsJson.scanRoots
+    : (Array.isArray(yamlStudio?.scanRoots) ? yamlStudio.scanRoots : null);
+  const scanRoots = rawScanRoots
+    ? [...new Set(rawScanRoots.map(s => String(s ?? '').trim()).filter(Boolean).map(s => resolve(repoReal, s)))]
+    : null;
+
+  const collections = Array.isArray(wsJson?.collections)
+    ? wsJson.collections
+    : (Array.isArray(yamlStudio?.collections) ? yamlStudio.collections : []);
+
+  return {
+    hasConfig: Boolean(wsJson || yamlStudio),
+    role: wsJson?.role || yamlStudio?.role || null,
+    title: wsJson?.title || yamlStudio?.title || null,
+    scanRoots,
+    groupLabels: mergedLabels,
+    collections: collections.filter(c => c && typeof c === 'object' && typeof c.kind === 'string'),
+  };
+}
 export async function resolveStudioScanRoots(workspaceRoot, explicitScanRoots, env = process.env) {
   if (explicitScanRoots !== undefined && explicitScanRoots !== null) {
     const raw = Array.isArray(explicitScanRoots) ? explicitScanRoots : String(explicitScanRoots).split(',');
@@ -118,23 +200,61 @@ export async function resolveStudioScanRoots(workspaceRoot, explicitScanRoots, e
   let rootReal;
   try { rootReal = await realpath(resolve(workspaceRoot)); } catch { return []; }
 
+  const cfg = await loadStudioWorkspaceConfig(rootReal);
+  if (Array.isArray(cfg.scanRoots) && cfg.scanRoots.length > 0) {
+    const existing = [];
+    for (const r of cfg.scanRoots) {
+      if (await exists(r)) existing.push(r);
+    }
+    if (existing.length > 0) return existing;
+  }
+
   let tmpReal = tmpdir();
   try { tmpReal = await realpath(tmpReal); } catch {}
-  const sourceParent = resolve(rootReal, '../..');
-  const isBareTmpChild = dirname(rootReal) === tmpReal || sourceParent === tmpReal || sourceParent === dirname(tmpReal);
-  if (sourceParent === '/' || isBareTmpChild) {
+  const immediateParent = resolve(rootReal, '..');
+  if (rootReal === '/' || immediateParent === '/' || immediateParent === tmpReal || immediateParent === dirname(tmpReal)) {
     return [rootReal];
   }
-  const candidates = [];
-  for (const cat of DEFAULT_CATEGORY_DIRS) {
-    const dir = join(sourceParent, cat);
-    if (await exists(dir)) candidates.push(dir);
+  return (await exists(immediateParent)) ? [immediateParent] : [rootReal];
+}
+
+async function resolveEffectiveCollections(repoReal, studioCfg = null) {
+  const cfg = studioCfg ?? await loadStudioWorkspaceConfig(repoReal);
+  if (Array.isArray(cfg.collections) && cfg.collections.length > 0) {
+    return cfg.collections;
   }
-  const immediateParent = resolve(rootReal, '..');
-  if (!candidates.includes(immediateParent) && await exists(immediateParent)) {
-    candidates.push(immediateParent);
+  const auto = [];
+  for (const candidate of [
+    {
+      id: 'local-lifecycle-stories',
+      kind: 'lifecycle-story-pack',
+      storiesJson: 'local/lifecycle-user-stories/stories.json',
+      explanationsDir: 'local/lifecycle-user-stories/explanations',
+      comparisonMarkdown: 'local/lifecycle-user-stories/replacement-comparison.md',
+    },
+    {
+      id: 'standard-stories-pack',
+      kind: 'lifecycle-story-pack',
+      storiesJson: 'artifacts/stories/stories.json',
+      explanationsDir: 'artifacts/stories/explanations',
+      comparisonMarkdown: 'artifacts/stories/replacement-comparison.md',
+    },
+  ]) {
+    if (await exists(join(repoReal, candidate.storiesJson)) || await exists(join(repoReal, candidate.explanationsDir))) {
+      auto.push(candidate);
+      break;
+    }
   }
-  return candidates.length ? candidates : [rootReal];
+  for (const manifestJson of [
+    'artifact-reading/business/inputs/model-and-scenes.json',
+    'artifacts/diagrams/model-and-scenes.json',
+  ]) {
+    if (await exists(join(repoReal, manifestJson))) {
+      auto.push({ id: 'archify-scenes', kind: 'archify-model-scenes', manifestJson });
+      break;
+    }
+  }
+  return auto;
 }
 
 function extractLockEndpointKey(endpoint) {
@@ -215,6 +335,14 @@ export async function readQuickRepoMeta(repoReal) {
     if (typeof pkg.version === 'string') version = pkg.version;
   } catch {}
 
+  const studioCfg = await loadStudioWorkspaceConfig(repoReal);
+  const hasPortfolio = await exists(join(repoReal, 'artifacts/portfolio-allocations.json'));
+  const hasUpstream = await exists(join(repoReal, 'artifacts/upstream-bindings.json'));
+  const repoRole = (hasPortfolio || studioCfg.role === 'portfolio')
+    ? 'portfolio'
+    : (hasUpstream ? 'subproject' : 'standalone');
+  const repoRoleLabel = repoRole === 'portfolio' ? '高阶规划仓' : (repoRole === 'subproject' ? '详设子仓' : '单项目仓');
+
   let lockPresent = false;
   let lockedCount = 0;
   let estimatedNodes = 0;
@@ -234,31 +362,36 @@ export async function readQuickRepoMeta(repoReal) {
     estimatedNodes = uidSet.size;
   } catch {}
 
-  // 若锁文件缺失或仅有孤立节点（无关系边），轻量统计配置的受管制品种类文件数作为兜底。
   if (estimatedNodes === 0) {
     estimatedNodes = await countConfiguredArtifactFiles(repoReal);
   }
 
   let richItemBonus = 0;
-  try {
-    const storiesRaw = JSON.parse(await readFileContained(repoReal, 'local/lifecycle-user-stories/stories.json', { encoding: 'utf8' }));
-    if (Array.isArray(storiesRaw?.stories)) richItemBonus += storiesRaw.stories.length;
-  } catch {}
-  try {
-    const expAbs = await resolveContained(repoReal, 'local/lifecycle-user-stories/explanations');
-    const expFiles = (await readdir(expAbs)).filter(n => /^\d{2}\.md$/.test(n));
-    richItemBonus += expFiles.length;
-  } catch {}
-  try {
-    const msRaw = JSON.parse(await readFileContained(repoReal, 'artifact-reading/business/inputs/model-and-scenes.json', { encoding: 'utf8' }));
-    for (const doc of msRaw?.documents ?? []) {
-      if (typeof doc?.markdown === 'string' && doc.markdown) richItemBonus += 1;
+  const collections = await resolveEffectiveCollections(repoReal, studioCfg);
+  for (const col of collections) {
+    if (col.kind === 'lifecycle-story-pack') {
+      if (col.storiesJson) {
+        const stRaw = await readJsonSafeContained(repoReal, col.storiesJson);
+        if (Array.isArray(stRaw?.stories)) richItemBonus += stRaw.stories.length;
+      }
+      if (col.explanationsDir) {
+        try {
+          const expAbs = await resolveContained(repoReal, col.explanationsDir);
+          const expFiles = (await readdir(expAbs)).filter(n => /^\d+\.md$/i.test(n));
+          richItemBonus += expFiles.length;
+        } catch {}
+      }
+    } else if (col.kind === 'archify-model-scenes' && col.manifestJson) {
+      const msRaw = await readJsonSafeContained(repoReal, col.manifestJson);
+      for (const doc of msRaw?.documents ?? []) {
+        if (typeof doc?.markdown === 'string' && doc.markdown) richItemBonus += 1;
+      }
     }
-  } catch {}
+  }
 
   let runtimeActive = false;
   let runtimeLabel = '无运行任务';
-  for (const rel of ['.artifacts/runtime-monitor/registry.json', 'artifacts/runtime-monitor/registry.json', '.runs']) {
+  for (const rel of ['.skill-family-studio/runtime-registry.json', '.artifacts/runtime-monitor/registry.json', 'artifacts/runtime-monitor/registry.json', '.runs']) {
     if (await exists(join(repoReal, rel))) {
       runtimeActive = true;
       runtimeLabel = '含运行记录';
@@ -270,6 +403,9 @@ export async function readQuickRepoMeta(repoReal) {
     pkgName,
     description,
     version,
+    studioCfg,
+    repoRole,
+    repoRoleLabel,
     lockPresent,
     lockedCount,
     versionLockLabel: lockPresent ? `已锁 (${lockedCount})` : '未建锁',
@@ -278,7 +414,6 @@ export async function readQuickRepoMeta(repoReal) {
     runtimeLabel,
   };
 }
-
 export async function discoverStudioRepos(workspaceRoot, { scanRoots, env } = {}) {
   const roots = await resolveStudioScanRoots(workspaceRoot, scanRoots, env);
   let primaryReal = null;
@@ -287,7 +422,7 @@ export async function discoverStudioRepos(workspaceRoot, { scanRoots, env } = {}
     if (await exists(join(r, 'artifact-graph.config.yaml'))) primaryReal = r;
   } catch {}
   if (!roots.length && !primaryReal) {
-    return { available: false, count: 0, primaryRepoId: null, repos: [], byId: new Map() };
+    return { available: false, count: 0, primaryRepoId: null, repos: [], byId: new Map(), groupLabels: {} };
   }
 
   const found = [];
@@ -322,9 +457,21 @@ export async function discoverStudioRepos(workspaceRoot, { scanRoots, env } = {}
     }
   }
 
+  const rootCfg = await loadStudioWorkspaceConfig(resolve(workspaceRoot)).catch(() => ({ groupLabels: {} }));
+  const metas = await Promise.all(found.map(realPath => readQuickRepoMeta(realPath)));
+
+  // 合并工作区及发现的高阶仓提供的自然分组标签（启动仓声明优先）
+  const mergedGroupLabels = {};
+  for (const m of metas) {
+    Object.assign(mergedGroupLabels, m.studioCfg?.groupLabels ?? {});
+  }
+  Object.assign(mergedGroupLabels, rootCfg.groupLabels ?? {});
+
   const usedIds = new Set();
   const records = [];
-  for (const realPath of found) {
+  for (let i = 0; i < found.length; i += 1) {
+    const realPath = found[i];
+    const meta = metas[i];
     const name = basename(realPath);
     const group = basename(dirname(realPath)) || 'workspace';
     let id = `${group}/${name}`;
@@ -334,15 +481,17 @@ export async function discoverStudioRepos(workspaceRoot, { scanRoots, env } = {}
       id = `${id}-${n}`;
     }
     usedIds.add(id);
-    const meta = await readQuickRepoMeta(realPath);
     records.push({
       id,
       name,
       packageName: meta.pkgName,
       group,
-      groupLabel: resolveGroupLabel(group),
+      groupLabel: resolveGroupLabel(group, mergedGroupLabels),
       version: meta.version,
       description: meta.description,
+      repoRole: meta.repoRole,
+      repoRoleLabel: meta.repoRoleLabel,
+      hasStudioConfig: Boolean(meta.studioCfg?.hasConfig),
       isPrimary: primaryReal !== null && realPath === primaryReal,
       lockPresent: meta.lockPresent,
       lockedCount: meta.lockedCount,
@@ -367,130 +516,120 @@ export async function discoverStudioRepos(workspaceRoot, { scanRoots, env } = {}
     primaryRepoId: publicRepos[0]?.id ?? null,
     repos: publicRepos,
     byId: new Map(records.map(r => [r.id, r])),
+    groupLabels: mergedGroupLabels,
   };
 }
 
-async function loadRichWorkspaceExtensions(repoReal) {
-  const extraItems = [];
-  const archifyDiagrams = [];
-  const allowedArchifyDirs = new Set();
-
-  // 1. 加载 14 张 Archify 业务逻辑与场景图（如 skill-family-workspace）
-  try {
-    const msRel = 'artifact-reading/business/inputs/model-and-scenes.json';
-    const msAbs = await resolveContained(repoReal, msRel);
-    await lstat(msAbs);
-    const ms = JSON.parse(await readFileContained(repoReal, msRel, { encoding: 'utf8' }));
-    for (const doc of ms.documents ?? []) {
-      if (doc.markdown && typeof doc.markdown === 'string') {
-        try {
-          const mdRaw = sanitizePublicText(await readFileContained(repoReal, doc.markdown, { encoding: 'utf8' }));
-          const rendered = renderMarkdownToHtml(mdRaw, { idPrefix: `art-${doc.pageId || 'doc'}` });
-          extraItems.push({
-            uid: `business_article:${doc.pageId || basename(doc.markdown, '.md')}`,
-            target: `business_article:${doc.pageId || basename(doc.markdown, '.md')}`,
-            type: 'business_article',
-            typeLabel: '业务专题文稿',
-            category: 'business_articles',
-            layer: 'domain',
-            layerOrder: 2,
-            layerLabel: '领域与决策',
-            code: String(doc.pageId || basename(doc.markdown, '.md')).toUpperCase(),
-            title: sanitizePublicText(doc.title || rendered.title || basename(doc.markdown)),
-            path: doc.markdown,
-            status: 'active',
-            isDesignNode: true,
-            inDegree: 0,
-            outDegree: (doc.figures ?? []).length,
-            inlineDoc: { title: doc.title || rendered.title, headings: rendered.headings, html: rendered.html },
-          });
-        } catch {}
-      }
-      for (const fig of doc.figures ?? []) {
-        if (!fig?.html) continue;
-        const cleanHtml = String(fig.html).replace(/\\/g, '/').replace(/^\.\//, '');
-        allowedArchifyDirs.add(dirname(cleanHtml));
-        archifyDiagrams.push({
-          id: fig.id,
-          title: sanitizePublicText(fig.title || fig.id),
-          docPageId: doc.pageId ? String(doc.pageId) : null,
-          docTitle: sanitizePublicText(doc.title || ''),
-          htmlPath: cleanHtml,
-          resources: Array.isArray(fig.resources) ? fig.resources : [],
-          bindings: Array.isArray(fig.bindings)
-            ? fig.bindings
-                .filter(b => b?.nodeId && b?.pageId)
-                .map(b => ({
-                  nodeId: String(b.nodeId),
-                  pageId: String(b.pageId),
-                  anchor: b.anchor ? String(b.anchor) : null,
-                }))
-            : [],
+async function loadArchifyCollection(repoReal, manifestRel, extraItems, archifyDiagrams, allowedArchifyDirs) {
+  const ms = await readJsonSafeContained(repoReal, manifestRel);
+  if (!ms) return;
+  for (const doc of ms.documents ?? []) {
+    if (doc.markdown && typeof doc.markdown === 'string') {
+      try {
+        const mdRaw = sanitizePublicText(await readFileContained(repoReal, doc.markdown, { encoding: 'utf8' }));
+        const rendered = renderMarkdownToHtml(mdRaw, { idPrefix: `art-${doc.pageId || 'doc'}` });
+        extraItems.push({
+          uid: `business_article:${doc.pageId || basename(doc.markdown, '.md')}`,
+          target: `business_article:${doc.pageId || basename(doc.markdown, '.md')}`,
+          type: 'business_article',
+          typeLabel: '业务专题文稿',
+          category: 'business_articles',
+          layer: 'domain',
+          layerOrder: 2,
+          layerLabel: '领域与决策',
+          code: String(doc.pageId || basename(doc.markdown, '.md')).toUpperCase(),
+          title: sanitizePublicText(doc.title || rendered.title || basename(doc.markdown)),
+          path: doc.markdown,
+          status: 'active',
+          isDesignNode: true,
+          inDegree: 0,
+          outDegree: (doc.figures ?? []).length,
+          inlineDoc: { title: doc.title || rendered.title, headings: rendered.headings, html: rendered.html },
         });
-      }
+      } catch {}
     }
-  } catch {}
-
-  return { extraItems, archifyDiagrams, allowedArchifyDirs };
-}
-
-async function loadLifecycleItems(repoReal) {
-  const baseRel = 'local/lifecycle-user-stories';
-  try {
-    const abs = await resolveContained(repoReal, `${baseRel}/stories.json`);
-    await lstat(abs);
-  } catch {
-    return [];
-  }
-  const items = [];
-  const storiesRaw = JSON.parse(await readFileContained(repoReal, `${baseRel}/stories.json`, { encoding: 'utf8' }));
-  const groups = storiesRaw.groups ?? {};
-
-  const gapMap = new Map();
-  try {
-    const compMd = sanitizePublicText(await readFileContained(repoReal, `${baseRel}/replacement-comparison.md`, { encoding: 'utf8' }));
-    const gapRegex = /^###\s+(US-\d{3})\s*·\s*(.+)$/gm;
-    const matches = [...compMd.matchAll(gapRegex)];
-    const tableStart = compMd.indexOf('## 全部81条旧故事的对应位置');
-    for (let idx = 0; idx < matches.length; idx += 1) {
-      const m = matches[idx];
-      const start = m.index + m[0].length;
-      const end = idx + 1 < matches.length ? matches[idx + 1].index : (tableStart > start ? tableStart : compMd.length);
-      gapMap.set(m[1].trim(), compMd.slice(start, end).trim());
-    }
-  } catch {}
-
-  try {
-    const expDir = await resolveContained(repoReal, `${baseRel}/explanations`);
-    const expFiles = (await readdir(expDir)).filter(n => /^\d{2}\.md$/.test(n)).sort();
-    for (const fileName of expFiles) {
-      const num = fileName.slice(0, 2);
-      const md = sanitizePublicText(await readFileContained(repoReal, `${baseRel}/explanations/${fileName}`, { encoding: 'utf8' }));
-      const lcId = (/故事编号\s+(LC-\d+)/i.exec(md)?.[1] || `LC-${num}`).toUpperCase();
-      const rendered = renderMarkdownToHtml(md, { idPrefix: `lc-${num}`, stripNavLine: true });
-      const cleanTitle = (rendered.title || lcId).replace(/^\d{2}\s*·\s*/, '').trim();
-      items.push({
-        uid: `lifecycle:${lcId}`,
-        target: `lifecycle:${lcId}`,
-        type: 'lifecycle',
-        typeLabel: '生命周期讲解',
-        category: 'lc_explanations',
-        layer: 'product',
-        layerOrder: 1,
-        layerLabel: '产品与故事',
-        code: lcId,
-        title: cleanTitle,
-        path: `${baseRel}/explanations/${fileName}`,
-        status: 'active',
-        isDesignNode: true,
-        inDegree: 0,
-        outDegree: 0,
-        inlineDoc: { title: `${lcId} · ${cleanTitle}`, headings: rendered.headings, html: rendered.html },
+    for (const fig of doc.figures ?? []) {
+      if (!fig?.html) continue;
+      const cleanHtml = String(fig.html).replace(/\\/g, '/').replace(/^\.\//, '');
+      allowedArchifyDirs.add(dirname(cleanHtml));
+      archifyDiagrams.push({
+        id: fig.id,
+        title: sanitizePublicText(fig.title || fig.id),
+        docPageId: doc.pageId ? String(doc.pageId) : null,
+        docTitle: sanitizePublicText(doc.title || ''),
+        htmlPath: cleanHtml,
+        resources: Array.isArray(fig.resources) ? fig.resources : [],
+        bindings: Array.isArray(fig.bindings)
+          ? fig.bindings
+              .filter(b => b?.nodeId && b?.pageId)
+              .map(b => ({
+                nodeId: String(b.nodeId),
+                pageId: String(b.pageId),
+                anchor: b.anchor ? String(b.anchor) : null,
+              }))
+          : [],
       });
     }
-  } catch {}
+  }
+}
 
-  for (const st of storiesRaw.stories ?? []) {
+async function loadLifecycleStoryPack(repoReal, col) {
+  const items = [];
+  const storiesRel = col.storiesJson || null;
+  const storiesRaw = storiesRel ? await readJsonSafeContained(repoReal, storiesRel) : null;
+  const groups = storiesRaw?.groups ?? {};
+
+  const gapMap = new Map();
+  if (col.comparisonMarkdown) {
+    try {
+      const compMd = sanitizePublicText(await readFileContained(repoReal, col.comparisonMarkdown, { encoding: 'utf8' }));
+      const gapRegex = /^###\s+(US-\d{3,})\s*·\s*(.+)$/gm;
+      const matches = [...compMd.matchAll(gapRegex)];
+      const tableMatch = /^##\s+全部.*旧故事/m.exec(compMd);
+      const tableStart = tableMatch ? tableMatch.index : -1;
+      for (let idx = 0; idx < matches.length; idx += 1) {
+        const m = matches[idx];
+        const start = m.index + m[0].length;
+        const end = idx + 1 < matches.length ? matches[idx + 1].index : (tableStart > start ? tableStart : compMd.length);
+        gapMap.set(m[1].trim(), compMd.slice(start, end).trim());
+      }
+    } catch {}
+  }
+
+  if (col.explanationsDir) {
+    try {
+      const expDir = await resolveContained(repoReal, col.explanationsDir);
+      const expFiles = (await readdir(expDir)).filter(n => /^\d+\.md$/i.test(n)).sort();
+      for (const fileName of expFiles) {
+        const num = fileName.replace(/\.md$/i, '');
+        const relFile = `${col.explanationsDir.replace(/\/$/, '')}/${fileName}`;
+        const md = sanitizePublicText(await readFileContained(repoReal, relFile, { encoding: 'utf8' }));
+        const lcId = (/故事编号\s+(LC-\d+)/i.exec(md)?.[1] || `LC-${num}`).toUpperCase();
+        const rendered = renderMarkdownToHtml(md, { idPrefix: `lc-${num}`, stripNavLine: true });
+        const cleanTitle = (rendered.title || lcId).replace(/^\d+\s*·\s*/, '').trim();
+        items.push({
+          uid: `lifecycle:${lcId}`,
+          target: `lifecycle:${lcId}`,
+          type: 'lifecycle',
+          typeLabel: '生命周期讲解',
+          category: 'lc_explanations',
+          layer: 'product',
+          layerOrder: 1,
+          layerLabel: '产品与故事',
+          code: lcId,
+          title: cleanTitle,
+          path: relFile,
+          status: 'active',
+          isDesignNode: true,
+          inDegree: 0,
+          outDegree: 0,
+          inlineDoc: { title: `${lcId} · ${cleanTitle}`, headings: rendered.headings, html: rendered.html },
+        });
+      }
+    } catch {}
+  }
+
+  for (const st of storiesRaw?.stories ?? []) {
     const fields = st.fields ?? {};
     const gapBody = gapMap.get(st.id) || '';
     const mdLines = [
@@ -514,7 +653,7 @@ async function loadLifecycleItems(repoReal) {
       layerLabel: '产品与故事',
       code: st.id,
       title: sanitizePublicText(st.title),
-      path: `${baseRel}/stories.json#${st.id}`,
+      path: `${storiesRel}#${st.id}`,
       status: gapBody ? 'accepted' : 'active',
       isDesignNode: true,
       inDegree: 0,
@@ -523,6 +662,46 @@ async function loadLifecycleItems(repoReal) {
     });
   }
   return items;
+}
+async function loadRepoCollections(repoReal) {
+  const studioCfg = await loadStudioWorkspaceConfig(repoReal);
+  const collections = await resolveEffectiveCollections(repoReal, studioCfg);
+  const extraItems = [];
+  const archifyDiagrams = [];
+  const allowedArchifyDirs = new Set();
+
+  for (const col of collections) {
+    if (col.kind === 'archify-model-scenes' && col.manifestJson) {
+      await loadArchifyCollection(repoReal, col.manifestJson, extraItems, archifyDiagrams, allowedArchifyDirs);
+    } else if (col.kind === 'lifecycle-story-pack') {
+      extraItems.push(...await loadLifecycleStoryPack(repoReal, col));
+    }
+  }
+
+  // 若无声明式 Archify 清单，通用兜底发现 artifacts/diagrams/**/*.html
+  if (archifyDiagrams.length === 0) {
+    try {
+      const diagRoot = await resolveContained(repoReal, 'artifacts/diagrams');
+      const entries = await readdir(diagRoot, { withFileTypes: true });
+      for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+        if (e.isFile() && e.name.endsWith('.html')) {
+          const relHtml = `artifacts/diagrams/${e.name}`;
+          allowedArchifyDirs.add('artifacts/diagrams');
+          archifyDiagrams.push({
+            id: basename(e.name, '.html'),
+            title: basename(e.name, '.html'),
+            docPageId: null,
+            docTitle: '',
+            htmlPath: relHtml,
+            resources: [],
+            bindings: [],
+          });
+        }
+      }
+    } catch {}
+  }
+
+  return { studioCfg, extraItems, archifyDiagrams, allowedArchifyDirs };
 }
 
 async function loadRepoSchemaSafe(repoReal) {
@@ -599,12 +778,13 @@ export async function inspectProjectRepo(record, emptyScanDir) {
     const tc = schema.types?.[nd.type] ?? {};
     const ld = classifyLayer(nd.type, tc.layer);
     const isCode = nd.type === 'test' || nd.type === 'implementation' || CODE_EXT_RE.test(nd.path);
+    const category = classifyReviewCategory(nd.type, ld.id);
     return {
       uid: nd.uid,
       target: nd.uid,
       type: nd.type,
       typeLabel: tc.displayName || TYPE_LABELS[nd.type] || nd.type,
-      category: ld.id,
+      category,
       layer: ld.id,
       layerOrder: ld.order,
       layerLabel: ld.label,
@@ -629,13 +809,10 @@ export async function inspectProjectRepo(record, emptyScanDir) {
     sourceLine: e.sourceLine,
   }));
 
-  const [richExt, lcItems] = await Promise.all([
-    loadRichWorkspaceExtensions(record.realPath),
-    loadLifecycleItems(record.realPath),
-  ]);
+  const colResult = await loadRepoCollections(record.realPath);
 
   const lockExists = await exists(join(record.realPath, VERSION_LOCK_PATH));
-  let versionLock = { present: lockExists, status: 'missing', badgeTone: 'zinc', badgeLabel: '未建版本锁', issueCount: 0 };
+  let versionLock = { present: lockExists, status: 'missing', badgeTone: 'zinc', badgeLabel: '未建版本锁', issueCount: 0, codeLocksCount: 0 };
   if (lockExists) {
     try {
       const audit = await auditVersionLock(record.realPath, VERSION_LOCK_PATH, graph, schema);
@@ -649,33 +826,40 @@ export async function inspectProjectRepo(record, emptyScanDir) {
         badgeTone: ok ? 'emerald' : (blockingCount > 0 ? 'rose' : 'amber'),
         badgeLabel: ok ? (totalAll > 0 ? `锁新鲜 (${freshAll}/${totalAll})` : '版本锁就绪 (0 条边)') : `锁漂移 (${audit.issues.length})`,
         issueCount: (audit.issues ?? []).length,
+        codeLocksCount: audit.totalLocks ?? 0,
+        relationLocksCount: audit.totalArtifactRelationLocks ?? 0,
       };
     } catch {
-      versionLock = { present: true, status: 'diagnostic', badgeTone: 'amber', badgeLabel: '版本锁待核实', issueCount: 0 };
+      versionLock = { present: true, status: 'diagnostic', badgeTone: 'amber', badgeLabel: '版本锁待核实', issueCount: 0, codeLocksCount: 0 };
     }
   }
 
   const designGraphNodes = graphNodes.filter(n => n.isDesignNode);
   const allReviewItems = sortItemsForGuidedReview([
     ...(designGraphNodes.length ? designGraphNodes : graphNodes),
-    ...richExt.extraItems,
-    ...lcItems,
+    ...colResult.extraItems,
   ]);
   const inlineDocs = new Map();
-  for (const item of [...richExt.extraItems, ...lcItems]) {
+  for (const item of colResult.extraItems) {
     if (item.inlineDoc) inlineDocs.set(item.uid, item.inlineDoc);
   }
   const publicItems = allReviewItems.map(({ inlineDoc: _omit, ...rest }) => rest);
 
+  // 按阅读任务主次分组与排序分类胶囊
   const catDefs = [
-    ...DEFAULT_LAYERS.map(l => ({ id: l.id, label: l.label })),
-    { id: 'lc_explanations', label: '生命周期讲解 (LC)' },
-    { id: 'us_stories', label: '原始需求故事 (US)' },
-    { id: 'gap_resolutions', label: '差异承接决议' },
-    { id: 'business_articles', label: '业务专题文稿' },
+    { id: 'stories', label: '理解诉求 · 用户故事', group: 'primary', groupLabel: '首要阅读' },
+    { id: 'lc_explanations', label: '生命周期讲解 (LC)', group: 'primary', groupLabel: '首要阅读' },
+    { id: 'us_stories', label: '原始需求故事 (US)', group: 'primary', groupLabel: '首要阅读' },
+    { id: 'gap_resolutions', label: '差异承接决议', group: 'primary', groupLabel: '首要阅读' },
+    { id: 'requirements', label: '核对进展 · 需求总纲', group: 'primary', groupLabel: '首要阅读' },
+    { id: 'scenarios', label: '细看行为 · 场景剧本', group: 'primary', groupLabel: '首要阅读' },
+    { id: 'domain', label: '领域与决策', group: 'supporting', groupLabel: '关联依据' },
+    { id: 'business_articles', label: '业务专题文稿', group: 'supporting', groupLabel: '关联依据' },
+    { id: 'architecture', label: '架构与规格', group: 'supporting', groupLabel: '关联依据' },
+    { id: 'verification', label: '测试与实现追溯', group: 'supporting', groupLabel: '关联依据' },
   ];
   const categories = [
-    { id: 'all', label: '全部审阅项', count: publicItems.length },
+    { id: 'all', label: '全部审阅项', group: 'all', groupLabel: '全部', count: publicItems.length },
     ...catDefs
       .map(c => ({ ...c, count: publicItems.filter(i => i.category === c.id).length }))
       .filter(c => c.count > 0),
@@ -687,6 +871,8 @@ export async function inspectProjectRepo(record, emptyScanDir) {
       repoName: record.name,
       group: record.group,
       groupLabel: record.groupLabel,
+      repoRole: record.repoRole,
+      repoRoleLabel: record.repoRoleLabel,
       configStatus,
       configMessage,
       counts: {
@@ -694,7 +880,7 @@ export async function inspectProjectRepo(record, emptyScanDir) {
         designNodes: designGraphNodes.length,
         edges: edges.length,
         reviewItems: publicItems.length,
-        archifyDiagrams: richExt.archifyDiagrams.length,
+        archifyDiagrams: colResult.archifyDiagrams.length,
       },
       layers: DEFAULT_LAYERS,
       versionLock,
@@ -702,11 +888,11 @@ export async function inspectProjectRepo(record, emptyScanDir) {
       edges,
       categories,
       reviewItems: publicItems,
-      archifyDiagrams: richExt.archifyDiagrams,
+      archifyDiagrams: colResult.archifyDiagrams,
     },
     contents,
     inlineDocs,
-    allowedArchifyDirs: richExt.allowedArchifyDirs,
+    allowedArchifyDirs: colResult.allowedArchifyDirs,
   };
 }
 

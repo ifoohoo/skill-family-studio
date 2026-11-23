@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+// @feature STU003
+// @feature STU004
+
 import { spawn } from 'node:child_process';
 import { mkdir, mkdtemp, open, readFile, realpath, rm } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';

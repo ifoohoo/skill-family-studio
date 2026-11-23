@@ -1,3 +1,6 @@
+// @feature STU001
+// @feature STU002
+
 import { homedir } from 'node:os';
 
 export const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({

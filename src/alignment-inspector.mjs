@@ -1,0 +1,512 @@
+// @feature STU005
+
+import { createHash } from 'node:crypto';
+import { lstat, readdir, realpath } from 'node:fs/promises';
+import { join, relative, resolve } from 'node:path';
+import { VERSION_LOCK_PATH } from 'artifact-graph';
+import { readFileContained, resolveContained } from 'skill-family-harness-node';
+import { parse as parseYaml } from 'yaml';
+
+const SKIP_SCAN_DIRS = new Set([
+  '.git', 'node_modules', 'dist', '.artifact-graph', '.artifacts', '.runs',
+  '.release-skill', '.cache', '.skill-family-studio', '.worktrees', '.tmp', 'target', 'site',
+]);
+
+async function existsFile(absPath) {
+  try {
+    const st = await lstat(absPath);
+    return !st.isSymbolicLink() && st.isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function readJsonContainedSafe(repoReal, relPath) {
+  try {
+    const abs = await resolveContained(repoReal, relPath);
+    const st = await lstat(abs);
+    if (st.isSymbolicLink() || !st.isFile()) return null;
+    const raw = await readFileContained(repoReal, relPath, { encoding: 'utf8' });
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function sha256FilePrefixed(repoReal, relPath) {
+  const clean = String(relPath ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!clean || clean.startsWith('/') || clean.split('/').includes('..')) return null;
+  try {
+    const abs = await resolveContained(repoReal, clean);
+    const st = await lstat(abs);
+    if (st.isSymbolicLink() || !st.isFile()) return null;
+    const bytes = await readFileContained(repoReal, clean);
+    return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+  } catch {
+    return null;
+  }
+}
+
+export function globToRegExp(pattern) {
+  const clean = String(pattern ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '');
+  let out = '^';
+  let i = 0;
+  while (i < clean.length) {
+    const ch = clean[i];
+    if (ch === '*') {
+      if (clean[i + 1] === '*') {
+        if (clean[i + 2] === '/') {
+          out += '(?:.*/)?';
+          i += 3;
+        } else {
+          out += '.*';
+          i += 2;
+        }
+      } else {
+        out += '[^/]*';
+        i += 1;
+      }
+    } else if (ch === '?') {
+      out += '[^/]';
+      i += 1;
+    } else if (ch === '{') {
+      const end = clean.indexOf('}', i + 1);
+      if (end > i) {
+        const parts = clean.slice(i + 1, end).split(',').map(p => p.replace(/[.+^${}()|[\]\\]/g, '\\$&'));
+        out += `(?:${parts.join('|')})`;
+        i = end + 1;
+      } else {
+        out += '\\{';
+        i += 1;
+      }
+    } else {
+      out += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+      i += 1;
+    }
+  }
+  out += '$';
+  return new RegExp(out);
+}
+
+async function listRepoFiles(repoReal) {
+  const files = [];
+  async function walk(dir) {
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const ent of entries) {
+      if (SKIP_SCAN_DIRS.has(ent.name) || ent.name.startsWith('.')) continue;
+      if (ent.isSymbolicLink()) continue;
+      const full = join(dir, ent.name);
+      if (ent.isDirectory()) await walk(full);
+      else if (ent.isFile()) files.push(relative(repoReal, full).split('\\').join('/'));
+    }
+  }
+  await walk(repoReal);
+  return files.sort();
+}
+
+async function resolveRelativeRepo(baseRepoReal, relRepoPath, catalog) {
+  const raw = String(relRepoPath ?? '').trim();
+  if (!raw || raw.includes('\0')) return null;
+  const candidate = resolve(baseRepoReal, raw);
+  let targetReal;
+  try {
+    targetReal = await realpath(candidate);
+  } catch {
+    return null;
+  }
+  if (catalog?.byId) {
+    for (const rec of catalog.byId.values()) {
+      if (rec.realPath === targetReal) {
+        return { repoId: rec.id, name: rec.name, realPath: rec.realPath, inCatalog: true };
+      }
+    }
+  }
+  if (await existsFile(join(targetReal, 'artifact-graph.config.yaml'))) {
+    return { repoId: null, name: targetReal.split('/').pop(), realPath: targetReal, inCatalog: false };
+  }
+  return null;
+}
+
+async function inspectDownstreamLockFreshness(targetRepoReal, verifiedReceiptPath = null) {
+  if (verifiedReceiptPath) {
+    const recJson = await readJsonContainedSafe(targetRepoReal, verifiedReceiptPath);
+    if (recJson && recJson.ok !== false) {
+      return { fresh: true, hasCodeLocks: true, mode: 'receipt', issueCount: 0 };
+    }
+    return { fresh: false, hasCodeLocks: false, mode: 'receipt_invalid', issueCount: 1 };
+  }
+  const lockJson = await readJsonContainedSafe(targetRepoReal, VERSION_LOCK_PATH);
+  if (!lockJson) return { fresh: false, hasCodeLocks: false, mode: 'missing_lock_file', issueCount: 1 };
+  const locks = Array.isArray(lockJson.locks) ? lockJson.locks : [];
+  if (locks.length === 0) {
+    return { fresh: false, hasCodeLocks: false, mode: 'empty_code_locks', issueCount: 1 };
+  }
+  let staleCount = 0;
+  for (const lk of locks) {
+    if (lk?.artifact?.path && lk?.artifact?.contentHash) {
+      const h = await sha256FilePrefixed(targetRepoReal, lk.artifact.path);
+      if (h !== lk.artifact.contentHash) staleCount += 1;
+    }
+    if (lk?.source?.path && lk?.source?.contentHash) {
+      const h = await sha256FilePrefixed(targetRepoReal, lk.source.path);
+      if (h !== lk.source.contentHash) staleCount += 1;
+    }
+  }
+  return { fresh: staleCount === 0, hasCodeLocks: true, mode: 'code_locks', issueCount: staleCount };
+}
+
+export async function inspectInternalCodeLocks(repoReal) {
+  let implSurface = { entryGlobs: [], excludeGlobs: ['**/*.test.*', '**/dist/**'], requireCodeLocks: false };
+  try {
+    const rawYaml = await readFileContained(repoReal, 'artifact-graph.config.yaml', { encoding: 'utf8' });
+    const parsed = parseYaml(rawYaml);
+    if (parsed?.implementationSurface && typeof parsed.implementationSurface === 'object') {
+      const cfg = parsed.implementationSurface;
+      implSurface = {
+        entryGlobs: Array.isArray(cfg.entryGlobs) ? cfg.entryGlobs.map(String) : [],
+        excludeGlobs: Array.isArray(cfg.excludeGlobs) ? cfg.excludeGlobs.map(String) : ['**/*.test.*', '**/dist/**'],
+        requireCodeLocks: Boolean(cfg.requireCodeLocks),
+      };
+    }
+  } catch {}
+
+  const lockJson = await readJsonContainedSafe(repoReal, VERSION_LOCK_PATH);
+  const locks = Array.isArray(lockJson?.locks) ? lockJson.locks : [];
+  const relLocks = Array.isArray(lockJson?.artifactRelations) ? lockJson.artifactRelations : [];
+
+  const claimedSources = new Set();
+  const implementsLocks = [];
+  const verifiesLocks = [];
+  const drifts = [];
+
+  for (const lk of locks) {
+    if (lk?.source?.path) claimedSources.add(lk.source.path);
+    for (const vb of lk?.verifiedBy ?? []) {
+      if (vb?.path) claimedSources.add(vb.path);
+    }
+    if (lk?.kind === 'verifies') verifiesLocks.push(lk);
+    else implementsLocks.push(lk);
+
+    if (lk?.artifact?.path && lk?.artifact?.contentHash) {
+      const cur = await sha256FilePrefixed(repoReal, lk.artifact.path);
+      if (cur !== lk.artifact.contentHash) {
+        drifts.push({ code: 'artifact_changed', path: lk.artifact.path, edgeId: lk.edgeId });
+      }
+    }
+    if (lk?.source?.path && lk?.source?.contentHash) {
+      const cur = await sha256FilePrefixed(repoReal, lk.source.path);
+      if (cur !== lk.source.contentHash) {
+        drifts.push({ code: 'source_changed', path: lk.source.path, edgeId: lk.edgeId });
+      }
+    }
+  }
+
+  let matchedEntries = [];
+  let unclaimedEntries = [];
+  if (implSurface.entryGlobs.length > 0) {
+    const incRes = implSurface.entryGlobs.map(globToRegExp);
+    const excRes = implSurface.excludeGlobs.map(globToRegExp);
+    const allFiles = await listRepoFiles(repoReal);
+    matchedEntries = allFiles.filter(f => incRes.some(r => r.test(f)) && !excRes.some(r => r.test(f)));
+    unclaimedEntries = matchedEntries.filter(f => !claimedSources.has(f));
+  }
+
+  const missingRequiredCodeLocks = implSurface.requireCodeLocks && locks.length === 0;
+  const healthy = !missingRequiredCodeLocks && unclaimedEntries.length === 0 && drifts.length === 0;
+
+  return {
+    lockPresent: Boolean(lockJson),
+    requireCodeLocks: implSurface.requireCodeLocks,
+    entryGlobsCount: implSurface.entryGlobs.length,
+    matchedEntriesCount: matchedEntries.length,
+    totalCodeLocks: locks.length,
+    implementsCount: implementsLocks.length,
+    verifiesCount: verifiesLocks.length,
+    relationLocksCount: relLocks.length,
+    unclaimedEntries,
+    drifts,
+    missingRequiredCodeLocks,
+    healthy,
+  };
+}
+const SATISFACTION_META = Object.freeze({
+  verified_satisfied: { code: 'verified_satisfied', label: '🟢 已验证满足', tone: 'emerald' },
+  partially_allocated: { code: 'partially_allocated', label: '🔵 部分覆盖', tone: 'indigo' },
+  allocated_in_progress: { code: 'allocated_in_progress', label: '⏳ 已派单推进中', tone: 'amber' },
+  not_applicable: { code: 'not_applicable', label: '⚪ 按处置不计满足', tone: 'zinc' },
+  unallocated: { code: 'unallocated', label: '🔴 漏拆未派单', tone: 'rose' },
+});
+
+const DISPOSITION_LABELS = Object.freeze({
+  allocated: '已拆派推进',
+  deferred: '已暂缓',
+  merged: '已合并',
+  abandoned: '已废弃',
+});
+
+export async function inspectPortfolioAllocations(repoReal, catalog) {
+  const doc = await readJsonContainedSafe(repoReal, 'artifacts/portfolio-allocations.json');
+  if (!doc) return { present: false, portfolioId: null, title: null, items: [], summary: null };
+
+  const rawItems = Array.isArray(doc.items) ? doc.items : [];
+  const items = [];
+  const summary = {
+    total: rawItems.length,
+    verifiedSatisfied: 0,
+    partiallyAllocated: 0,
+    allocatedInProgress: 0,
+    notApplicable: 0,
+    unallocated: 0,
+    driftCount: 0,
+    missingCount: 0,
+  };
+
+  for (const raw of rawItems) {
+    const disposition = String(raw?.disposition || 'allocated');
+    const remainingScope = Array.isArray(raw?.remainingScope) ? raw.remainingScope.map(String) : [];
+    const allocsRaw = Array.isArray(raw?.allocations) ? raw.allocations : [];
+    const currentSourceDigest = raw?.sourcePath ? await sha256FilePrefixed(repoReal, raw.sourcePath) : null;
+    const itemIssues = [];
+
+    if (!currentSourceDigest) {
+      itemIssues.push({ code: 'SOURCE_ARTIFACT_MISSING', message: `高阶源文件缺失：${raw?.sourcePath || ''}` });
+    } else if (raw?.sourceDigest && currentSourceDigest !== raw.sourceDigest) {
+      itemIssues.push({ code: 'UPSTREAM_DESIGN_CHANGED', message: '高阶需求原文已修订，待同步下游详细设计' });
+    }
+
+    const allocations = [];
+    for (const a of allocsRaw) {
+      const targetMeta = await resolveRelativeRepo(repoReal, a?.targetRepo, catalog);
+      const allocIssues = [];
+      let currentTargetDigest = null;
+      let reciprocalBinding = null;
+      let lockCheck = { fresh: false, hasCodeLocks: false, mode: 'missing' };
+
+      if (!targetMeta) {
+        allocIssues.push({ code: 'TARGET_MISSING', message: `未找到下游承接仓库：${a?.targetRepo || ''}` });
+      } else {
+        currentTargetDigest = a?.targetPath ? await sha256FilePrefixed(targetMeta.realPath, a.targetPath) : null;
+        if (!currentTargetDigest) {
+          allocIssues.push({ code: 'TARGET_MISSING', message: `下游制品文件缺失：${a?.targetPath || ''}` });
+        } else if (a?.targetDigest && currentTargetDigest !== a.targetDigest) {
+          allocIssues.push({ code: 'DOWNSTREAM_DESIGN_EVOLVED', message: '下游详设已演进，待回写更新高阶规划清单' });
+        }
+
+        if (a?.readonlyTarget === true) {
+          lockCheck = await inspectDownstreamLockFreshness(targetMeta.realPath, a?.verifiedReceiptPath || null);
+        } else {
+          const upDoc = await readJsonContainedSafe(targetMeta.realPath, 'artifacts/upstream-bindings.json');
+          const bindings = Array.isArray(upDoc?.bindings) ? upDoc.bindings : [];
+          reciprocalBinding = bindings.find(b =>
+            (b?.localUid === a?.targetUid && b?.upstreamUid === raw?.sourceUid)
+            || (b?.localPath === a?.targetPath && b?.upstreamPath === raw?.sourcePath),
+          ) || null;
+          if (!reciprocalBinding) {
+            allocIssues.push({ code: 'UNRECIPROCATED_ALLOCATION', message: '下游仓库缺少对应 upstream-bindings.json 回指声明' });
+          } else {
+            if (currentSourceDigest && reciprocalBinding.upstreamDigest && currentSourceDigest !== reciprocalBinding.upstreamDigest) {
+              allocIssues.push({ code: 'UPSTREAM_DESIGN_CHANGED', message: '高阶原文已变更，下游 upstream-bindings 尚未同步' });
+            }
+            if (currentTargetDigest && reciprocalBinding.localDigest && currentTargetDigest !== reciprocalBinding.localDigest) {
+              allocIssues.push({ code: 'DOWNSTREAM_DESIGN_EVOLVED', message: '下游详设已变更，本地回指摘要尚未更新' });
+            }
+          }
+          lockCheck = await inspectDownstreamLockFreshness(targetMeta.realPath, a?.verifiedReceiptPath || null);
+        }
+      }
+
+      for (const iss of allocIssues) {
+        if (!itemIssues.some(x => x.code === iss.code && x.message === iss.message)) itemIssues.push(iss);
+      }
+
+      allocations.push({
+        targetRepo: a?.targetRepo || '',
+        targetRepoId: targetMeta?.repoId || null,
+        targetRepoName: targetMeta?.name || String(a?.targetRepo || '').split('/').pop(),
+        targetUid: a?.targetUid || '',
+        targetPath: a?.targetPath || '',
+        coverageRole: a?.coverageRole || 'primary',
+        readonlyTarget: Boolean(a?.readonlyTarget),
+        verifiedReceiptPath: a?.verifiedReceiptPath || null,
+        targetExists: Boolean(currentTargetDigest),
+        reciprocalFound: Boolean(reciprocalBinding) || Boolean(a?.readonlyTarget),
+        codeLocksFresh: lockCheck.fresh && lockCheck.hasCodeLocks,
+        lockMode: lockCheck.mode,
+        issues: allocIssues,
+      });
+    }
+
+    let computedSatisfaction = 'allocated_in_progress';
+    if (disposition !== 'allocated') {
+      computedSatisfaction = 'not_applicable';
+      summary.notApplicable += 1;
+    } else if (allocations.length === 0) {
+      computedSatisfaction = 'unallocated';
+      summary.unallocated += 1;
+      itemIssues.push({ code: 'UNALLOCATED_ACTIVE_DEMAND', message: '有效高阶需求尚未拆派给任何子项目' });
+    } else if (remainingScope.length > 0) {
+      computedSatisfaction = 'partially_allocated';
+      summary.partiallyAllocated += 1;
+    } else {
+      const allTargetsReady = allocations.every(al => al.targetExists && al.reciprocalFound && al.codeLocksFresh);
+      const noBlockingDrift = !itemIssues.some(iss =>
+        ['SOURCE_ARTIFACT_MISSING', 'TARGET_MISSING', 'UPSTREAM_DESIGN_CHANGED', 'DOWNSTREAM_DESIGN_EVOLVED', 'UNRECIPROCATED_ALLOCATION'].includes(iss.code),
+      );
+      if (allTargetsReady && noBlockingDrift) {
+        computedSatisfaction = 'verified_satisfied';
+        summary.verifiedSatisfied += 1;
+      } else {
+        computedSatisfaction = 'allocated_in_progress';
+        summary.allocatedInProgress += 1;
+      }
+    }
+
+    const issueCodes = new Set(itemIssues.map(i => i.code));
+    let health = { code: 'SYNCED', label: '🟢 双向一致', tone: 'emerald' };
+    if (issueCodes.has('UNALLOCATED_ACTIVE_DEMAND') || issueCodes.has('SOURCE_ARTIFACT_MISSING') || issueCodes.has('TARGET_MISSING')) {
+      health = { code: 'MISSING_OR_UNALLOCATED', label: '🔴 漏拆或目标缺失', tone: 'rose' };
+      summary.missingCount += 1;
+    } else if (issueCodes.has('UNRECIPROCATED_ALLOCATION')) {
+      health = { code: 'UNRECIPROCATED_ALLOCATION', label: '🔴 单边未互认', tone: 'rose' };
+      summary.driftCount += 1;
+    } else if (issueCodes.has('UPSTREAM_DESIGN_CHANGED')) {
+      health = { code: 'UPSTREAM_DESIGN_CHANGED', label: '🟠 高阶已变待同步详设', tone: 'amber' };
+      summary.driftCount += 1;
+    } else if (issueCodes.has('DOWNSTREAM_DESIGN_EVOLVED')) {
+      health = { code: 'DOWNSTREAM_DESIGN_EVOLVED', label: '🟠 详设已演进待回写高阶', tone: 'amber' };
+      summary.driftCount += 1;
+    } else if (disposition !== 'allocated') {
+      health = { code: 'DISPOSED', label: '⚪ 按处置结案', tone: 'zinc' };
+    } else if (computedSatisfaction !== 'verified_satisfied') {
+      health = { code: 'IN_PROGRESS', label: '🔵 摘要对齐·实施验证中', tone: 'indigo' };
+    }
+
+    items.push({
+      sourceUid: raw?.sourceUid || '',
+      sourcePath: raw?.sourcePath || '',
+      title: raw?.title || raw?.sourceUid || '',
+      disposition,
+      dispositionLabel: DISPOSITION_LABELS[disposition] || disposition,
+      dispositionNote: raw?.dispositionNote || '',
+      mergedInto: raw?.mergedInto || null,
+      remainingScope,
+      allocations,
+      computedSatisfaction,
+      satisfactionMeta: SATISFACTION_META[computedSatisfaction] || SATISFACTION_META.allocated_in_progress,
+      health,
+      issues: itemIssues,
+    });
+  }
+
+  return {
+    present: true,
+    portfolioId: doc.portfolioId || null,
+    title: doc.title || '高阶需求拆分与承接总表',
+    items,
+    summary,
+  };
+}
+
+export async function inspectUpstreamBindings(repoReal, catalog) {
+  const doc = await readJsonContainedSafe(repoReal, 'artifacts/upstream-bindings.json');
+  if (!doc) return { present: false, upstreamPortfolio: null, upstreamRepoId: null, upstreamRepoName: null, bindings: [], driftCount: 0 };
+
+  const upstreamMeta = await resolveRelativeRepo(repoReal, doc.upstreamPortfolio, catalog);
+  const upstreamPortfolioDoc = upstreamMeta
+    ? await readJsonContainedSafe(upstreamMeta.realPath, 'artifacts/portfolio-allocations.json')
+    : null;
+  const upItems = Array.isArray(upstreamPortfolioDoc?.items) ? upstreamPortfolioDoc.items : [];
+
+  const bindings = [];
+  let driftCount = 0;
+
+  for (const b of Array.isArray(doc.bindings) ? doc.bindings : []) {
+    const curLocalDigest = b?.localPath ? await sha256FilePrefixed(repoReal, b.localPath) : null;
+    const curUpstreamDigest = (upstreamMeta && b?.upstreamPath)
+      ? await sha256FilePrefixed(upstreamMeta.realPath, b.upstreamPath)
+      : null;
+
+    const matchedUpItem = upItems.find(it => it?.sourceUid === b?.upstreamUid || it?.sourcePath === b?.upstreamPath) || null;
+    const matchedAlloc = matchedUpItem
+      ? (matchedUpItem.allocations ?? []).find(al => al?.targetUid === b?.localUid || al?.targetPath === b?.localPath) || null
+      : null;
+
+    const issues = [];
+    if (!curLocalDigest) issues.push({ code: 'TARGET_MISSING', message: `本地制品缺失：${b?.localPath || ''}` });
+    if (!upstreamMeta || !curUpstreamDigest) issues.push({ code: 'TARGET_MISSING', message: `上游高阶文件缺失：${b?.upstreamPath || ''}` });
+    if (upstreamPortfolioDoc && !matchedAlloc) {
+      issues.push({ code: 'UNRECIPROCATED_ALLOCATION', message: '上游高阶清单未登记对本条目的承接分配' });
+    }
+    if (curUpstreamDigest && ((b?.upstreamDigest && curUpstreamDigest !== b.upstreamDigest)
+      || (matchedUpItem?.sourceDigest && curUpstreamDigest !== matchedUpItem.sourceDigest))) {
+      issues.push({ code: 'UPSTREAM_DESIGN_CHANGED', message: '上游高阶需求已修订，本详设需同步对齐' });
+    }
+    if (curLocalDigest && ((b?.localDigest && curLocalDigest !== b.localDigest)
+      || (matchedAlloc?.targetDigest && curLocalDigest !== matchedAlloc.targetDigest))) {
+      issues.push({ code: 'DOWNSTREAM_DESIGN_EVOLVED', message: '本详设已演进，需反向回写上游高阶清单' });
+    }
+
+    const codes = new Set(issues.map(i => i.code));
+    let health = { code: 'SYNCED', label: '🟢 与高阶双向一致', tone: 'emerald' };
+    if (codes.has('TARGET_MISSING') || codes.has('UNRECIPROCATED_ALLOCATION')) {
+      health = { code: 'UNRECIPROCATED_ALLOCATION', label: '🔴 来源缺失或未互认', tone: 'rose' };
+      driftCount += 1;
+    } else if (codes.has('UPSTREAM_DESIGN_CHANGED')) {
+      health = { code: 'UPSTREAM_DESIGN_CHANGED', label: '🟠 高阶已变待同步详设', tone: 'amber' };
+      driftCount += 1;
+    } else if (codes.has('DOWNSTREAM_DESIGN_EVOLVED')) {
+      health = { code: 'DOWNSTREAM_DESIGN_EVOLVED', label: '🟠 详设已演进待回写高阶', tone: 'amber' };
+      driftCount += 1;
+    }
+
+    bindings.push({
+      localUid: b?.localUid || '',
+      localPath: b?.localPath || '',
+      upstreamUid: b?.upstreamUid || '',
+      upstreamPath: b?.upstreamPath || '',
+      upstreamTitle: matchedUpItem?.title || b?.upstreamUid || '',
+      upstreamRepoId: upstreamMeta?.repoId || null,
+      upstreamRepoName: upstreamMeta?.name || String(doc.upstreamPortfolio || '').split('/').pop(),
+      health,
+      issues,
+    });
+  }
+
+  return {
+    present: true,
+    upstreamPortfolio: doc.upstreamPortfolio || null,
+    upstreamRepoId: upstreamMeta?.repoId || null,
+    upstreamRepoName: upstreamMeta?.name || String(doc.upstreamPortfolio || '').split('/').pop(),
+    bindings,
+    driftCount,
+  };
+}
+
+export async function inspectRepoAlignment(record, catalog) {
+  const [portfolio, upstreamBindings, internalCodeLocks] = await Promise.all([
+    inspectPortfolioAllocations(record.realPath, catalog),
+    inspectUpstreamBindings(record.realPath, catalog),
+    inspectInternalCodeLocks(record.realPath),
+  ]);
+
+  const totalAlerts = (portfolio.summary?.driftCount ?? 0)
+    + (portfolio.summary?.missingCount ?? 0)
+    + (portfolio.summary?.unallocated ?? 0)
+    + (upstreamBindings.driftCount ?? 0)
+    + (internalCodeLocks.unclaimedEntries?.length ?? 0)
+    + (internalCodeLocks.drifts?.length ?? 0)
+    + (internalCodeLocks.missingRequiredCodeLocks ? 1 : 0);
+
+  return {
+    ok: true,
+    repoId: record.id,
+    repoName: record.name,
+    role: portfolio.present ? 'portfolio' : (upstreamBindings.present ? 'subproject' : 'standalone'),
+    totalAlerts,
+    portfolio,
+    upstreamBindings,
+    internalCodeLocks,
+  };
+}

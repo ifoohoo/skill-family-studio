@@ -1,13 +1,13 @@
 # Skill Family Studio
 
-`skill-family-studio` 是面向技能族研发与设计验收的本地离线可视化控制台。它在单一回环端口（默认 `127.0.0.1:57630`）内统一承载 `artifact-graph` 宽屏制品图谱浏览、四态引导式逐项审阅与 Foundation 运行态监控。
+`skill-family-studio` 是面向任意技能族与业务域套组的本地离线可视化控制台。它在单一回环端口（默认 `127.0.0.1:57630`）内统一承载 `artifact-graph` 宽屏制品图谱浏览、三层双向一致性体检与跨仓互跳、故事优先的四态引导式逐项审阅，以及迭代升级的 Foundation 运行态监控。
 
 ## 核心能力
 
-1. **统一项目切换，废除内部批次黑话**：顶栏左侧通过唯一的「当前项目」切换器按 `Skill Family 支撑线 / Artifact 制品线 / GLAF4 业务线` 浏览仓库，直观展示制品节点数、版本锁新鲜度、审阅完成度与运行态活跃度。
-2. **超宽屏自适应与同层多行自动折行图谱**：主画布解除 `1440px` 锁宽限制，在 `1920px`、`2560px`（2K 桌面）与 `3440px`（21:9 带鱼屏）显示器上 100% 铺满视口；同一层级包含大量节点时自动排布为多行网格（Wrap Grid），少节点层自动居中避免孤岛撕裂，保证有效字号不低于 `11px` 且消除横向滚动条。内嵌 Archify 架构图支持一键全屏展开及点击节点联动定位对应说明章节。
-3. **自动感知的四态审阅工作流与零侵入存储**：提供「开始按推荐顺序审阅」与「✓ 通过并审下一项 →」连贯动线。为文档添加未解决批注会自动点亮「🔵 审阅中」，批注全部解决或清空且未给结论时自动回到「⚪ 待审阅」；全部数据保存在 `.skill-family-studio/reviews.json`，零改动受审仓库源码。
-4. **单端口集成 Foundation 运行态监控**：直接在「⚡ 运行监控」页签实时查看 `state-store` SHA-256 事件哈希链、`token-lock` 持锁读秒预警与 `supervise-process` 子进程状态，并支持在系统临时目录一键运行隔离沙箱演练。
+1. **零硬编码通用适配（单项目零配置 + 业务域多仓套组）**：零配置即可自动发现当前仓与同父目录兄弟仓库；多仓业务域可通过声明式 `.studio-workspace.json`（或 `artifact-graph.config.yaml` 的 `studio` 节）自定义 `scanRoots`、`groupLabels` 与 `lifecycle-story-pack` / `archify-model-scenes` 扩展集合，对任何第三方技能族开箱即用。
+2. **需求进展三列总览与三层双向对齐体检**：高阶规划仓提供「业务处置与承接去向 / 机器派生满足概况 / 阶段与双向健康度」三列一览表，严禁靠手工台账声称满足；支持高阶变了提醒详设（`UPSTREAM_DESIGN_CHANGED`）、详设演进提醒回写（`DOWNSTREAM_DESIGN_EVOLVED`）、单仓代码与 `SKILL.md` 未认领入口告警（`UNCLAIMED_IMPLEMENTATION_ENTRY`），以及高阶与子仓详设之间一键跨仓互跳。
+3. **超宽屏自适应折行图谱与故事优先审阅**：解除 `1440px` 锁宽限制，在 `1920px`、`2560px`（2K）与 `3440px`（21:9 带鱼屏）铺满视口并同层多行自动折行；「逐项审阅」按读者任务划分为「首要阅读（用户故事 → 需求总纲 → 场景剧本）」与「关联依据（领域决策 → 架构规格 → 测试追溯）」；添加未解决批注自动点亮「🔵 审阅中」，零侵入保存在 `.skill-family-studio/reviews.json`。
+4. **迭代版「⚡ 运行监控」四大观测子视图**：支持聚焦当前项目与全工作区活跃源切换、多格式（MD/JSON/CSV）任务里程碑矩阵、文件锁每秒跳字读秒与超阈值预警、网页内 `+ 挂载运行源` 弹窗与 `🔓 释放沙箱锁`、`state-store` 事件哈希链时间线、`supervise-process` 子进程监督轨迹以及 SSE 实时自动同步。
 
 ## 环境要求与快速启动
 
@@ -23,7 +23,7 @@ npx skill-family-studio ensure --root /absolute/project/path --port 57630
 # 前台启动并默认打开「使用说明」页签
 npx skill-family-studio serve --root /absolute/project/path --port 57630 --tab guide
 
-# 离线输出设计态 + 审阅汇总 + 运行态聚合快照
+# 离线输出设计态 + 双向对齐 + 审阅汇总 + 运行态聚合快照
 npx skill-family-studio snapshot --root /absolute/project/path
 ```
 
@@ -33,9 +33,9 @@ npx skill-family-studio snapshot --root /absolute/project/path
 
 - **Codex / Kimi Code / Qoder / CodeBuddy**：自动映射至 `.agents/skills/skill-family-studio/SKILL.md` 及对应 `.*-plugin/plugin.json`；
 - **Claude Code**：映射至 `.claude/skills/skill-family-studio/SKILL.md` 与 `.claude-plugin/plugin.json`；
-- **Antigravity**：提供严格遵守官方十键白名单（`name` / `displayName` / `version` / `description` / `author` / `repository` 等）的根级 `plugin.json`，支持按宿主规范挂载至项目 `.agents/skills`、`.agent/skills` 或 `.gemini/config/{skills,plugins}`。
+- **Antigravity**：提供严格遵守官方十键白名单的根级 `plugin.json`，支持按宿主规范挂载至项目 `.agents/skills`、`.agent/skills` 或 `.gemini/config/{skills,plugins}`。
 
-详细操作动线与状态说明请参阅包内随附的 [USER-GUIDE.md](USER-GUIDE.md)。
+详细操作动线、双向对齐规则与运行监控使用方式请参阅随附的 [USER-GUIDE.md](USER-GUIDE.md)。
 
 ## 开源许可与署名
 

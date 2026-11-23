@@ -1,9 +1,16 @@
+// @feature STU001
+// @feature STU002
+// @feature STU003
+// @feature STU005
+
+import { existsSync, watch } from 'node:fs';
 import { createServer } from 'node:http';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { FOUNDATION_PACKAGE_VERSION } from 'skill-family-harness-node';
+import { inspectRepoAlignment } from './alignment-inspector.mjs';
 import { discoverStudioRepos, inspectProjectRepo, readRepoArchifyAsset, readRepoDocument } from './ecosystem.mjs';
 import { STUDIO_GUIDE_MODEL } from './guide-content.mjs';
 import {
@@ -162,9 +169,15 @@ export async function createStudioServer({
     return entry;
   };
 
-  const getLegacyFallbackRoot = catalog => {
-    const sfw = [...(catalog?.byId?.values() ?? [])].find(r => r.name === 'skill-family-workspace');
-    return sfw?.realPath ?? null;
+  const getLegacyFallback = catalog => {
+    const records = [...(catalog?.byId?.values() ?? [])];
+    const hit = records.find(r => existsSync(join(r.realPath, 'artifacts/reviews/workbench-reviews.json')))
+      || records.find(r => r.repoRole === 'portfolio')
+      || records[0];
+    return {
+      legacyFallbackRoot: hit?.realPath ?? null,
+      defaultPrimaryRepoId: hit?.id ?? catalog?.primaryRepoId ?? null,
+    };
   };
 
   const sseClients = new Set();
@@ -180,6 +193,27 @@ export async function createStudioServer({
     }
   }, 20000);
   heartbeat.unref?.();
+
+  const runtimeWatchers = [];
+  let runtimeDebounceTimer = null;
+  const triggerRuntimeBroadcast = () => {
+    if (runtimeDebounceTimer) clearTimeout(runtimeDebounceTimer);
+    runtimeDebounceTimer = setTimeout(() => {
+      runtimeDebounceTimer = null;
+      broadcast('runtime-change', { at: new Date().toISOString() });
+    }, 220);
+    runtimeDebounceTimer.unref?.();
+  };
+  for (const relDir of ['.skill-family-studio', '.artifacts/runtime-monitor', 'artifacts/runtime-monitor']) {
+    const absDir = join(resolvedRoot, relDir);
+    if (existsSync(absDir)) {
+      try {
+        const w = watch(absDir, () => triggerRuntimeBroadcast());
+        w.unref?.();
+        runtimeWatchers.push(w);
+      } catch {}
+    }
+  }
 
   const server = createServer(async (req, res) => {
     try {
@@ -223,9 +257,11 @@ export async function createStudioServer({
         if (req.method !== 'GET') { sendJson(res, 405, { ok: false, error: '仅支持 GET 请求。' }); return; }
         const force = url.searchParams.get('refresh') === '1';
         const catalog = await getCatalog(force);
+        const fb = getLegacyFallback(catalog);
         const store = await readStudioReviewStore(resolvedRoot, {
           reviewsPath,
-          legacyFallbackRoot: getLegacyFallbackRoot(catalog),
+          legacyFallbackRoot: fb.legacyFallbackRoot,
+          defaultPrimaryRepoId: fb.defaultPrimaryRepoId,
         });
         sendJson(res, 200, {
           ok: true,
@@ -306,9 +342,11 @@ export async function createStudioServer({
       if (pathname === '/api/studio/summary') {
         if (req.method !== 'GET') { sendJson(res, 405, { ok: false, error: '仅支持 GET 请求。' }); return; }
         const catalog = await getCatalog(false);
+        const fb = getLegacyFallback(catalog);
         const store = await readStudioReviewStore(resolvedRoot, {
           reviewsPath,
-          legacyFallbackRoot: getLegacyFallbackRoot(catalog),
+          legacyFallbackRoot: fb.legacyFallbackRoot,
+          defaultPrimaryRepoId: fb.defaultPrimaryRepoId,
         });
         const summary = buildStudioReviewSummary(store, { repos: catalog.repos });
         if (url.searchParams.get('format') === 'markdown') {
@@ -317,6 +355,20 @@ export async function createStudioServer({
           return;
         }
         sendJson(res, 200, { ok: true, writable, updatedAt: store.updatedAt, ...summary });
+        return;
+      }
+
+      if (pathname === '/api/studio/alignment') {
+        if (req.method !== 'GET') { sendJson(res, 405, { ok: false, error: '仅支持 GET 请求。' }); return; }
+        const catalog = await getCatalog(url.searchParams.get('refresh') === '1');
+        const repoId = url.searchParams.get('repo') || catalog.primaryRepoId;
+        const record = repoId ? catalog.byId.get(repoId) : null;
+        if (!record) {
+          sendJson(res, 404, { ok: false, error: `未找到指定的技能族仓库：${repoId || ''}` });
+          return;
+        }
+        const alignment = await inspectRepoAlignment(record, catalog);
+        sendJson(res, 200, alignment);
         return;
       }
 
@@ -331,6 +383,7 @@ export async function createStudioServer({
           selectedRepoId,
           registryPath: runtimeRegistryPath,
           extraTargets,
+          hasActiveSandboxLock: Boolean(sandboxHandle?.isLockHeld?.()),
           lockWarnMs,
           allowedRoots,
           workbenchUrl,
@@ -369,10 +422,12 @@ export async function createStudioServer({
             return;
           }
           const effectiveRepoId = checkRepo || catalog.primaryRepoId || 'workspace';
+          const fb = getLegacyFallback(catalog);
           const out = await enqueueWrite(async () => {
             const store = await readStudioReviewStore(resolvedRoot, {
               reviewsPath,
-              legacyFallbackRoot: getLegacyFallbackRoot(catalog),
+              legacyFallbackRoot: fb.legacyFallbackRoot,
+              defaultPrimaryRepoId: fb.defaultPrimaryRepoId,
             });
             const mut = pathname === '/api/studio/annotations'
               ? applyAnnotationMutation(store, body, { repoId: effectiveRepoId })
@@ -409,9 +464,19 @@ export async function createStudioServer({
           if (sandboxHandle?.releaseLock) {
             try { await sandboxHandle.releaseLock(); } catch {}
           }
+          if (sandboxHandle?.sandboxRoot) {
+            try { await rm(sandboxHandle.sandboxRoot, { recursive: true, force: true }); } catch {}
+          }
           sandboxHandle = await runSandboxExercise({ holdLock: true, simulateTimeout: true });
           broadcast('runtime-change', { at: new Date().toISOString() });
-          sendJson(res, 200, { ok: true, target: sandboxHandle.targetEntry });
+          sendJson(res, 200, { ok: true, target: sandboxHandle.targetEntry, lockHeld: Boolean(sandboxHandle.isLockHeld?.()) });
+          return;
+        }
+
+        if (pathname === '/api/studio/runtime/sandbox/release') {
+          const released = sandboxHandle?.releaseLock ? Boolean(await sandboxHandle.releaseLock()) : false;
+          broadcast('runtime-change', { at: new Date().toISOString(), action: 'sandbox-release' });
+          sendJson(res, 200, { ok: true, released, lockHeld: Boolean(sandboxHandle?.isLockHeld?.()) });
           return;
         }
       }
@@ -449,10 +514,18 @@ export async function createStudioServer({
 
   server.on('close', () => {
     clearInterval(heartbeat);
+    if (runtimeDebounceTimer) clearTimeout(runtimeDebounceTimer);
+    for (const w of runtimeWatchers) { try { w.close(); } catch {} }
     for (const c of sseClients) { try { c.end(); } catch {} }
     sseClients.clear();
     if (sandboxHandle?.releaseLock) {
-      Promise.resolve(sandboxHandle.releaseLock()).catch(() => {});
+      Promise.resolve(sandboxHandle.releaseLock())
+        .catch(() => {})
+        .finally(() => {
+          if (sandboxHandle?.sandboxRoot) {
+            rm(sandboxHandle.sandboxRoot, { recursive: true, force: true }).catch(() => {});
+          }
+        });
     }
     rm(emptyScanDir, { recursive: true, force: true }).catch(() => {});
   });
@@ -489,7 +562,12 @@ export async function createStudioServer({
     port: boundPort,
     writable,
     url: serverUrl,
-    close: () => new Promise(res => server.close(() => res())),
+    close: () => {
+      for (const c of sseClients) { try { c.end(); } catch {} }
+      sseClients.clear();
+      server.closeAllConnections?.();
+      return new Promise(res => server.close(() => res()));
+    },
   };
 }
 
@@ -508,10 +586,14 @@ export async function collectStudioSnapshot({
     const targetRepoId = repo || catalog.primaryRepoId;
     const record = targetRepoId ? catalog.byId.get(targetRepoId) : null;
     const inspected = record ? await inspectProjectRepo(record, emptyScanDir) : null;
-    const sfw = [...catalog.byId.values()].find(r => r.name === 'skill-family-workspace');
+    const alignment = record ? await inspectRepoAlignment(record, catalog) : null;
+    const legacyHit = [...catalog.byId.values()].find(r => existsSync(join(r.realPath, 'artifacts/reviews/workbench-reviews.json')))
+      || [...catalog.byId.values()].find(r => r.repoRole === 'portfolio')
+      || null;
     const store = await readStudioReviewStore(resolvedRoot, {
       reviewsPath,
-      legacyFallbackRoot: sfw?.realPath ?? null,
+      legacyFallbackRoot: legacyHit?.realPath ?? null,
+      defaultPrimaryRepoId: legacyHit?.id ?? catalog.primaryRepoId ?? null,
     });
     const reviewSummary = buildStudioReviewSummary(store, { repos: catalog.repos });
     const runtime = await collectStudioRuntimeView({
@@ -532,6 +614,7 @@ export async function collectStudioSnapshot({
         repos: catalog.repos,
       },
       selectedRepo: inspected ? inspected.publicSnapshot : null,
+      alignment,
       reviewSummary: {
         counts: reviewSummary.counts,
         repos: reviewSummary.repos,

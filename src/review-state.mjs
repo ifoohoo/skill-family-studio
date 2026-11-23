@@ -1,3 +1,5 @@
+// @feature STU002
+
 import { randomUUID } from 'node:crypto';
 import { lstat, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
@@ -58,7 +60,7 @@ export function validateTargetId(target) {
   return clean;
 }
 
-export function normalizeLegacyTargetKey(rawKey, defaultPrimaryRepoId = 'skill-family/skill-family-workspace') {
+export function normalizeLegacyTargetKey(rawKey, defaultPrimaryRepoId = null) {
   const clean = validateTargetId(rawKey);
   if (clean.startsWith('repo:')) return clean;
   const ecoMatch = /^eco:([^:]+):(.+)$/.exec(clean);
@@ -142,7 +144,7 @@ export function computeEffectiveReviewStatus(qualifiedTarget, store) {
   return 'pending';
 }
 
-function sanitizeParsedStore(parsed, defaultPrimaryRepoId = 'skill-family/skill-family-workspace') {
+function sanitizeParsedStore(parsed, defaultPrimaryRepoId = null) {
   const decisions = Object.create(null);
   const rawDecisions = parsed?.decisions && typeof parsed.decisions === 'object' && !Array.isArray(parsed.decisions)
     ? parsed.decisions
@@ -193,7 +195,7 @@ export async function readStudioReviewStore(
   {
     reviewsPath = DEFAULT_STUDIO_REVIEWS_PATH,
     legacyFallbackRoot = null,
-    defaultPrimaryRepoId = 'skill-family/skill-family-workspace',
+    defaultPrimaryRepoId = null,
   } = {},
 ) {
   try {
@@ -336,24 +338,33 @@ export function applyDecisionMutation(store, body, { repoId, now = new Date().to
 }
 
 const READING_ORDER_TIER = Object.freeze({
-  requirement: 10,
-  prd: 12,
-  spec: 15,
-  user_story: 20,
-  story: 20,
-  lifecycle: 22,
-  lifecycle_story: 24,
-  feature: 26,
+  user_story: 10,
+  story: 10,
+  lifecycle: 12,
+  lifecycle_story: 14,
+  requirement: 18,
+  prd: 19,
+  spec: 20,
+  scenario: 24,
   domain_model: 30,
   entity: 32,
+  'domain-glossary': 32,
+  'bounded-context-map': 33,
   decision: 34,
-  design: 36,
-  interface_contracts: 38,
-  data_contracts: 38,
-  archify_diagram: 40,
-  scenario: 50,
-  e2e_test: 60,
-  'test-strategy': 62,
+  business_article: 36,
+  feature: 40,
+  design: 42,
+  interface_contracts: 44,
+  data_contracts: 44,
+  application_state_machines: 44,
+  error_model: 44,
+  agent_skill: 46,
+  archify_diagram: 48,
+  e2e_test: 54,
+  'test-strategy': 56,
+  'rule-golden-cases': 58,
+  test: 60,
+  implementation: 62,
 });
 
 export function sortItemsForGuidedReview(items = []) {

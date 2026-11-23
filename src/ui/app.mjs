@@ -1,3 +1,8 @@
+// @feature STU001
+// @feature STU002
+// @feature STU003
+// @feature STU005
+
 import { computeAdaptiveGraphLayout, pickDefaultArtifactNode } from '../graph-layout.mjs';
 
 const STATUS_META = {
@@ -16,8 +21,12 @@ const state = {
   annotations: [],
   guide: null,
   snap: null,
+  alignment: null,
   runtime: null,
   selectedUid: null,
+  reviewMode: 'reader', // 'alignment' | 'reader'
+  alignFilter: 'all',
+  alignQuery: '',
   reviewCategory: 'all',
   reviewStatusFilter: 'all',
   reviewQuery: '',
@@ -33,6 +42,21 @@ const state = {
   selectedAnchor: null,
   archifySelectedNode: null,
   docCache: new Map(),
+  rtScope: 'repo', // 'repo' | 'workspace'
+  rtSelectedTargetId: '__all__',
+  rtSubtab: 'all', // 'all' | 'tasks' | 'locks' | 'chain' | 'processes'
+  rtTaskFilter: 'all',
+  rtTaskQuery: '',
+  rtLockFilter: 'all',
+  rtSseStatus: 'connected',
+  rtModalOpen: false,
+};
+
+const el = (tag, text, cls) => {
+  const n = document.createElement(tag);
+  if (text !== undefined && text !== null) n.textContent = String(text);
+  if (cls) n.className = cls;
+  return n;
 };
 
 function resolveStudioItemByPageId(pageId) {
@@ -41,6 +65,8 @@ function resolveStudioItemByPageId(pageId) {
   const raw = String(pageId).trim();
   const exactArticle = items.find(i => i.uid === `business_article:${raw}`);
   if (exactArticle) return exactArticle;
+  const exactUid = items.find(i => i.uid === raw || i.target === raw);
+  if (exactUid) return exactUid;
   const normalized = raw.replace(/^story-/i, '').toUpperCase();
   return items.find(i =>
     String(i.code || '').toUpperCase() === raw.toUpperCase()
@@ -48,13 +74,6 @@ function resolveStudioItemByPageId(pageId) {
     || String(i.uid || '').toLowerCase().endsWith(`:${raw.toLowerCase()}`),
   ) || null;
 }
-
-const el = (tag, text, cls) => {
-  const n = document.createElement(tag);
-  if (text !== undefined && text !== null) n.textContent = String(text);
-  if (cls) n.className = cls;
-  return n;
-};
 
 function qualifiedTarget(rawTarget, repoId = state.repoId) {
   if (!rawTarget) return '';
@@ -106,6 +125,26 @@ async function apiJson(url, options) {
   return data;
 }
 
+function formatDurationMs(ms) {
+  if (ms === null || ms === undefined || !Number.isFinite(ms) || ms < 0) return '—';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  const remSec = sec % 60;
+  if (min < 60) return `${min}m ${String(remSec).padStart(2, '0')}s`;
+  const hr = Math.floor(min / 60);
+  return `${hr}h ${min % 60}m`;
+}
+
+function formatIsoShort(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso);
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 function updateTopbarSummary() {
   const curRepo = state.repos.find(r => r.id === state.repoId);
   document.getElementById('st-current-repo-name').textContent = curRepo ? curRepo.name : '未发现仓库';
@@ -128,7 +167,7 @@ function renderRepoPopover() {
   const host = document.getElementById('st-repo-groups');
   const q = (document.getElementById('st-repo-search').value || '').trim().toLowerCase();
   host.replaceChildren();
-  const filtered = state.repos.filter(r => !q || `${r.name} ${r.groupLabel} ${r.description}`.toLowerCase().includes(q));
+  const filtered = state.repos.filter(r => !q || `${r.name} ${r.groupLabel} ${r.repoRoleLabel || ''} ${r.description}`.toLowerCase().includes(q));
   const byGroup = new Map();
   for (const r of filtered) {
     if (!byGroup.has(r.groupLabel)) byGroup.set(r.groupLabel, []);
@@ -141,7 +180,13 @@ function renderRepoPopover() {
       const btn = el('button', null, `st-repo-option${r.id === state.repoId ? ' is-selected' : ''}`);
       btn.type = 'button';
       const head = el('div', null, 'st-repo-opt-head');
-      head.append(el('span', r.name), el('span', `已审 ${p.decided}/${p.total}`, 'st-badge st-badge-indigo'));
+      const leftHead = el('div', null, 'st-graph-controls');
+      leftHead.append(el('span', r.name));
+      if (r.repoRoleLabel) {
+        const roleTone = r.repoRole === 'portfolio' ? 'st-badge-amber' : (r.repoRole === 'subproject' ? 'st-badge-emerald' : 'st-badge-zinc');
+        leftHead.append(el('span', r.repoRoleLabel, `st-badge ${roleTone}`));
+      }
+      head.append(leftHead, el('span', `已审 ${p.decided}/${p.total}`, 'st-badge st-badge-indigo'));
       const metrics = el('div', null, 'st-repo-opt-metrics');
       metrics.append(
         el('span', `制品节点 ${r.nodeCount ?? 0}`),
@@ -166,8 +211,17 @@ function normalizeUiTab(raw) {
   return ['guide', 'graph', 'review', 'runtime'].includes(t) ? t : 'graph';
 }
 
+let lockTickTimer = null;
+function stopLockTicker() {
+  if (lockTickTimer) {
+    clearInterval(lockTickTimer);
+    lockTickTimer = null;
+  }
+}
+
 function switchTab(nextTab) {
   nextTab = normalizeUiTab(nextTab);
+  if (nextTab !== 'runtime') stopLockTicker();
   state.tab = nextTab;
   const u = new URL(location.href);
   u.searchParams.set('tab', nextTab);
@@ -180,6 +234,21 @@ function switchTab(nextTab) {
   });
   document.querySelectorAll('[data-panel]').forEach(p => { p.hidden = p.dataset.panel !== nextTab; });
   renderActiveTab();
+}
+async function jumpToRepoAndItem(targetRepoId, targetUidOrCode, nextTab = 'review', nextReviewMode = 'reader') {
+  if (targetRepoId && targetRepoId !== state.repoId) {
+    await selectRepo(targetRepoId, { skipRender: true });
+  }
+  if (targetUidOrCode && state.snap) {
+    const clean = String(targetUidOrCode).trim();
+    const list = [...(state.snap.reviewItems || []), ...(state.snap.nodes || [])];
+    const hit = list.find(i => i.uid === clean || i.target === clean || i.code === clean)
+      || list.find(i => clean.includes(':') && (i.uid === clean || i.code === clean.split(':').slice(1).join(':')));
+    if (hit) state.selectedUid = hit.uid;
+  }
+  state.selectedAnchor = null;
+  state.reviewMode = nextReviewMode;
+  switchTab(nextTab);
 }
 
 function findNextUnreviewed(currentUid = state.selectedUid) {
@@ -198,6 +267,7 @@ function findNextUnreviewed(currentUid = state.selectedUid) {
 function startGuidedReview() {
   const first = findNextUnreviewed(null);
   if (first) state.selectedUid = first.uid;
+  state.reviewMode = 'reader';
   switchTab('review');
 }
 
@@ -274,6 +344,27 @@ async function mountDocumentReader(container, item, options = {}) {
   rightBtns.append(approveNextBtn, skipNextBtn, widthToggle);
   actionBar.append(leftInfo, rightBtns);
   container.append(actionBar);
+
+  // 若当前制品或当前仓库关联了上游高阶规划来源，渲染「↖ 上游高阶来源」跨仓回跳胶囊栏
+  const upInfo = state.alignment?.upstreamBindings;
+  if (upInfo?.present && Array.isArray(upInfo.bindings) && upInfo.bindings.length > 0) {
+    const directMatches = upInfo.bindings.filter(b => b.localUid === item.uid || b.localPath === item.path);
+    const listToShow = directMatches.length > 0 ? directMatches : upInfo.bindings.slice(0, 3);
+    const upBar = el('div', null, 'st-upstream-capsule-bar');
+    const upLeft = el('div', null, 'st-graph-controls');
+    upLeft.append(el('span', directMatches.length > 0 ? '↖ 上游高阶来源：' : `↖ 所属高阶规划仓 (${upInfo.upstreamRepoName})：`, 'st-muted-xs'));
+    for (const b of listToShow) {
+      const pill = el('button', `${upInfo.upstreamRepoName} · ${b.upstreamUid}`, 'st-jump-pill');
+      pill.type = 'button';
+      pill.title = b.upstreamTitle || b.upstreamUid;
+      pill.addEventListener('click', () => jumpToRepoAndItem(b.upstreamRepoId || upInfo.upstreamRepoId, b.upstreamUid, 'review', 'reader'));
+      upLeft.append(pill);
+      const tone = b.health?.tone || 'zinc';
+      upLeft.append(el('span', b.health?.label || '已绑定', `st-badge st-badge-${tone}`));
+    }
+    upBar.append(upLeft);
+    container.append(upBar);
+  }
 
   if (archifyContext && Array.isArray(archifyContext.bindings) && archifyContext.bindings.length > 0) {
     const bindBar = el('div', null, 'st-archify-bindings');
@@ -410,7 +501,6 @@ async function mountDocumentReader(container, item, options = {}) {
     }
   }
 }
-
 function renderGuidePanel() {
   const host = document.getElementById('st-panel-guide');
   host.replaceChildren();
@@ -422,18 +512,60 @@ function renderGuidePanel() {
   bLeft.append(el('h1', g.title, ''), el('p', g.subtitle, 'st-muted-xs'));
   bLeft.firstChild.style.margin = '0 0 4px 0';
   bLeft.lastChild.style.margin = '0';
-  const startBtn = el('button', '▶ 开始按推荐顺序审阅（需求总纲 → 用户故事 → 架构设计 → 场景测试）', 'st-btn st-btn-primary');
+  const bRight = el('div', null, 'st-graph-controls');
+  const alignQuickBtn = el('button', '📋 查看需求进展与双向对齐总览', 'st-btn');
+  alignQuickBtn.type = 'button';
+  alignQuickBtn.addEventListener('click', () => { state.reviewMode = 'alignment'; switchTab('review'); });
+  const startBtn = el('button', '▶ 开始按推荐顺序审阅（用户故事 → 需求总纲 → 场景剧本 → 架构）', 'st-btn st-btn-primary');
   startBtn.type = 'button';
   startBtn.addEventListener('click', startGuidedReview);
-  banner.append(bLeft, startBtn);
+  bRight.append(alignQuickBtn, startBtn);
+  banner.append(bLeft, bRight);
   host.append(banner);
 
-  const whyCard = el('div', null, 'st-card');
-  whyCard.style.padding = '16px 20px';
+  const whyCard = el('div', null, 'st-card st-guide-section');
   whyCard.append(el('h2', '一、为什么需要统一控制台', ''));
-  whyCard.firstChild.style.marginTop = '0';
   for (const p of g.whyItExists || []) whyCard.append(el('p', p));
   host.append(whyCard);
+
+  if (Array.isArray(g.usageModes) && g.usageModes.length > 0) {
+    const modeSec = el('div', null, 'st-card st-guide-section');
+    modeSec.append(el('h2', '二、两种工作模式（单技能族零配置 vs 业务域多仓套组）', ''));
+    const modeGrid = el('div', null, 'st-mode-grid');
+    for (const mode of g.usageModes) {
+      const card = el('div', null, 'st-card st-mode-card');
+      card.append(
+        el('span', mode.audience, 'st-badge st-badge-indigo'),
+        el('h3', mode.title, ''),
+        el('p', `何时选用：${mode.whenToUse}`, 'st-muted-xs'),
+        el('p', mode.howItWorks, ''),
+        el('pre', mode.command, 'st-code-block'),
+      );
+      card.querySelector('h3').style.margin = '4px 0';
+      modeGrid.append(card);
+    }
+    modeSec.append(modeGrid);
+    host.append(modeSec);
+  }
+
+  if (Array.isArray(g.readingOrderGuide) && g.readingOrderGuide.length > 0) {
+    const readSec = el('div', null, 'st-card st-guide-section');
+    readSec.append(el('h2', '三、按阅读任务分主次的审阅动线', ''));
+    const flow = el('div', null, 'st-reading-flow');
+    for (const r of g.readingOrderGuide) {
+      const box = el('div', null, 'st-reading-step');
+      box.append(
+        el('span', `第 ${r.step} 站`, 'st-badge st-badge-indigo'),
+        el('h4', r.stage, ''),
+        el('p', r.why, 'st-muted-xs'),
+      );
+      box.querySelector('h4').style.margin = '6px 0 4px 0';
+      box.querySelector('p').style.margin = '0';
+      flow.append(box);
+    }
+    readSec.append(flow);
+    host.append(readSec);
+  }
 
   const stepGrid = el('div', null, 'st-guide-grid');
   for (const s of g.fiveSteps || []) {
@@ -451,8 +583,9 @@ function renderGuidePanel() {
         document.getElementById('st-repo-popover').hidden = false;
         renderRepoPopover();
       } else if (s.actionId === 'go-tab-graph') switchTab('graph');
+      else if (s.actionId === 'go-tab-alignment') { state.reviewMode = 'alignment'; switchTab('review'); }
       else if (s.actionId === 'start-guided-review') startGuidedReview();
-      else if (s.actionId === 'go-tab-review') switchTab('review');
+      else if (s.actionId === 'go-tab-review') { state.reviewMode = 'reader'; switchTab('review'); }
       else if (s.actionId === 'open-export-drawer') openExportDrawer();
     });
     card.append(top, act);
@@ -460,10 +593,45 @@ function renderGuidePanel() {
   }
   host.append(stepGrid);
 
-  const rulesCard = el('div', null, 'st-card');
-  rulesCard.style.padding = '16px 20px';
-  rulesCard.append(el('h2', '二、四种审阅状态流转规则', ''));
-  rulesCard.firstChild.style.marginTop = '0';
+  if (g.alignmentGuide) {
+    const alignCard = el('div', null, 'st-card st-guide-section');
+    alignCard.append(el('h2', '四、三层双向一致性体检与跨仓互跳说明', ''));
+    const satTbl = el('table', null, 'st-prose-table');
+    const satHead = el('thead');
+    const satHr = el('tr');
+    satHr.append(el('th', '满足概况（机器派生，严禁手工覆写）'), el('th', '严格判定条件与业务含义'));
+    satHead.append(satHr);
+    const satBody = el('tbody');
+    for (const st of g.alignmentGuide.satisfactionStates || []) {
+      const tr = el('tr');
+      const td1 = el('td');
+      td1.append(el('strong', st.badge), document.createTextNode(' ('), el('code', st.code), document.createTextNode(')'));
+      tr.append(td1, el('td', st.meaning));
+      satBody.append(tr);
+    }
+    satTbl.append(satHead, satBody);
+
+    const driftTbl = el('table', null, 'st-prose-table');
+    driftTbl.style.marginTop = '12px';
+    const dHead = el('thead');
+    const dHr = el('tr');
+    dHr.append(el('th', '告警徽章与错误码'), el('th', '识别到什么问题'), el('th', '推荐处理动作'));
+    dHead.append(dHr);
+    const dBody = el('tbody');
+    for (const dr of g.alignmentGuide.driftChecks || []) {
+      const tr = el('tr');
+      const td1 = el('td');
+      td1.append(el('strong', dr.badge), document.createTextNode(' ('), el('code', dr.code), document.createTextNode(')'));
+      tr.append(td1, el('td', dr.meaning), el('td', dr.action));
+      dBody.append(tr);
+    }
+    driftTbl.append(dHead, dBody);
+    alignCard.append(satTbl, driftTbl);
+    host.append(alignCard);
+  }
+
+  const rulesCard = el('div', null, 'st-card st-guide-section');
+  rulesCard.append(el('h2', '五、四种审阅状态流转规则', ''));
   const tbl = el('table', null, 'st-prose-table');
   const thead = el('thead');
   const headTr = el('tr');
@@ -480,6 +648,26 @@ function renderGuidePanel() {
   tbl.append(thead, tbody);
   rulesCard.append(tbl);
   host.append(rulesCard);
+
+  if (Array.isArray(g.runtimeSubpanels) && g.runtimeSubpanels.length > 0) {
+    const rtCard = el('div', null, 'st-card st-guide-section');
+    rtCard.append(el('h2', '六、迭代版「⚡ 运行监控」四大观测面板与实操', ''));
+    const rtGrid = el('div', null, 'st-reading-flow');
+    for (const sub of g.runtimeSubpanels) {
+      const box = el('div', null, 'st-reading-step');
+      box.append(el('h4', sub.title, ''), el('p', sub.detail, 'st-muted-xs'));
+      box.firstChild.style.margin = '0 0 4px 0';
+      box.lastChild.style.margin = '0';
+      rtGrid.append(box);
+    }
+    rtCard.append(rtGrid);
+    const goRt = el('button', '⚡ 打开运行监控面板 →', 'st-btn st-btn-primary');
+    goRt.type = 'button';
+    goRt.style.marginTop = '12px';
+    goRt.addEventListener('click', () => switchTab('runtime'));
+    rtCard.append(goRt);
+    host.append(rtCard);
+  }
 }
 
 let graphResizeObserver = null;
@@ -765,26 +953,259 @@ function renderGraphPanel() {
   split.append(leftCard, rightCard);
   host.append(split);
 }
+function renderAlignmentOverview(host) {
+  const wrap = el('div', null, 'st-alignment-panel');
+  const al = state.alignment;
+  if (!al) {
+    wrap.append(el('div', '正在计算三层双向一致性与代码互锁体检…', 'st-card st-guide-section st-muted-xs'));
+    host.append(wrap);
+    return;
+  }
+
+  // 1. 高阶规划仓：三列需求进展与双向对齐总览表
+  if (al.portfolio?.present) {
+    const pf = al.portfolio;
+    const sum = pf.summary || {};
+    const card = el('div', null, 'st-card st-guide-section');
+    const headRow = el('div', null, 'st-graph-toolbar');
+    headRow.style.padding = '0 0 12px 0';
+    const leftTitle = el('div');
+    leftTitle.append(
+      el('h2', pf.title || '高阶需求进展与双向对齐三列一览表', ''),
+      el('p', '满足概况完全由下游存在性、摘要互锁与代码/测试锁机器派生，严禁人工篡改；点击任意下游胶囊直接跨仓进入子项目详设。', 'st-muted-xs'),
+    );
+    leftTitle.firstChild.style.margin = '0 0 4px 0';
+    leftTitle.lastChild.style.margin = '0';
+
+    const filterGroup = el('div', null, 'st-graph-controls');
+    const alertTotal = (sum.driftCount ?? 0) + (sum.missingCount ?? 0) + (sum.unallocated ?? 0);
+    for (const [fKey, fLabel] of [
+      ['all', `全部 (${sum.total ?? 0})`],
+      ['alerts', `🔴 双向告警 (${alertTotal})`],
+      ['in_progress', `⏳ 推进/部分 (${(sum.allocatedInProgress ?? 0) + (sum.partiallyAllocated ?? 0)})`],
+      ['verified', `🟢 已验证满足 (${sum.verifiedSatisfied ?? 0})`],
+      ['not_applicable', `⚪ 按处置不计 (${sum.notApplicable ?? 0})`],
+    ]) {
+      const b = el('button', fLabel, `st-btn${state.alignFilter === fKey ? ' is-active' : ''}`);
+      b.type = 'button';
+      b.addEventListener('click', () => { state.alignFilter = fKey; renderReviewPanel(); });
+      filterGroup.append(b);
+    }
+    const qInp = el('input', null, 'st-input');
+    qInp.type = 'search';
+    qInp.style.width = '220px';
+    qInp.placeholder = '按需求编号/目标仓搜索…';
+    qInp.value = state.alignQuery;
+    headRow.append(leftTitle, filterGroup);
+
+    const searchBar = el('div', null, 'st-graph-controls');
+    searchBar.style.margin = '10px 0';
+    searchBar.append(qInp);
+
+    const tblWrap = el('div', null, 'st-table-wrap');
+    const tbl = el('table', null, 'st-prose-table');
+    const thead = el('thead');
+    const hr = el('tr');
+    for (const h of ['高阶需求条目', '业务处置与承接去向', '满足概况（机器派生）', '阶段与双向健康度']) hr.append(el('th', h));
+    thead.append(hr);
+    const tbody = el('tbody');
+
+    const paintRows = () => {
+      tbody.replaceChildren();
+      const q = state.alignQuery.trim().toLowerCase();
+      const rows = (pf.items || []).filter(item => {
+        if (state.alignFilter === 'alerts' && !(item.issues || []).some(i => ['UNALLOCATED_ACTIVE_DEMAND', 'SOURCE_ARTIFACT_MISSING', 'TARGET_MISSING', 'UNRECIPROCATED_ALLOCATION', 'UPSTREAM_DESIGN_CHANGED', 'DOWNSTREAM_DESIGN_EVOLVED'].includes(i.code))) return false;
+        if (state.alignFilter === 'in_progress' && !['allocated_in_progress', 'partially_allocated'].includes(item.computedSatisfaction)) return false;
+        if (state.alignFilter === 'verified' && item.computedSatisfaction !== 'verified_satisfied') return false;
+        if (state.alignFilter === 'not_applicable' && item.computedSatisfaction !== 'not_applicable') return false;
+        if (q) {
+          const hay = `${item.sourceUid} ${item.title} ${item.dispositionNote} ${(item.allocations || []).map(a => `${a.targetRepoName} ${a.targetUid}`).join(' ')}`.toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+      if (!rows.length) {
+        const emptyTr = el('tr');
+        const td = el('td', '当前筛选条件下无匹配的高阶需求记录。', 'st-muted-xs');
+        td.colSpan = 4;
+        emptyTr.append(td);
+        tbody.append(emptyTr);
+        return;
+      }
+      for (const item of rows) {
+        const tr = el('tr');
+        // 列0：高阶条目（点击在当前仓打开原文）
+        const tdSrc = el('td');
+        const srcBtn = el('button', item.sourceUid, 'st-inline-jump');
+        srcBtn.type = 'button';
+        srcBtn.addEventListener('click', () => jumpToRepoAndItem(state.repoId, item.sourceUid, 'review', 'reader'));
+        tdSrc.append(srcBtn, el('div', item.title, ''));
+
+        // 列1：业务处置与承接去向（可点击跨仓跳转至子仓）
+        const tdDisp = el('td');
+        const allocWrap = el('div', null, 'st-alignment-alloc-list');
+        const dispHead = el('div', null, 'st-graph-controls');
+        dispHead.append(el('span', item.dispositionLabel, 'st-badge st-badge-zinc'));
+        if (item.mergedInto) dispHead.append(el('span', `→ ${item.mergedInto}`, 'st-muted-xs'));
+        allocWrap.append(dispHead);
+        if (item.dispositionNote) allocWrap.append(el('div', item.dispositionNote, 'st-muted-xs'));
+        for (const al of item.allocations || []) {
+          const aRow = el('div', null, 'st-alignment-alloc-row');
+          if (al.targetRepoId) {
+            const jumpBtn = el('button', `↗ ${al.targetRepoName} · ${al.targetUid}`, 'st-jump-pill');
+            jumpBtn.type = 'button';
+            jumpBtn.addEventListener('click', () => jumpToRepoAndItem(al.targetRepoId, al.targetUid, 'review', 'reader'));
+            aRow.append(jumpBtn);
+          } else {
+            aRow.append(el('span', `${al.targetRepoName} · ${al.targetUid}`, 'st-badge st-badge-zinc'));
+          }
+          aRow.append(el('span', al.codeLocksFresh ? '锁新鲜' : '待补锁', `st-badge ${al.codeLocksFresh ? 'st-badge-emerald' : 'st-badge-amber'}`));
+          allocWrap.append(aRow);
+        }
+        tdDisp.append(allocWrap);
+
+        // 列2：满足概况（机器派生 + 剩余范围）
+        const tdSat = el('td');
+        const satMeta = item.satisfactionMeta || {};
+        tdSat.append(el('span', satMeta.label || item.computedSatisfaction, `st-badge st-badge-${satMeta.tone || 'zinc'}`));
+        if (Array.isArray(item.remainingScope) && item.remainingScope.length > 0) {
+          const ul = el('ul');
+          ul.style.margin = '6px 0 0 16px';
+          ul.style.padding = '0';
+          for (const rem of item.remainingScope) ul.append(el('li', `剩余范围：${rem}`, 'st-muted-xs'));
+          tdSat.append(ul);
+        }
+
+        // 列3：阶段与双向健康度
+        const tdHealth = el('td');
+        const h = item.health || {};
+        tdHealth.append(el('span', h.label || '未知', `st-badge st-badge-${h.tone || 'zinc'}`));
+        for (const iss of item.issues || []) {
+          tdHealth.append(el('div', `${iss.code}：${iss.message}`, 'st-muted-xs'));
+        }
+
+        tr.append(tdSrc, tdDisp, tdSat, tdHealth);
+        tbody.append(tr);
+      }
+    };
+    qInp.addEventListener('input', () => { state.alignQuery = qInp.value; paintRows(); });
+    paintRows();
+    tbl.append(thead, tbody);
+    tblWrap.append(tbl);
+    card.append(headRow, searchBar, tblWrap);
+    wrap.append(card);
+  }
+
+  // 2. 子项目详设仓：上游高阶承接回指列表
+  if (al.upstreamBindings?.present) {
+    const up = al.upstreamBindings;
+    const upCard = el('div', null, 'st-card st-guide-section');
+    upCard.append(
+      el('h2', `上游高阶规划绑定（来自 ${up.upstreamRepoName}）`, ''),
+      el('p', '核对本仓详细设计与上游高阶规划仓的摘要一致性；点击条目可直接阅读本仓原文或跨仓跳回高阶需求。', 'st-muted-xs'),
+    );
+    const tbl = el('table', null, 'st-prose-table');
+    const thead = el('thead');
+    const hr = el('tr');
+    for (const h of ['本地详设条目', '上游高阶规划来源', '双向互锁健康度']) hr.append(el('th', h));
+    thead.append(hr);
+    const tbody = el('tbody');
+    for (const b of up.bindings || []) {
+      const tr = el('tr');
+      const tdLocal = el('td');
+      const localBtn = el('button', b.localUid, 'st-inline-jump');
+      localBtn.type = 'button';
+      localBtn.addEventListener('click', () => jumpToRepoAndItem(state.repoId, b.localUid, 'review', 'reader'));
+      tdLocal.append(localBtn, el('div', b.localPath, 'st-muted-xs'));
+
+      const tdUp = el('td');
+      if (b.upstreamRepoId || up.upstreamRepoId) {
+        const upBtn = el('button', `↖ ${up.upstreamRepoName} · ${b.upstreamUid}`, 'st-jump-pill');
+        upBtn.type = 'button';
+        upBtn.addEventListener('click', () => jumpToRepoAndItem(b.upstreamRepoId || up.upstreamRepoId, b.upstreamUid, 'review', 'reader'));
+        tdUp.append(upBtn);
+      } else {
+        tdUp.append(el('code', b.upstreamUid));
+      }
+      tdUp.append(el('div', b.upstreamTitle, 'st-muted-xs'));
+
+      const tdHealth = el('td');
+      tdHealth.append(el('span', b.health?.label || '已绑定', `st-badge st-badge-${b.health?.tone || 'zinc'}`));
+      for (const iss of b.issues || []) tdHealth.append(el('div', `${iss.code}：${iss.message}`, 'st-muted-xs'));
+      tr.append(tdLocal, tdUp, tdHealth);
+      tbody.append(tr);
+    }
+    tbl.append(thead, tbody);
+    upCard.append(tbl);
+    wrap.append(upCard);
+  }
+
+  // 3. 单仓内部「详设 ↔ 代码与测试」双向互锁体检
+  const ic = al.internalCodeLocks || {};
+  const codeCard = el('div', null, 'st-card st-guide-section');
+  codeCard.append(el('h2', '单仓内部「详设 ↔ 代码与测试」双向互锁体检', ''));
+  const kpiRow = el('div', null, 'st-kpi-grid');
+  const mkBox = (lbl, val, tone) => {
+    const c = el('div', null, 'st-card st-kpi-card');
+    c.append(el('div', lbl, 'st-muted-xs'), el('div', val, 'st-kpi-val'), el('span', tone === 'emerald' ? '覆盖正常' : '需关注', `st-badge st-badge-${tone}`));
+    kpiRow.append(c);
+  };
+  mkBox('代码实现锁 (implements)', `${ic.implementsCount ?? 0} 条`, (ic.implementsCount ?? 0) > 0 ? 'emerald' : (ic.requireCodeLocks ? 'rose' : 'zinc'));
+  mkBox('测试验证锁 (verifies)', `${ic.verifiesCount ?? 0} 条`, (ic.verifiesCount ?? 0) > 0 ? 'emerald' : 'zinc');
+  mkBox('声明式代码/技能入口', `${ic.matchedEntriesCount ?? 0} 个`, (ic.unclaimedEntries?.length ?? 0) === 0 ? 'emerald' : 'amber');
+  mkBox('未认领入口与锁漂移', `${(ic.unclaimedEntries?.length ?? 0) + (ic.drifts?.length ?? 0)} 项`, ic.healthy ? 'emerald' : 'rose');
+  codeCard.append(kpiRow);
+
+  if ((ic.unclaimedEntries || []).length > 0) {
+    codeCard.append(el('div', '⚠️ 以下入口文件尚未在 traceability-version-lock.json 中被任何 @feature / @scenario 认领 (UNCLAIMED_IMPLEMENTATION_ENTRY)：', 'st-muted-xs'));
+    const ul = el('ul');
+    for (const p of ic.unclaimedEntries) ul.append(el('li', p, 'st-inline-code'));
+    codeCard.append(ul);
+  }
+  if ((ic.drifts || []).length > 0) {
+    codeCard.append(el('div', '⚠️ 以下代码/测试锁存在摘要漂移（修改后尚未刷新 version-lock）：', 'st-muted-xs'));
+    const ul = el('ul');
+    for (const d of ic.drifts) ul.append(el('li', `${d.code} · ${d.path}`, ''));
+    codeCard.append(ul);
+  }
+  if (ic.healthy) {
+    codeCard.append(el('p', '🟢 本仓核心源码、SKILL.md 入口与测试文件均已完成双向版本锁绑定且哈希新鲜。', 'st-muted-xs'));
+  }
+  wrap.append(codeCard);
+  host.append(wrap);
+}
 
 function renderReviewPanel() {
   const host = document.getElementById('st-panel-review');
   host.replaceChildren();
   if (!state.snap) { host.append(el('p', '正在加载审阅清单…', 'st-muted-xs')); return; }
 
+  const totalAlerts = state.alignment?.totalAlerts ?? 0;
   const banner = el('div', null, 'st-guided-banner');
-  banner.append(
-    el('span', '推荐阅读与签收顺序：需求总纲 → 用户故事 → 领域与架构设计 → 场景剧本与验收测试'),
-    (() => {
-      const b = el('button', '▶ 跳至下一项待审条目 →', 'st-btn st-btn-primary');
-      b.type = 'button';
-      b.addEventListener('click', () => {
-        const nxt = findNextUnreviewed(state.selectedUid);
-        if (nxt) { state.selectedUid = nxt.uid; renderReviewPanel(); }
-      });
-      return b;
-    })(),
-  );
+  const leftControls = el('div', null, 'st-graph-controls');
+  const viewSwitch = el('div', null, 'st-view-switch');
+  const alignTabBtn = el('button', `📋 需求进展与双向对齐总览${totalAlerts > 0 ? ` (${totalAlerts} 告警)` : ''}`, `st-btn${state.reviewMode === 'alignment' ? ' is-active' : ''}`);
+  alignTabBtn.type = 'button';
+  alignTabBtn.addEventListener('click', () => { state.reviewMode = 'alignment'; renderReviewPanel(); });
+  const readerTabBtn = el('button', '📖 按阅读任务逐篇审阅', `st-btn${state.reviewMode === 'reader' ? ' is-active' : ''}`);
+  readerTabBtn.type = 'button';
+  readerTabBtn.addEventListener('click', () => { state.reviewMode = 'reader'; renderReviewPanel(); });
+  viewSwitch.append(alignTabBtn, readerTabBtn);
+  leftControls.append(viewSwitch, el('span', '推荐动线：用户故事 → 需求进展总览 → 场景剧本 → 领域与架构依据', 'st-muted-xs'));
+
+  const nextBtn = el('button', '▶ 跳至下一项待审条目 →', 'st-btn st-btn-primary');
+  nextBtn.type = 'button';
+  nextBtn.addEventListener('click', () => {
+    const nxt = findNextUnreviewed(state.selectedUid);
+    if (nxt) { state.selectedUid = nxt.uid; state.reviewMode = 'reader'; renderReviewPanel(); }
+  });
+  banner.append(leftControls, nextBtn);
   host.append(banner);
+
+  if (state.reviewMode === 'alignment') {
+    renderAlignmentOverview(host);
+    return;
+  }
 
   const split = el('div', null, 'st-review-split');
   const sidebar = el('aside', null, 'st-card st-review-sidebar');
@@ -800,11 +1221,33 @@ function renderReviewPanel() {
   sidebar.append(searchInp);
 
   const catRow = el('div', null, 'st-cat-pills');
-  for (const c of state.snap.categories || []) {
-    const b = el('button', `${c.label} (${c.count})`, `st-btn${state.reviewCategory === c.id ? ' is-active' : ''}`);
-    b.type = 'button';
-    b.addEventListener('click', () => { state.reviewCategory = c.id; renderReviewPanel(); });
-    catRow.append(b);
+  const cats = state.snap.categories || [];
+  const allCat = cats.find(c => c.id === 'all');
+  if (allCat) {
+    const bAll = el('button', `${allCat.label} (${allCat.count})`, `st-btn${state.reviewCategory === 'all' ? ' is-active' : ''}`);
+    bAll.type = 'button';
+    bAll.addEventListener('click', () => { state.reviewCategory = 'all'; renderReviewPanel(); });
+    catRow.append(bAll);
+  }
+  const primaryCats = cats.filter(c => c.group === 'primary');
+  if (primaryCats.length > 0) {
+    catRow.append(el('div', '首要阅读（从诉求到进展与行为）', 'st-cat-group-label'));
+    for (const c of primaryCats) {
+      const b = el('button', `${c.label} (${c.count})`, `st-btn${state.reviewCategory === c.id ? ' is-active' : ''}`);
+      b.type = 'button';
+      b.addEventListener('click', () => { state.reviewCategory = c.id; renderReviewPanel(); });
+      catRow.append(b);
+    }
+  }
+  const supportCats = cats.filter(c => c.group === 'supporting');
+  if (supportCats.length > 0) {
+    catRow.append(el('div', '关联依据（领域、架构与测试追溯）', 'st-cat-group-label'));
+    for (const c of supportCats) {
+      const b = el('button', `${c.label} (${c.count})`, `st-btn${state.reviewCategory === c.id ? ' is-active' : ''}`);
+      b.type = 'button';
+      b.addEventListener('click', () => { state.reviewCategory = c.id; renderReviewPanel(); });
+      catRow.append(b);
+    }
   }
   sidebar.append(catRow);
 
@@ -867,7 +1310,6 @@ function renderReviewPanel() {
   split.append(sidebar, readerCard);
   host.append(split);
 }
-
 export function buildRuntimeTargetsTable(targetsToShow = [], doc = document) {
   const mk = (tag, text, cls) => {
     const node = doc.createElement(tag);
@@ -897,9 +1339,354 @@ export function buildRuntimeTargetsTable(targetsToShow = [], doc = document) {
   return tbl;
 }
 
+function openRegisterRuntimeModal(onRegistered) {
+  const existing = document.getElementById('st-rt-reg-modal');
+  if (existing) existing.remove();
+
+  const backdrop = el('div', null, 'st-modal-backdrop');
+  backdrop.id = 'st-rt-reg-modal';
+  const modal = el('div', null, 'st-modal');
+  modal.setAttribute('role', 'dialog');
+  modal.setAttribute('aria-modal', 'true');
+
+  const head = el('div', null, 'st-repo-opt-head');
+  head.append(el('h3', '+ 挂载 Foundation 运行监控源', ''));
+  head.firstChild.style.margin = '0';
+  const closeBtn = el('button', '✕', 'st-btn');
+  closeBtn.type = 'button';
+  closeBtn.addEventListener('click', () => backdrop.remove());
+  head.append(closeBtn);
+
+  const mkField = (id, label, placeholder, req = false) => {
+    const wrap = el('div', null, 'st-form-field');
+    const lbl = el('label', label);
+    lbl.htmlFor = id;
+    const inp = el('input', null, 'st-input');
+    inp.id = id;
+    inp.placeholder = placeholder;
+    if (req) inp.required = true;
+    wrap.append(lbl, inp);
+    return { wrap, inp };
+  };
+
+  const fId = mkField('st-reg-id', '目标 ID（字母/数字/短横线）*', '如 task-wave10-verify', true);
+  const fTitle = mkField('st-reg-title', '显示标题', '如 Wave 10 全量门禁执行器');
+  const fState = mkField('st-reg-state', 'state-store 状态目录（可选）', '.artifacts/state-store 或绝对路径');
+  const fPlan = mkField('st-reg-plan', '执行计划路径（.md / .json / .csv，可选）', 'PLAN.md');
+  const fRuns = mkField('st-reg-runs', '子进程监督目录 runsDir（可选）', '.runs');
+  const fLocks = mkField('st-reg-locks', '锁路径 lockPaths（逗号分隔，可选）', '.artifacts/locks, artifacts/traceability-version-lock.json');
+
+  const errLine = el('div', '', 'st-muted-xs');
+  errLine.style.color = 'var(--st-rose-fg)';
+
+  const foot = el('div', null, 'st-graph-controls');
+  foot.style.justifyContent = 'flex-end';
+  const cancelBtn = el('button', '取消', 'st-btn');
+  cancelBtn.type = 'button';
+  cancelBtn.addEventListener('click', () => backdrop.remove());
+  const submitBtn = el('button', '确认挂载并落盘', 'st-btn st-btn-primary');
+  submitBtn.type = 'button';
+  submitBtn.addEventListener('click', async () => {
+    errLine.textContent = '';
+    const idVal = fId.inp.value.trim();
+    if (!idVal) { errLine.textContent = '请填写目标 ID。'; return; }
+    submitBtn.disabled = true;
+    try {
+      await apiJson('/api/studio/runtime/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: idVal,
+          title: fTitle.inp.value.trim() || idVal,
+          stateDir: fState.inp.value.trim() || undefined,
+          planPath: fPlan.inp.value.trim() || undefined,
+          runsDir: fRuns.inp.value.trim() || undefined,
+          lockPaths: fLocks.inp.value.split(',').map(s => s.trim()).filter(Boolean),
+        }),
+      });
+      backdrop.remove();
+      onRegistered?.();
+    } catch (err) {
+      errLine.textContent = err.message || '挂载失败';
+      submitBtn.disabled = false;
+    }
+  });
+  foot.append(cancelBtn, submitBtn);
+
+  modal.append(head, fId.wrap, fTitle.wrap, fState.wrap, fPlan.wrap, fRuns.wrap, fLocks.wrap, errLine, foot);
+  backdrop.append(modal);
+  backdrop.addEventListener('click', ev => { if (ev.target === backdrop) backdrop.remove(); });
+  document.body.append(backdrop);
+  fId.inp.focus();
+}
+
+function renderTaskMatrixSubpanel(host, scopedTargets) {
+  const card = el('div', null, 'st-card st-guide-section');
+  const allTasks = scopedTargets.flatMap(t => (t.taskSummary?.tasks || []).map(tk => ({ ...tk, targetTitle: t.title })));
+  const allMilestones = scopedTargets.flatMap(t => t.taskSummary?.milestones || []);
+  const total = allTasks.length;
+  const done = allTasks.filter(t => t.status === 'done').length;
+  const running = allTasks.filter(t => t.status === 'running').length;
+  const blocked = allTasks.filter(t => t.status === 'blocked').length;
+  const todo = allTasks.filter(t => t.status === 'todo').length;
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+
+  const head = el('div', null, 'st-repo-opt-head');
+  head.append(el('h3', 'A. 任务与里程碑推进矩阵', ''), el('span', `已完成 ${done} · 进行中 ${running} · 阻断 ${blocked} · 待推进 ${todo} / 共 ${total} 项 (${pct}%)`, 'st-badge st-badge-indigo'));
+  head.firstChild.style.margin = '0';
+  card.append(head);
+
+  if (total > 0) {
+    const bar = el('div', null, 'st-progress-multi');
+    bar.style.margin = '10px 0';
+    const seg = (cls, count) => {
+      const d = el('div', null, cls);
+      d.style.width = `${((count / total) * 100).toFixed(2)}%`;
+      return d;
+    };
+    bar.append(seg('st-prog-seg-done', done), seg('st-prog-seg-running', running), seg('st-prog-seg-blocked', blocked), seg('st-prog-seg-todo', todo));
+    card.append(bar);
+  }
+
+  if (allMilestones.length > 0) {
+    const mGrid = el('div', null, 'st-milestone-grid');
+    for (const m of allMilestones) {
+      const box = el('div', null, 'st-milestone-item');
+      const mh = el('div', null, 'st-repo-opt-head');
+      mh.append(el('strong', m.name), el('span', `${m.done}/${m.total} (${m.percent}%)`, 'st-muted-xs'));
+      box.append(mh, el('div', `进行中 ${m.running} · 阻断 ${m.blocked} · 待办 ${m.todo}`, 'st-muted-xs'));
+      mGrid.append(box);
+    }
+    card.append(mGrid);
+  }
+
+  if (total === 0) {
+    card.append(el('p', '当前范围内暂无可解析的执行计划（.md / .json / .csv）。可挂载 --plan-path 或运行沙箱演练查看。', 'st-muted-xs'));
+    host.append(card);
+    return;
+  }
+
+  const ctrl = el('div', null, 'st-graph-toolbar');
+  ctrl.style.padding = '8px 0';
+  const pills = el('div', null, 'st-graph-controls');
+  for (const [fk, fl] of [['all', '全部'], ['running', '🔵 进行中'], ['todo', '⚪ 待推进'], ['done', '🟢 已完成'], ['blocked', '🔴 异常阻断']]) {
+    const b = el('button', fl, `st-btn${state.rtTaskFilter === fk ? ' is-active' : ''}`);
+    b.type = 'button';
+    b.addEventListener('click', () => { state.rtTaskFilter = fk; renderRuntimeTasksRows(); });
+    pills.append(b);
+  }
+  const sInp = el('input', null, 'st-input');
+  sInp.type = 'search';
+  sInp.style.width = '220px';
+  sInp.placeholder = '搜索任务编号、阶段或名称…';
+  sInp.value = state.rtTaskQuery;
+  ctrl.append(pills, sInp);
+
+  const tblWrap = el('div', null, 'st-table-wrap');
+  const tbl = el('table', null, 'st-prose-table');
+  const thead = el('thead');
+  const hr = el('tr');
+  for (const h of ['编号', '所属里程碑', '任务事项', '状态', '来源/说明']) hr.append(el('th', h));
+  thead.append(hr);
+  const tbody = el('tbody');
+  tbl.append(thead, tbody);
+  tblWrap.append(tbl);
+
+  const renderRuntimeTasksRows = () => {
+    tbody.replaceChildren();
+    ctrl.querySelectorAll('.st-btn').forEach(btn => {
+      const match = [['all', '全部'], ['running', '🔵 进行中'], ['todo', '⚪ 待推进'], ['done', '🟢 已完成'], ['blocked', '🔴 异常阻断']].find(x => x[1] === btn.textContent);
+      if (match) btn.classList.toggle('is-active', state.rtTaskFilter === match[0]);
+    });
+    const q = state.rtTaskQuery.trim().toLowerCase();
+    const list = allTasks.filter(t => {
+      if (state.rtTaskFilter !== 'all' && t.status !== state.rtTaskFilter) return false;
+      if (q && !`${t.id} ${t.group} ${t.title} ${t.detail}`.toLowerCase().includes(q)) return false;
+      return true;
+    });
+    for (const t of list) {
+      const tr = el('tr');
+      const tone = t.status === 'done' ? 'emerald' : (t.status === 'running' ? 'indigo' : (t.status === 'blocked' ? 'rose' : 'zinc'));
+      const txt = t.status === 'done' ? '🟢 已完成' : (t.status === 'running' ? '🔵 进行中' : (t.status === 'blocked' ? '🔴 异常阻断' : '⚪ 待推进'));
+      const tdStatus = el('td');
+      tdStatus.append(el('span', txt, `st-badge st-badge-${tone}`));
+      tr.append(el('td', t.id, 'st-tabular'), el('td', t.group), el('td', t.title), tdStatus, el('td', t.detail || t.sourceLabel || '—', 'st-muted-xs'));
+      tbody.append(tr);
+    }
+  };
+  sInp.addEventListener('input', () => { state.rtTaskQuery = sInp.value; renderRuntimeTasksRows(); });
+  renderRuntimeTasksRows();
+  card.append(ctrl, tblWrap);
+  host.append(card);
+}
+function renderLockRadarSubpanel(host, scopedTargets, lockWarnMs) {
+  const card = el('div', null, 'st-card st-guide-section');
+  const allLocks = scopedTargets.flatMap(t => (t.locks || []).map(l => ({ ...l, targetTitle: t.title })));
+  const activeCount = allLocks.filter(l => l.isActive).length;
+
+  const head = el('div', null, 'st-graph-toolbar');
+  head.style.padding = '0 0 10px 0';
+  const left = el('div', null, 'st-graph-controls');
+  left.append(el('h3', 'B. 文件锁与并发写集雷达', ''), el('span', `活跃排他锁 ${activeCount} 把 · 总锁记录 ${allLocks.length} 项`, 'st-badge st-badge-indigo'));
+  left.firstChild.style.margin = '0';
+  const filterBtns = el('div', null, 'st-graph-controls');
+  for (const [fk, fl] of [['all', '全部锁（含版本锁）'], ['active', '仅看活跃排他锁']]) {
+    const b = el('button', fl, `st-btn${state.rtLockFilter === fk ? ' is-active' : ''}`);
+    b.type = 'button';
+    b.addEventListener('click', () => { state.rtLockFilter = fk; renderRuntimePanel(); });
+    filterBtns.append(b);
+  }
+  head.append(left, filterBtns);
+  card.append(head);
+
+  const visibleLocks = state.rtLockFilter === 'active' ? allLocks.filter(l => l.isActive) : allLocks;
+  if (!visibleLocks.length) {
+    card.append(el('p', '当前筛选条件下无文件锁或静态追溯锁记录。', 'st-muted-xs'));
+    host.append(card);
+    return;
+  }
+
+  const grid = el('div', null, 'st-lock-grid');
+  for (const lk of visibleLocks) {
+    const isWarn = lk.isActive && lk.isStaleWarning;
+    const lc = el('div', null, `st-lock-card${lk.isActive ? ' is-active' : ''}${isWarn ? ' is-warn' : ''}`);
+    const top = el('div', null, 'st-repo-opt-head');
+    top.append(el('strong', lk.name || 'lock'), el('span', lk.lockKind || 'lock', 'st-badge st-badge-zinc'));
+    const statusBadge = isWarn
+      ? el('span', '⚠️ 持锁超时预警', 'st-badge st-badge-amber')
+      : (lk.isActive ? el('span', '🔒 活跃持锁中', 'st-badge st-badge-indigo') : el('span', '📌 静态版本锁', 'st-badge st-badge-emerald'));
+
+    const metaRow = el('div', null, 'st-repo-opt-head');
+    metaRow.append(el('span', `持有者：${lk.owner || 'unknown'}`, 'st-muted-xs'), statusBadge);
+
+    const timeRow = el('div', null, 'st-repo-opt-head');
+    const durSpan = el('span', lk.isActive ? `已持锁 ${formatDurationMs(lk.ageMs)}` : `更新于 ${formatIsoShort(lk.acquiredAt)}`, 'st-tabular st-muted-xs');
+    if (lk.isActive && lk.acquiredAt) {
+      durSpan.dataset.lockAcquiredAt = lk.acquiredAt;
+      durSpan.dataset.lockWarnMs = String(lockWarnMs);
+    }
+    timeRow.append(el('span', `获取：${formatIsoShort(lk.acquiredAt)}`, 'st-muted-xs'), durSpan);
+
+    lc.append(top, el('div', lk.displayPath || lk.path || '', 'st-muted-xs st-tabular'), metaRow, timeRow);
+    if (lk.summary) lc.append(el('div', lk.summary, 'st-muted-xs'));
+    grid.append(lc);
+  }
+  card.append(grid);
+  host.append(card);
+}
+
+function renderEventChainSubpanel(host, scopedTargets) {
+  const card = el('div', null, 'st-card st-guide-section');
+  const stores = scopedTargets.map(t => ({ targetTitle: t.title, store: t.stateStore })).filter(x => x.store?.isStateStore);
+  const head = el('div', null, 'st-repo-opt-head');
+  head.append(el('h3', 'C. Foundation 事件溯源哈希链（state-store）', ''), el('span', `状态库 ${stores.length} 个`, 'st-badge st-badge-indigo'));
+  head.firstChild.style.margin = '0';
+  card.append(head);
+
+  if (!stores.length) {
+    card.append(el('p', '当前范围内暂无初始化的 state-store 状态目录。', 'st-muted-xs'));
+    host.append(card);
+    return;
+  }
+
+  for (const { targetTitle, store } of stores) {
+    const box = el('div', null, 'st-chain-box');
+    const stHead = el('div', null, 'st-repo-opt-head');
+    const tone = store.integrity === 'VALID' ? 'emerald' : (store.integrity === 'CHAIN_BROKEN' ? 'rose' : (store.integrity === 'STALE_HEAD' ? 'amber' : 'zinc'));
+    stHead.append(
+      el('div', `${targetTitle} · ${store.displayPath || ''}`, 'st-muted-xs'),
+      el('span', `${store.integrity} · #${store.lastSequence} · fencing #${store.fencing ?? 0}`, `st-badge st-badge-${tone}`),
+    );
+    box.append(stHead);
+    if (store.integrityError) box.append(el('p', `⚠️ ${store.integrityError}`, 'st-muted-xs'));
+
+    const events = store.events || [];
+    if (events.length === 0) {
+      box.append(el('p', '事件日志为空。', 'st-muted-xs'));
+    } else {
+      const tblWrap = el('div', null, 'st-table-wrap');
+      const tbl = el('table', null, 'st-prose-table');
+      const thead = el('thead');
+      const hr = el('tr');
+      for (const h of ['序号', '事件类型 (eventType)', '产生者 (producer)', '时间戳', 'recordDigest 摘要', '链接校验']) hr.append(el('th', h));
+      thead.append(hr);
+      const tbody = el('tbody');
+      for (const ev of [...events].reverse().slice(0, 50)) {
+        const tr = el('tr');
+        const dig = ev.recordDigest ? `${String(ev.recordDigest).slice(0, 18)}…` : '—';
+        const tdVer = el('td');
+        tdVer.append(el('span', ev.digestVerified !== false ? '✓ 链校验通过' : '✕ 链断裂', `st-badge ${ev.digestVerified !== false ? 'st-badge-emerald' : 'st-badge-rose'}`));
+        tr.append(
+          el('td', `#${String(ev.sequence).padStart(6, '0')}`, 'st-tabular'),
+          el('td', ev.eventType || '—'),
+          el('td', ev.producer || '—'),
+          el('td', formatIsoShort(ev.recordedAt), 'st-tabular'),
+          el('td', dig, 'st-tabular'),
+          tdVer,
+        );
+        tbody.append(tr);
+      }
+      tbl.append(thead, tbody);
+      tblWrap.append(tbl);
+      box.append(tblWrap);
+    }
+    card.append(box);
+  }
+  host.append(card);
+}
+
+function renderProcessSubpanel(host, scopedTargets) {
+  const card = el('div', null, 'st-card st-guide-section');
+  const procs = scopedTargets.flatMap(t => (t.processes || []).map(p => ({ ...p, targetTitle: t.title })));
+  const head = el('div', null, 'st-repo-opt-head');
+  head.append(el('h3', 'D. 受管子进程监督轨迹（supervise-process）', ''), el('span', `共 ${procs.length} 条调用记录`, 'st-badge st-badge-indigo'));
+  head.firstChild.style.margin = '0';
+  card.append(head);
+
+  if (!procs.length) {
+    card.append(el('p', '当前范围内暂无受管子进程监督记录（invocation.json / *.watchdog.json）。', 'st-muted-xs'));
+    host.append(card);
+    return;
+  }
+
+  const tblWrap = el('div', null, 'st-table-wrap');
+  const tbl = el('table', null, 'st-prose-table');
+  const thead = el('thead');
+  const hr = el('tr');
+  for (const h of ['运行源 / 文件', '命令/脚本', '状态', '退出码', '耗时', '保护标记']) hr.append(el('th', h));
+  thead.append(hr);
+  const tbody = el('tbody');
+  for (const p of procs) {
+    const tr = el('tr');
+    const tone = p.processStatus === 'RUNNING' ? 'indigo' : (p.processStatus === 'EXITED' && p.ok ? 'emerald' : (p.processStatus === 'TIMED_OUT' ? 'amber' : 'rose'));
+    const tdSt = el('td');
+    tdSt.append(el('span', p.processStatus, `st-badge st-badge-${tone}`));
+    const tdGuard = el('td');
+    if (p.timedOut) tdGuard.append(el('span', `⏱️ 超时代杀 (${p.killSignal || 'SIGKILL'})`, 'st-badge st-badge-amber'));
+    else tdGuard.append(el('span', p.ok ? '正常受控退出' : '异常退出', 'st-muted-xs'));
+
+    tr.append(
+      el('td', `${p.targetTitle} · ${p.label}`, 'st-muted-xs'),
+      el('td', p.command || p.label, 'st-tabular'),
+      tdSt,
+      el('td', p.exitCode !== null && p.exitCode !== undefined ? String(p.exitCode) : '—', 'st-tabular'),
+      el('td', formatDurationMs(p.durationMs), 'st-tabular'),
+      tdGuard,
+    );
+    tbody.append(tr);
+  }
+  tbl.append(thead, tbody);
+  tblWrap.append(tbl);
+  card.append(tblWrap);
+  host.append(card);
+}
+
 async function renderRuntimePanel() {
+  stopLockTicker();
   const host = document.getElementById('st-panel-runtime');
-  host.replaceChildren(el('p', '正在采集 Foundation 运行态监控快照…', 'st-muted-xs'));
+  if (!state.runtime) {
+    host.replaceChildren(el('p', '正在采集 Foundation 运行态监控快照…', 'st-muted-xs'));
+  }
   try {
     state.runtime = await apiJson(`/api/studio/runtime?repo=${encodeURIComponent(state.repoId || '')}`);
   } catch (err) {
@@ -908,54 +1695,147 @@ async function renderRuntimePanel() {
   }
   host.replaceChildren();
   const rt = state.runtime;
-  const kpi = rt.kpi || {};
+  const curRepo = state.repos.find(r => r.id === state.repoId);
+  const allTargets = rt.targets || [];
+  const repoTargets = rt.currentRepoTargets || [];
 
-  const kpiGrid = el('div', null, 'st-kpi-grid');
-  const addKpi = (title, val, sub, badgeCls = 'st-badge-indigo') => {
-    const c = el('div', null, 'st-card st-kpi-card');
-    c.append(el('div', title, 'st-muted-xs'), el('div', val, 'st-kpi-val'), el('span', sub, `st-badge ${badgeCls}`));
-    kpiGrid.append(c);
-  };
-  addKpi('全生态监控源', `${kpi.targetsCount ?? 0} 个`, `Foundation v${rt.foundationVersion || '0.39.0'}`);
-  addKpi('活跃令牌锁 (token-lock)', `${kpi.locks?.activeCount ?? 0} 把`, `超时预警 ${kpi.locks?.staleWarnCount ?? 0} 把`, (kpi.locks?.staleWarnCount ?? 0) > 0 ? 'st-badge-amber' : 'st-badge-emerald');
-  addKpi('事件哈希链 (state-store)', kpi.eventChain?.integrity || 'NO_STORE', `共 ${kpi.eventChain?.totalEvents ?? 0} 条事件`, kpi.eventChain?.integrity === 'CHAIN_BROKEN' ? 'st-badge-rose' : 'st-badge-emerald');
-  addKpi('受管子进程 (supervise-process)', `${kpi.processes?.total ?? 0} 条`, `运行中 ${kpi.processes?.counts?.RUNNING ?? 0} · 超时 ${kpi.processes?.counts?.TIMED_OUT ?? 0}`);
-  host.append(kpiGrid);
+  // 如果当前仓无运行态但工作区有其他活跃源，仍允许范围在当前仓与全工作区之间切
+  const scopeBaseTargets = state.rtScope === 'repo' ? repoTargets : allTargets;
+  const scopedTargets = state.rtSelectedTargetId === '__all__'
+    ? scopeBaseTargets
+    : scopeBaseTargets.filter(t => t.id === state.rtSelectedTargetId);
 
-  if (!rt.currentRepoHasRuntime) {
-    const emptyCard = el('div', null, 'st-card');
-    emptyCard.style.padding = '18px 20px';
-    emptyCard.style.marginBottom = '16px';
-    emptyCard.append(
-      el('h3', '当前仓库暂无正在运行的任务记录', ''),
-      el('p', '当长程任务或脚本通过 skill-family-studio ensure 与 skill-family-kit monitor register 挂载执行计划、令牌锁或状态目录后，此处将实时显示锁读秒与事件哈希链。你也可以立即触发一次隔离沙箱演练体验真实运行态。', 'st-muted-xs'),
-      el('pre', 'npx skill-family-studio ensure --root . --port 57630 --tab runtime\nnpx skill-family-kit monitor register --id task-01 --title "长程验证任务" --state-dir .runs/state --plan PLAN.md', 'st-code-block'),
-    );
-    emptyCard.firstChild.style.marginTop = '0';
-    const sbxBtn = el('button', '▶ 运行隔离沙箱演练（体验真实 token-lock 与 state-store 事件链）', 'st-btn st-btn-primary');
-    sbxBtn.type = 'button';
-    sbxBtn.addEventListener('click', async () => {
-      sbxBtn.disabled = true;
-      sbxBtn.textContent = '正在执行沙箱演练…';
-      await apiJson('/api/studio/runtime/sandbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  // 顶部观测范围与快捷动作栏
+  const bar = el('div', null, 'st-card st-rt-toolbar');
+  const leftBar = el('div', null, 'st-graph-controls');
+  const scopeSwitch = el('div', null, 'st-view-switch');
+  const bRepo = el('button', `聚焦当前项目 (${curRepo?.name || '当前仓'} · ${repoTargets.length})`, `st-btn${state.rtScope === 'repo' ? ' is-active' : ''}`);
+  bRepo.type = 'button';
+  bRepo.addEventListener('click', () => { state.rtScope = 'repo'; state.rtSelectedTargetId = '__all__'; renderRuntimePanel(); });
+  const bAll = el('button', `全工作区监控源聚合 (${allTargets.length} 源)`, `st-btn${state.rtScope === 'workspace' ? ' is-active' : ''}`);
+  bAll.type = 'button';
+  bAll.addEventListener('click', () => { state.rtScope = 'workspace'; state.rtSelectedTargetId = '__all__'; renderRuntimePanel(); });
+  scopeSwitch.append(bRepo, bAll);
+
+  const srcSelect = el('select', null, 'st-select');
+  srcSelect.style.width = 'auto';
+  const optAll = el('option', `全部范围运行源 (${scopeBaseTargets.length})`);
+  optAll.value = '__all__';
+  srcSelect.append(optAll);
+  for (const t of scopeBaseTargets) {
+    const o = el('option', `${t.title} [${t.badge}]`);
+    o.value = t.id;
+    if (state.rtSelectedTargetId === t.id) o.selected = true;
+    srcSelect.append(o);
+  }
+  srcSelect.addEventListener('change', () => { state.rtSelectedTargetId = srcSelect.value; renderRuntimePanel(); });
+  leftBar.append(scopeSwitch, srcSelect);
+
+  const rightBar = el('div', null, 'st-graph-controls');
+  const ssePill = el('span', null, 'st-live-pill');
+  ssePill.append(el('span', null, 'st-live-dot'), el('span', state.rtSseStatus === 'connected' ? 'SSE 实时同步' : '重连中…'));
+
+  const mountBtn = el('button', '+ 挂载运行源', 'st-btn');
+  mountBtn.type = 'button';
+  mountBtn.addEventListener('click', () => openRegisterRuntimeModal(() => renderRuntimePanel()));
+
+  const sbxBtn = el('button', '▶ 运行隔离沙箱演练', 'st-btn st-btn-primary');
+  sbxBtn.type = 'button';
+  sbxBtn.addEventListener('click', async () => {
+    sbxBtn.disabled = true;
+    sbxBtn.textContent = '演练中…';
+    await apiJson('/api/studio/runtime/sandbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    renderRuntimePanel();
+  });
+
+  rightBar.append(ssePill, mountBtn, sbxBtn);
+  if (rt.hasActiveSandboxLock) {
+    const relBtn = el('button', '🔓 释放沙箱锁', 'st-btn st-btn-amber');
+    relBtn.type = 'button';
+    relBtn.addEventListener('click', async () => {
+      relBtn.disabled = true;
+      await apiJson('/api/studio/runtime/sandbox/release', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
       renderRuntimePanel();
     });
-    emptyCard.append(sbxBtn);
-    host.append(emptyCard);
+    rightBar.append(relBtn);
   }
+  bar.append(leftBar, rightBar);
+  host.append(bar);
 
-  const targetsToShow = rt.currentRepoHasRuntime ? rt.currentRepoTargets : rt.ecosystemActiveTargets;
-  const secCard = el('div', null, 'st-card');
-  secCard.style.padding = '16px 20px';
-  secCard.append(el('h3', rt.currentRepoHasRuntime ? '当前仓库运行态详情' : '全生态活跃运行态总览', ''));
+  // 计算当前范围内的聚合 KPI
+  const sTasks = scopedTargets.flatMap(t => t.taskSummary?.tasks || []);
+  const sDone = sTasks.filter(t => t.status === 'done').length;
+  const sRun = sTasks.filter(t => t.status === 'running').length;
+  const sBlk = sTasks.filter(t => t.status === 'blocked').length;
+  const sPct = sTasks.length ? Math.round((sDone / sTasks.length) * 100) : 0;
+  const sLocks = scopedTargets.flatMap(t => t.locks || []);
+  const sActiveLocks = sLocks.filter(l => l.isActive);
+  const sWarnLocks = sActiveLocks.filter(l => l.isStaleWarning);
+  const sStores = scopedTargets.map(t => t.stateStore).filter(s => s?.isStateStore);
+  const sEvents = sStores.reduce((n, s) => n + (s.events?.length || 0), 0);
+  const sChainStatus = sStores.some(s => s.integrity === 'CHAIN_BROKEN') ? 'CHAIN_BROKEN' : (sStores.length ? (sEvents ? 'VALID' : 'EMPTY') : 'NO_STORE');
+  const sProcs = scopedTargets.flatMap(t => t.processes || []);
+  const sProcsRun = sProcs.filter(p => p.processStatus === 'RUNNING').length;
+  const sProcsTo = sProcs.filter(p => p.processStatus === 'TIMED_OUT').length;
+
+  const kpiGrid = el('div', null, 'st-kpi-grid');
+  const addKpi = (subKey, title, val, sub, badgeCls = 'st-badge-indigo') => {
+    const c = el('div', null, `st-card st-kpi-card is-clickable${state.rtSubtab === subKey ? ' is-focused' : ''}`);
+    c.append(el('div', title, 'st-muted-xs'), el('div', val, 'st-kpi-val st-tabular'), el('span', sub, `st-badge ${badgeCls}`));
+    c.addEventListener('click', () => { state.rtSubtab = state.rtSubtab === subKey ? 'all' : subKey; renderRuntimePanel(); });
+    kpiGrid.append(c);
+  };
+  addKpi('tasks', 'A. 任务与里程碑推进', `${sPct}% (${sDone}/${sTasks.length})`, `进行中 ${sRun} · 阻断 ${sBlk}`, sBlk > 0 ? 'st-badge-rose' : 'st-badge-indigo');
+  addKpi('locks', 'B. 文件锁与并发雷达', `${sActiveLocks.length} 把活跃`, `超时预警 ${sWarnLocks.length} 把`, sWarnLocks.length > 0 ? 'st-badge-amber' : 'st-badge-emerald');
+  addKpi('chain', 'C. 事件哈希链 (state-store)', sChainStatus, `共 ${sEvents} 条事件 · ${sStores.length} 仓`, sChainStatus === 'CHAIN_BROKEN' ? 'st-badge-rose' : 'st-badge-emerald');
+  addKpi('processes', 'D. 受管子进程监督', `${sProcs.length} 条记录`, `运行中 ${sProcsRun} · 超时强杀 ${sProcsTo}`, sProcsTo > 0 ? 'st-badge-amber' : 'st-badge-indigo');
+  host.append(kpiGrid);
+
+  const subBar = el('div', null, 'st-rt-subtabs');
+  for (const [sk, sl] of [
+    ['all', '全部四维观测总览'],
+    ['tasks', 'A. 任务与里程碑矩阵'],
+    ['locks', 'B. 文件锁并发雷达'],
+    ['chain', 'C. 事件哈希链时间线'],
+    ['processes', 'D. 子进程监督轨迹'],
+  ]) {
+    const b = el('button', sl, `st-btn${state.rtSubtab === sk ? ' is-active' : ''}`);
+    b.type = 'button';
+    b.addEventListener('click', () => { state.rtSubtab = sk; renderRuntimePanel(); });
+    subBar.append(b);
+  }
+  host.append(subBar);
+
+  const lockWarnMs = rt.kpi?.lockWarnMs || 30000;
+  if (state.rtSubtab === 'all' || state.rtSubtab === 'tasks') renderTaskMatrixSubpanel(host, scopedTargets);
+  if (state.rtSubtab === 'all' || state.rtSubtab === 'locks') renderLockRadarSubpanel(host, scopedTargets, lockWarnMs);
+  if (state.rtSubtab === 'all' || state.rtSubtab === 'chain') renderEventChainSubpanel(host, scopedTargets);
+  if (state.rtSubtab === 'all' || state.rtSubtab === 'processes') renderProcessSubpanel(host, scopedTargets);
+
+  const secCard = el('div', null, 'st-card st-guide-section');
+  secCard.append(el('h3', state.rtScope === 'repo' ? '当前项目挂载源汇总' : '全工作区运行源汇总', ''));
   secCard.firstChild.style.marginTop = '0';
-
-  if (!targetsToShow || !targetsToShow.length) {
-    secCard.append(el('p', '全生态当前静默，无活跃令牌锁或未完成子进程。', 'st-muted-xs'));
+  if (!scopedTargets.length) {
+    secCard.append(el('p', '当前范围暂无运行态任务记录；可点击右上角「+ 挂载运行源」或「▶ 运行隔离沙箱演练」，或切换「全工作区监控源聚合」查看其他项目活跃任务。', 'st-muted-xs'));
   } else {
-    secCard.append(buildRuntimeTargetsTable(targetsToShow, document));
+    secCard.append(buildRuntimeTargetsTable(scopedTargets, document));
   }
   host.append(secCard);
+
+  // 若存在活跃排他锁，开启每秒读秒更新（仅改写文字，不销毁 DOM）
+  if (sActiveLocks.length > 0 && state.tab === 'runtime') {
+    lockTickTimer = setInterval(() => {
+      if (state.tab !== 'runtime') { stopLockTicker(); return; }
+      const nodes = host.querySelectorAll('[data-lock-acquired-at]');
+      const now = Date.now();
+      for (const n of nodes) {
+        const ts = Date.parse(n.dataset.lockAcquiredAt || '');
+        if (!Number.isFinite(ts)) continue;
+        const ageMs = Math.max(0, now - ts);
+        n.textContent = `已持锁 ${formatDurationMs(ageMs)}`;
+      }
+    }, 1000);
+  }
 }
 
 function renderActiveTab() {
@@ -965,7 +1845,7 @@ function renderActiveTab() {
   else if (state.tab === 'runtime') renderRuntimePanel();
 }
 
-async function selectRepo(repoId) {
+async function selectRepo(repoId, { skipRender = false } = {}) {
   if (!repoId) return;
   state.repoId = repoId;
   state.graphMode = 'dag';
@@ -973,16 +1853,24 @@ async function selectRepo(repoId) {
   state.archifySelectedNode = null;
   state.selectedAnchor = null;
   state.reviewCategory = 'all';
+  state.rtSelectedTargetId = '__all__';
   const u = new URL(location.href);
   u.searchParams.set('repo', repoId);
   if (state.tab) u.searchParams.set('tab', state.tab);
   history.replaceState(null, '', u);
-  const data = await apiJson(`/api/studio/repo?repo=${encodeURIComponent(repoId)}`);
+  const [data, alignData] = await Promise.all([
+    apiJson(`/api/studio/repo?repo=${encodeURIComponent(repoId)}`),
+    apiJson(`/api/studio/alignment?repo=${encodeURIComponent(repoId)}`).catch(() => null),
+  ]);
   state.snap = data.snapshot;
+  state.alignment = alignData;
   const def = pickDefaultArtifactNode(state.snap.nodes || []) || (state.snap.reviewItems || [])[0] || null;
   state.selectedUid = def ? def.uid : null;
+  if (!skipRender) {
+    state.reviewMode = state.alignment?.portfolio?.present ? 'alignment' : 'reader';
+  }
   updateTopbarSummary();
-  renderActiveTab();
+  if (!skipRender) renderActiveTab();
 }
 
 async function openExportDrawer() {
@@ -1034,14 +1922,24 @@ async function boot() {
   if (initialRepo) await selectRepo(initialRepo);
   switchTab(initialTab);
 
+  let rtRefreshTimer = null;
   try {
     const es = new EventSource('/api/studio/events');
+    es.addEventListener('connected', () => { state.rtSseStatus = 'connected'; });
     es.addEventListener('review-change', async () => {
       const fresh = await apiJson('/api/studio/state');
       state.decisions = fresh.decisions || {};
       state.annotations = fresh.annotations || [];
       updateTopbarSummary();
     });
+    es.addEventListener('runtime-change', () => {
+      state.rtSseStatus = 'connected';
+      if (state.tab === 'runtime') {
+        if (rtRefreshTimer) clearTimeout(rtRefreshTimer);
+        rtRefreshTimer = setTimeout(() => { rtRefreshTimer = null; renderRuntimePanel(); }, 200);
+      }
+    });
+    es.onerror = () => { state.rtSseStatus = 'reconnecting'; };
   } catch {}
 }
 

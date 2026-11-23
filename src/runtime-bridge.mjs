@@ -1,3 +1,5 @@
+// @feature STU003
+
 import { lstatSync, realpathSync } from 'node:fs';
 import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -97,13 +99,20 @@ export function resolveRuntimeTargetPath(root, inputPath, { allowedRoots = [], s
   return canonical;
 }
 
+function shortDisplayPath(fullPath) {
+  const clean = sanitizePublicText(String(fullPath ?? ''));
+  const parts = clean.split(/[\\/]/).filter(Boolean);
+  if (parts.length <= 3) return clean;
+  return `…/${parts.slice(-3).join('/')}`;
+}
+
 async function safeLstat(p) { try { return await lstat(p); } catch { return null; } }
 async function safeJson(p) { try { return { ok: true, value: JSON.parse(await readFile(p, 'utf8')) }; } catch { return { ok: false }; } }
 
 async function walkBounded(rootDir, maxDepth = 3, accept = null) {
   const out = [];
   async function visit(dir, d) {
-    if (d > maxDepth || out.length >= 100) return;
+    if (d > maxDepth || out.length >= 120) return;
     let ents = [];
     try { ents = await readdir(dir, { withFileTypes: true }); } catch { return; }
     for (const e of ents) {
@@ -117,15 +126,280 @@ async function walkBounded(rootDir, maxDepth = 3, accept = null) {
   return out;
 }
 
+function cleanMarkdownInline(text) {
+  return String(text ?? '')
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/<br\s*\/?>/gi, ' · ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeTaskStatus(raw) {
+  const text = String(raw ?? '').trim();
+  const lower = text.toLowerCase();
+  if (!text) return null;
+  if (/\[done\]|^done$|^completed?$|^passed?$|^pass$|^succeeded$|^ok$|^exited$/i.test(lower)) return 'done';
+  if (/\[process\]|\[running\]|\[wip\]|^running$|^in[_-\s]?progress$|^active$|^supervising$/i.test(lower)) return 'running';
+  if (/\[blocked\]|\[failed\]|^blocked$|^failed$|^error$|^timed_out$|^terminated$/i.test(lower)) return 'blocked';
+  if (/\[todo\]|^todo$|^pending$|^planned$|^queued$/i.test(lower)) return 'todo';
+  if (/不适用/.test(text)) return null;
+  if (/失败|阻断|异常|超时/.test(text) && !/零失败|0\s*fail|无异常/.test(text)) return 'blocked';
+  if (/进行中|正在|待授权|待重验|待用户/.test(text)) return 'running';
+  if (/尚未|待推进|未启动|未完成|待办/.test(text)) return 'todo';
+  if (/已完成|全部通过|验证通过|核对通过|全绿|完成/.test(text)) return 'done';
+  return null;
+}
+
+function parseCsvRows(csvText) {
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  for (let i = 0; i < csvText.length; i += 1) {
+    const ch = csvText[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (csvText[i + 1] === '"') { field += '"'; i += 1; }
+        else inQuotes = false;
+      } else {
+        field += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ',') {
+      row.push(field.trim());
+      field = '';
+    } else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && csvText[i + 1] === '\n') i += 1;
+      row.push(field.trim());
+      if (row.some(cell => cell.length > 0)) rows.push(row);
+      row = [];
+      field = '';
+    } else {
+      field += ch;
+    }
+  }
+  row.push(field.trim());
+  if (row.some(cell => cell.length > 0)) rows.push(row);
+  return rows;
+}
+
+function summarizeMilestones(tasks) {
+  const map = new Map();
+  for (const task of tasks) {
+    const group = task.group || '默认阶段';
+    if (!map.has(group)) {
+      map.set(group, { name: group, total: 0, done: 0, running: 0, todo: 0, blocked: 0, percent: 0 });
+    }
+    const item = map.get(group);
+    item.total += 1;
+    if (task.status === 'done') item.done += 1;
+    else if (task.status === 'running') item.running += 1;
+    else if (task.status === 'blocked') item.blocked += 1;
+    else item.todo += 1;
+  }
+  const milestones = [...map.values()];
+  for (const m of milestones) {
+    m.percent = m.total > 0 ? Math.round((m.done / m.total) * 100) : 0;
+  }
+  return milestones;
+}
+
+export function parsePlanSummary(content, ext = '.md', sourceLabel = 'plan') {
+  const cleanExt = String(ext ?? '.md').toLowerCase();
+  const tasks = [];
+  let format = 'markdown';
+
+  if (cleanExt === '.csv' || cleanExt === 'csv') {
+    format = 'csv';
+    const rows = parseCsvRows(String(content ?? ''));
+    if (rows.length >= 2) {
+      const headers = rows[0].map(h => h.toLowerCase());
+      const findIdx = names => headers.findIndex(h => names.some(n => h === n || h.includes(n)));
+      const idIdx = findIdx(['id', 'task_id', '编号', 'code']);
+      const titleIdx = findIdx(['title', 'name', 'task', '标题', '任务', '事项']);
+      const statusIdx = findIdx(['status', 'state', 'phase', '状态', '阶段']);
+      const groupIdx = findIdx(['group', 'milestone', 'stage', '里程碑', '分组']);
+      const detailIdx = findIdx(['detail', 'note', 'owner', '说明', '负责人']);
+      for (let i = 1; i < rows.length; i += 1) {
+        const cols = rows[i];
+        const rawTitle = titleIdx >= 0 ? cols[titleIdx] : cols[1] ?? cols[0];
+        if (!rawTitle) continue;
+        const rawStatus = statusIdx >= 0 ? cols[statusIdx] : 'todo';
+        const status = normalizeTaskStatus(rawStatus) ?? 'todo';
+        tasks.push({
+          id: (idIdx >= 0 && cols[idIdx]) ? cols[idIdx] : `CSV-${i}`,
+          title: sanitizePublicText(rawTitle),
+          status,
+          rawStatus: rawStatus || status,
+          group: sanitizePublicText((groupIdx >= 0 && cols[groupIdx]) ? cols[groupIdx] : 'CSV 进度清单'),
+          detail: sanitizePublicText((detailIdx >= 0 && cols[detailIdx]) ? cols[detailIdx] : ''),
+          sourceType: 'csv',
+          sourceLabel,
+        });
+      }
+    }
+  } else if (cleanExt === '.json' || cleanExt === 'json') {
+    format = 'json';
+    try {
+      const parsed = JSON.parse(String(content ?? ''));
+      const list = Array.isArray(parsed)
+        ? parsed
+        : (Array.isArray(parsed?.tasks) ? parsed.tasks : (Array.isArray(parsed?.steps) ? parsed.steps : (Array.isArray(parsed?.actual_steps) ? parsed.actual_steps : [])));
+      list.forEach((entry, idx) => {
+        if (!entry || typeof entry !== 'object') return;
+        const status = entry.status
+          ? (normalizeTaskStatus(entry.status) ?? 'todo')
+          : (typeof entry.exitCode === 'number' ? (entry.exitCode === 0 ? 'done' : 'blocked') : (entry.done === true ? 'done' : 'todo'));
+        tasks.push({
+          id: String(entry.id ?? entry.code ?? `STEP-${idx + 1}`),
+          title: sanitizePublicText(String(entry.title ?? entry.name ?? entry.id ?? `步骤 ${idx + 1}`)),
+          status,
+          rawStatus: String(entry.status ?? (typeof entry.exitCode === 'number' ? `exit=${entry.exitCode}` : status)),
+          group: sanitizePublicText(String(entry.group ?? entry.milestone ?? 'JSON 阶段步骤')),
+          detail: sanitizePublicText(typeof entry.durationMs === 'number' ? `耗时 ${(entry.durationMs / 1000).toFixed(2)}s` : String(entry.detail ?? '')),
+          sourceType: 'json',
+          sourceLabel,
+        });
+      });
+    } catch {}
+  } else {
+    const lines = String(content ?? '').split(/\r?\n/);
+    let inFence = false;
+    let currentGroup = '核心待办与执行阶段';
+    let checkboxSeq = 0;
+    let tableSeq = 0;
+
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i];
+      if (/^\s*```/.test(line)) { inFence = !inFence; continue; }
+      if (inFence) continue;
+      const headingMatch = /^(#{1,4})\s+(.+)$/.exec(line);
+      if (headingMatch) {
+        const cleanHeading = cleanMarkdownInline(headingMatch[2]);
+        if (cleanHeading) currentGroup = sanitizePublicText(cleanHeading);
+        continue;
+      }
+      const cbMatch = /^\s*[-*+]\s+\[([ xX/\-~!])\]\s+(.+)$/.exec(line);
+      if (cbMatch) {
+        checkboxSeq += 1;
+        const mark = cbMatch[1].toLowerCase();
+        const status = mark === 'x' ? 'done' : (mark === '!' ? 'blocked' : ((mark === '/' || mark === '-' || mark === '~') ? 'running' : 'todo'));
+        const cleaned = sanitizePublicText(cleanMarkdownInline(cbMatch[2]));
+        const idExtract = /^\[([A-Za-z0-9_.-]+)\]\s*(.+)$/.exec(cleaned);
+        tasks.push({
+          id: idExtract ? idExtract[1] : `TASK-${String(checkboxSeq).padStart(2, '0')}`,
+          title: idExtract ? idExtract[2] : cleaned,
+          status,
+          rawStatus: `[${mark}]`,
+          group: currentGroup,
+          detail: '',
+          sourceType: 'markdown-checkbox',
+          sourceLabel,
+        });
+        continue;
+      }
+      if (/^\s*\|.+\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+        const splitCells = rowLine => rowLine.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+        const headers = splitCells(line).map(h => cleanMarkdownInline(h));
+        const statusColIdx = headers.findIndex(h => /状态|当前安排|进展|status|phase/i.test(h));
+        i += 2;
+        while (i < lines.length && /^\s*\|.+\|\s*$/.test(lines[i])) {
+          const rawCells = splitCells(lines[i]);
+          const cells = rawCells.map(c => cleanMarkdownInline(c));
+          let detectedStatus = null;
+          let rawStatusText = '';
+          for (const rc of rawCells) {
+            if (/\[(done|process|todo|blocked|running)\]/i.test(rc)) {
+              detectedStatus = normalizeTaskStatus(rc);
+              rawStatusText = cleanMarkdownInline(rc);
+              break;
+            }
+          }
+          if (!detectedStatus && statusColIdx >= 0 && statusColIdx < rawCells.length) {
+            detectedStatus = normalizeTaskStatus(rawCells[statusColIdx]);
+            rawStatusText = cells[statusColIdx];
+          }
+          if (detectedStatus) {
+            tableSeq += 1;
+            const titleCell = cells.find((c, idx) => idx !== statusColIdx && c.length > 0) || `条目 ${tableSeq}`;
+            tasks.push({
+              id: `ROW-${String(tableSeq).padStart(2, '0')}`,
+              title: sanitizePublicText(titleCell),
+              status: detectedStatus,
+              rawStatus: rawStatusText || detectedStatus,
+              group: currentGroup,
+              detail: sanitizePublicText(cells.slice(1).filter(Boolean).slice(0, 2).join(' · ')),
+              sourceType: 'markdown-table',
+              sourceLabel,
+            });
+          }
+          i += 1;
+        }
+        i -= 1;
+      }
+    }
+  }
+
+  const total = tasks.length;
+  const done = tasks.filter(t => t.status === 'done').length;
+  const running = tasks.filter(t => t.status === 'running').length;
+  const blocked = tasks.filter(t => t.status === 'blocked').length;
+  const todo = tasks.filter(t => t.status === 'todo').length;
+  const percent = total > 0 ? Math.round((done / total) * 100) : 0;
+  return { format, total, done, running, blocked, todo, percent, tasks, milestones: summarizeMilestones(tasks) };
+}
 export async function inspectStateStoreReadOnly(stateDir, { lockWarnMs = DEFAULT_LOCK_WARN_MS, nowMs = Date.now() } = {}) {
   if (!stateDir) return null;
   const st = await safeLstat(stateDir);
-  if (!st?.isDirectory()) return { path: stateDir, exists: false, isStateStore: false, integrity: 'MISSING', lastSequence: 0, events: [] };
+  if (!st?.isDirectory()) {
+    return {
+      path: stateDir,
+      displayPath: shortDisplayPath(stateDir),
+      exists: false,
+      isStateStore: false,
+      integrity: 'MISSING',
+      integrityError: null,
+      lastSequence: 0,
+      headDigest: STATE_GENESIS_DIGEST,
+      fencing: 0,
+      writerLock: null,
+      hasActiveMutation: false,
+      hasActiveRecovery: false,
+      snapshotsCount: 0,
+      events: [],
+    };
+  }
   const dir = await realpath(stateDir).catch(() => stateDir);
   const headJson = await safeJson(join(dir, 'chain-head.json'));
+  const fencingJson = await safeJson(join(dir, 'fencing.json'));
   const evDir = await safeLstat(join(dir, 'events'));
+  const snapshotsDir = await safeLstat(join(dir, 'snapshots'));
+  const mutationLockStat = await safeLstat(join(dir, 'writer-mutation.lock'));
+  const recoveryLockStat = await safeLstat(join(dir, 'writer-recovery.lock'));
+
   if (!headJson.ok && !evDir?.isDirectory()) {
-    return { path: dir, exists: true, isStateStore: false, integrity: 'NOT_STORE', lastSequence: 0, events: [] };
+    return {
+      path: dir,
+      displayPath: shortDisplayPath(dir),
+      exists: true,
+      isStateStore: false,
+      integrity: 'NOT_STORE',
+      integrityError: null,
+      lastSequence: 0,
+      headDigest: STATE_GENESIS_DIGEST,
+      fencing: 0,
+      writerLock: null,
+      hasActiveMutation: false,
+      hasActiveRecovery: false,
+      snapshotsCount: 0,
+      events: [],
+    };
   }
 
   let writerLock = null;
@@ -139,76 +413,196 @@ export async function inspectStateStoreReadOnly(stateDir, { lockWarnMs = DEFAULT
 
   const events = [];
   let integrity = 'EMPTY';
+  let integrityError = null;
   let prevDigest = STATE_GENESIS_DIGEST;
   if (evDir?.isDirectory()) {
     const names = (await readdir(join(dir, 'events'))).filter(n => /^\d{6}\.json$/.test(n)).sort();
     for (let i = 0; i < names.length; i += 1) {
-      const parsed = await safeJson(join(dir, 'events', names[i]));
-      if (!parsed.ok || Number(names[i].slice(0, 6)) !== i + 1) { integrity = 'CHAIN_BROKEN'; break; }
+      const evFull = join(dir, 'events', names[i]);
+      const parsed = await safeJson(evFull);
+      const evStat = await safeLstat(evFull);
+      if (!parsed.ok || Number(names[i].slice(0, 6)) !== i + 1) {
+        integrity = 'CHAIN_BROKEN';
+        integrityError = `事件序号或 JSON 损坏：${names[i]}`;
+        break;
+      }
       const rec = parsed.value;
       const { recordDigest: _omit, ...unsigned } = rec;
       const calc = (() => { try { return digestDocument(unsigned); } catch { return null; } })();
       const ok = rec.sequence === i + 1 && rec.prevDigest === prevDigest && calc === rec.recordDigest;
-      if (!ok) integrity = 'CHAIN_BROKEN';
+      if (!ok && integrity !== 'CHAIN_BROKEN') {
+        integrity = 'CHAIN_BROKEN';
+        integrityError = `事件 #${i + 1} 哈希链校验失败`;
+      }
       prevDigest = rec.recordDigest ?? prevDigest;
-      events.push({ sequence: rec.sequence, eventId: rec.eventId, eventType: rec.eventType, producer: rec.producer, recordedAt: rec.payload?.timestamp ?? null });
+      events.push({
+        sequence: rec.sequence,
+        eventId: rec.eventId,
+        eventType: rec.eventType,
+        producer: rec.producer,
+        writerFencing: rec.writerFencing ?? null,
+        prevDigest: rec.prevDigest ?? null,
+        recordDigest: rec.recordDigest ?? null,
+        digestVerified: ok,
+        recordedAt: rec.payload?.timestamp ?? rec.payload?.at ?? (evStat ? new Date(evStat.mtimeMs).toISOString() : null),
+      });
     }
     if (integrity !== 'CHAIN_BROKEN') {
-      integrity = events.length === 0 ? 'EMPTY' : (headJson.ok && (headJson.value?.lastSequence !== events.length || headJson.value?.headDigest !== prevDigest) ? 'STALE_HEAD' : 'VALID');
+      integrity = events.length === 0
+        ? 'EMPTY'
+        : (headJson.ok && (headJson.value?.lastSequence !== events.length || headJson.value?.headDigest !== prevDigest) ? 'STALE_HEAD' : 'VALID');
+      if (integrity === 'STALE_HEAD') integrityError = 'chain-head.json 与最新事件序号或摘要不一致';
     }
   }
-  return { path: dir, exists: true, isStateStore: true, integrity, lastSequence: events.length, writerLock, events };
+
+  let snapshotsCount = 0;
+  if (snapshotsDir?.isDirectory()) {
+    try {
+      snapshotsCount = (await readdir(join(dir, 'snapshots'))).filter(n => /^\d{6}\.json$/.test(n)).length;
+    } catch {}
+  }
+
+  return {
+    path: dir,
+    displayPath: shortDisplayPath(dir),
+    exists: true,
+    isStateStore: true,
+    integrity,
+    integrityError,
+    lastSequence: events.length > 0 ? events[events.length - 1].sequence : (headJson.value?.lastSequence ?? 0),
+    headDigest: events.length > 0 ? prevDigest : (headJson.value?.headDigest ?? STATE_GENESIS_DIGEST),
+    fencing: fencingJson.value?.lastFencing ?? writerLock?.fencing ?? 0,
+    writerLock,
+    hasActiveMutation: Boolean(mutationLockStat?.isFile()),
+    hasActiveRecovery: Boolean(recoveryLockStat?.isFile()),
+    snapshotsCount,
+    events,
+  };
+}
+
+async function inspectSingleLockFile(fullPath, { lockWarnMs = DEFAULT_LOCK_WARN_MS, nowMs = Date.now(), targetId } = {}) {
+  const fileStat = await safeLstat(fullPath);
+  if (!fileStat || !fileStat.isFile()) return null;
+  const name = basename(fullPath);
+
+  if (name === 'traceability-version-lock.json') {
+    const parsed = await safeJson(fullPath);
+    if (!parsed.ok) return null;
+    const relCount = Array.isArray(parsed.value?.artifactRelations) ? parsed.value.artifactRelations.length : 0;
+    const codeLocksCount = Array.isArray(parsed.value?.locks) ? parsed.value.locks.length : 0;
+    const uniqueFiles = new Set();
+    for (const edge of parsed.value?.artifactRelations ?? []) {
+      if (edge?.source?.path) uniqueFiles.add(edge.source.path);
+      if (edge?.target?.path) uniqueFiles.add(edge.target.path);
+    }
+    return {
+      id: `vlock:${fullPath}`,
+      targetId,
+      name,
+      path: fullPath,
+      displayPath: shortDisplayPath(fullPath),
+      lockKind: 'version-lock',
+      owner: 'artifact-graph',
+      acquiredAt: new Date(fileStat.mtimeMs).toISOString(),
+      ageMs: Math.max(0, nowMs - fileStat.mtimeMs),
+      isActive: false,
+      isStaleWarning: false,
+      status: 'ANCHORED',
+      summary: `${relCount} 条制品关系锁 · ${codeLocksCount} 项代码/测试锁 · ${uniqueFiles.size} 个制品文件`,
+    };
+  }
+
+  if (name === 'writer.lock' || name === 'writer-mutation.lock' || name === 'writer-recovery.lock') {
+    const parsed = await safeJson(fullPath);
+    const val = parsed.ok ? parsed.value : {};
+    const acquiredAt = val?.acquiredAt ?? new Date(fileStat.mtimeMs).toISOString();
+    const ageMs = Math.max(0, nowMs - Date.parse(acquiredAt));
+    const isStaleWarning = Number.isFinite(ageMs) && ageMs >= lockWarnMs;
+    return {
+      id: `sslock:${fullPath}`,
+      targetId,
+      name,
+      path: fullPath,
+      displayPath: shortDisplayPath(fullPath),
+      lockKind: name === 'writer.lock' ? 'state-store-writer' : 'state-store-control',
+      owner: val?.owner ?? (name === 'writer-recovery.lock' ? 'recovery-coordinator' : 'unknown'),
+      acquiredAt,
+      ageMs: Number.isFinite(ageMs) ? ageMs : 0,
+      isActive: true,
+      isStaleWarning,
+      status: name === 'writer-recovery.lock' ? 'RECOVERING' : (isStaleWarning ? 'WARN_HELD_LONG' : 'ACTIVE'),
+      summary: name === 'writer.lock'
+        ? `State-Store 写入锁 (fencing #${val?.fencing ?? 0})`
+        : (name === 'writer-mutation.lock' ? `原子变更守卫 (${val?.operation ?? 'mutation'})` : '显式锁恢复守卫'),
+    };
+  }
+
+  if (name.endsWith('.lock')) {
+    try {
+      const parentReal = await realpath(dirname(fullPath));
+      const inspected = await inspectFilesystemLock(parentReal, name);
+      if (inspected?.locked) {
+        const ageMs = Math.max(0, nowMs - Date.parse(inspected.acquiredAt));
+        const isStaleWarning = ageMs >= lockWarnMs;
+        return {
+          id: `tlock:${fullPath}`,
+          targetId,
+          name,
+          path: fullPath,
+          displayPath: shortDisplayPath(fullPath),
+          lockKind: 'token-lock',
+          owner: inspected.owner,
+          tokenDigest: inspected.tokenDigest ? `${String(inspected.tokenDigest).slice(0, 12)}…` : null,
+          acquiredAt: inspected.acquiredAt,
+          ageMs,
+          isActive: true,
+          isStaleWarning,
+          status: isStaleWarning ? 'WARN_HELD_LONG' : 'ACTIVE',
+          summary: `Foundation 令牌排他锁 (${String(inspected.tokenDigest || '').slice(0, 12)}…)`,
+        };
+      }
+    } catch (error) {
+      const fallback = await safeJson(fullPath);
+      const ageMs = Math.max(0, nowMs - fileStat.mtimeMs);
+      const isStaleWarning = ageMs >= lockWarnMs;
+      return {
+        id: `flock:${fullPath}`,
+        targetId,
+        name,
+        path: fullPath,
+        displayPath: shortDisplayPath(fullPath),
+        lockKind: 'file-lock',
+        owner: fallback.value?.owner ?? 'active-holder',
+        acquiredAt: fallback.value?.acquiredAt ?? new Date(fileStat.mtimeMs).toISOString(),
+        ageMs,
+        isActive: true,
+        isStaleWarning,
+        status: fallback.ok ? (isStaleWarning ? 'WARN_HELD_LONG' : 'ACTIVE') : 'CORRUPT',
+        summary: fallback.ok ? '自定义 JSON 文件锁' : `锁记录校验异常 (${error?.message ?? 'corrupt'})`,
+      };
+    }
+  }
+  return null;
 }
 
 async function scanLocksReadOnly(resolvedTarget, { lockWarnMs = DEFAULT_LOCK_WARN_MS, nowMs = Date.now() } = {}) {
   const candidates = new Set();
   for (const d of [resolvedTarget.stateDir, resolvedTarget.runsDir].filter(Boolean)) {
-    for (const f of await walkBounded(d, 3, n => n.endsWith('.lock'))) candidates.add(f);
+    for (const f of await walkBounded(d, 3, n => n.endsWith('.lock') || n === 'traceability-version-lock.json')) candidates.add(f);
   }
   for (const p of resolvedTarget.lockPaths ?? []) {
     const st = await safeLstat(p);
     if (st?.isFile()) candidates.add(p);
     else if (st?.isDirectory()) {
-      for (const f of await walkBounded(p, 2, n => n.endsWith('.lock'))) candidates.add(f);
+      for (const f of await walkBounded(p, 2, n => n.endsWith('.lock') || n === 'traceability-version-lock.json')) candidates.add(f);
     }
   }
   const locks = [];
   for (const full of candidates) {
-    const name = basename(full);
-    try {
-      const parentReal = await realpath(dirname(full));
-      const inspected = await inspectFilesystemLock(parentReal, name);
-      if (inspected?.locked) {
-        const ageMs = Math.max(0, nowMs - Date.parse(inspected.acquiredAt));
-        locks.push({
-          id: `tlock:${full}`,
-          name,
-          path: full,
-          lockKind: 'token-lock',
-          owner: inspected.owner,
-          acquiredAt: inspected.acquiredAt,
-          ageMs,
-          isActive: true,
-          isStaleWarning: ageMs >= lockWarnMs,
-        });
-      }
-    } catch {
-      const st = await safeLstat(full);
-      if (st?.isFile()) {
-        const ageMs = Math.max(0, nowMs - st.mtimeMs);
-        locks.push({
-          id: `flock:${full}`,
-          name,
-          path: full,
-          lockKind: 'file-lock',
-          owner: 'active-holder',
-          ageMs,
-          isActive: true,
-          isStaleWarning: ageMs >= lockWarnMs,
-        });
-      }
-    }
+    const item = await inspectSingleLockFile(full, { lockWarnMs, nowMs, targetId: resolvedTarget.id });
+    if (item) locks.push(item);
   }
+  locks.sort((a, b) => Number(b.isActive) - Number(a.isActive) || Number(b.isStaleWarning) - Number(a.isStaleWarning) || a.name.localeCompare(b.name));
   return locks;
 }
 
@@ -225,33 +619,43 @@ async function scanProcessesReadOnly(resolvedTarget) {
     if (!parsed.ok || !parsed.value) continue;
     const doc = parsed.value;
     const rawSt = String(doc.processStatus ?? doc.status ?? '').toUpperCase();
-    const processStatus = PROCESS_STATUSES.includes(rawSt) ? rawSt : (rawSt === 'ACTIVE' ? 'RUNNING' : 'EXITED');
+    const processStatus = PROCESS_STATUSES.includes(rawSt)
+      ? rawSt
+      : (rawSt === 'ACTIVE' || rawSt === 'SUPERVISING' ? 'RUNNING' : 'EXITED');
+    const exitCode = typeof doc.exitCode === 'number'
+      ? doc.exitCode
+      : (typeof doc.exit_code === 'number' ? doc.exit_code : null);
+    const startedAt = doc.startedAt ?? doc.createdAt ?? null;
+    const endedAt = doc.endedAt ?? doc.finishedAt ?? null;
+    const durationMs = typeof doc.durationMs === 'number'
+      ? doc.durationMs
+      : (startedAt && endedAt ? Math.max(0, Date.parse(endedAt) - Date.parse(startedAt)) : null);
+    const timedOut = processStatus === 'TIMED_OUT' || Boolean(doc.timedOut);
+    const command = Array.isArray(doc.argv)
+      ? doc.argv.map(String).slice(0, 4).join(' ')
+      : (typeof doc.command === 'string'
+        ? `${doc.command}${Array.isArray(doc.args) ? ` ${doc.args.slice(0, 3).join(' ')}` : ''}`.trim()
+        : basename(full));
+
     processes.push({
       id: `proc:${full}`,
+      targetId: resolvedTarget.id,
       filePath: full,
+      displayPath: shortDisplayPath(full),
       label: basename(full),
+      command: sanitizePublicText(command),
       processStatus,
-      ok: typeof doc.ok === 'boolean' ? doc.ok : (doc.exit_code === 0),
+      exitCode,
+      durationMs,
+      timedOut,
+      killSignal: doc.killSignal ?? doc.signal ?? (timedOut ? 'SIGTERM/SIGKILL' : null),
+      startedAt,
+      endedAt,
+      ok: typeof doc.ok === 'boolean' ? doc.ok : (exitCode === 0),
     });
   }
   return processes;
 }
-
-function parsePlanSummary(content, ext) {
-  if (ext === '.json') {
-    try {
-      const p = JSON.parse(content);
-      const list = Array.isArray(p?.tasks) ? p.tasks : [];
-      const done = list.filter(t => t.done || t.status === 'done').length;
-      return { total: list.length, done, percent: list.length ? Math.round((done / list.length) * 100) : 0 };
-    } catch { return { total: 0, done: 0, percent: 0 }; }
-  }
-  const boxes = [...String(content ?? '').matchAll(/^\s*[-*+]\s+\[([ xX/\-~])\]/gm)];
-  const total = boxes.length;
-  const done = boxes.filter(m => m[1].toLowerCase() === 'x').length;
-  return { total, done, percent: total ? Math.round((done / total) * 100) : 0 };
-}
-
 export async function loadMonitorRegistry(root = '.', registryPath = STUDIO_RUNTIME_REGISTRY_PATH, { allowedRoots = [] } = {}) {
   const base = resolve(root);
   const abs = isAbsolute(registryPath)
@@ -296,7 +700,11 @@ export async function registerMonitorTarget(root = '.', input = {}, registryPath
   const rawStateDir = input.stateDir ? String(input.stateDir).trim() : '';
   const rawPlanPath = input.planPath ? String(input.planPath).trim() : '';
   const rawRunsDir = input.runsDir ? String(input.runsDir).trim() : '';
-  const lockPaths = Array.isArray(input.lockPaths) ? input.lockPaths.map(p => String(p).trim()).filter(Boolean) : [];
+  const lockPaths = Array.isArray(input.lockPaths)
+    ? input.lockPaths.map(p => String(p).trim()).filter(Boolean)
+    : (typeof input.lockPaths === 'string'
+      ? input.lockPaths.split(',').map(p => p.trim()).filter(Boolean)
+      : []);
 
   for (const c of [rawStateDir, rawPlanPath, rawRunsDir, ...lockPaths]) {
     if (c) resolveRuntimeTargetPath(base, c, { allowedRoots, strict: true });
@@ -342,13 +750,25 @@ export async function runSandboxExercise({ holdLock = true, simulateTimeout = tr
 
   await writeFile(
     planPath,
-    '# 隔离沙箱演练计划\n\n- [x] 获取令牌排他锁\n- [x] 追加 state-store 事件哈希链\n- [/] 运行子进程健康与超时保护探针\n',
+    [
+      '# 隔离沙箱演练计划',
+      '',
+      '## 阶段一：并发写集锁与哈希链初始化',
+      '- [x] [SBX-01] 获取 Foundation 令牌排他锁 (`token-lock`)',
+      '- [x] [SBX-02] 追加 `state-store` SHA-256 创世与步骤事件链',
+      '',
+      '## 阶段二：子进程监督与超时保护',
+      '- [x] [SBX-03] 运行正常退出的轻量探针进程 (`EXITED`)',
+      '- [/] [SBX-04] 运行受管超时强杀探针并保持沙箱排他锁待手动释放',
+      '',
+    ].join('\n'),
     'utf8',
   );
 
   const lockHandle = await acquireFilesystemLock(locksDir, 'sandbox-write-set.lock', {
     owner: `studio-sandbox-pid-${process.pid}`,
   });
+  let lockHeld = true;
 
   const schemas = { 'sandbox.step': { 1: { type: 'object', additionalProperties: true } } };
   const store = await openStateStore(stateDir, { owner: `studio-sandbox-${process.pid}`, payloadSchemas: schemas });
@@ -362,7 +782,15 @@ export async function runSandboxExercise({ holdLock = true, simulateTimeout = tr
       idempotencyKey: `idem-${tag}-1`,
       payload: { step: 'lock-acquired', timestamp: new Date().toISOString() },
     });
-    await writeSnapshot(store, { stepsCompleted: 1 }, {
+    await appendEvent(store, {
+      eventId: `sbx-${tag}-2`,
+      eventType: 'sandbox.step',
+      payloadSchemaVersion: 1,
+      producer: 'studio.sandbox',
+      idempotencyKey: `idem-${tag}-2`,
+      payload: { step: 'watchdog-probe-completed', timestamp: new Date().toISOString() },
+    });
+    await writeSnapshot(store, { stepsCompleted: 2 }, {
       reducer: prev => ({ stepsCompleted: (prev?.stepsCompleted ?? 0) + 1 }),
       initial: null,
       hostSessionRef: `sbx-${tag}`,
@@ -389,11 +817,20 @@ export async function runSandboxExercise({ holdLock = true, simulateTimeout = tr
       evidencePath: join(runsDir, 'timeout-guard.watchdog.json'),
     });
   }
-  if (!holdLock) await releaseFilesystemLock(lockHandle);
+  if (!holdLock) {
+    await releaseFilesystemLock(lockHandle);
+    lockHeld = false;
+  }
 
   return {
     sandboxRoot: rootDir,
-    releaseLock: holdLock ? () => releaseFilesystemLock(lockHandle) : null,
+    isLockHeld: () => lockHeld,
+    releaseLock: async () => {
+      if (!lockHeld) return false;
+      lockHeld = false;
+      await releaseFilesystemLock(lockHandle);
+      return true;
+    },
     targetEntry: {
       id: 'foundation-live-sandbox',
       title: 'Foundation 实时隔离沙箱演练',
@@ -424,6 +861,7 @@ export async function collectStudioRuntimeView({
   selectedRepoId = null,
   registryPath = STUDIO_RUNTIME_REGISTRY_PATH,
   extraTargets = [],
+  hasActiveSandboxLock = false,
   lockWarnMs = DEFAULT_LOCK_WARN_MS,
   allowedRoots = [],
   workbenchUrl = null,
@@ -441,6 +879,8 @@ export async function collectStudioRuntimeView({
         registryPath: FOUNDATION_RUNTIME_REGISTRY_PATH,
         allowedRoots: [rec.realPath, tmpdir(), ...allowedRoots],
       });
+      const vlockPath = join(rec.realPath, 'artifacts/traceability-version-lock.json');
+      const hasVlock = Boolean(await safeLstat(vlockPath));
       for (const stItem of siblingRegs) {
         if (rec.isPrimary) continue;
         const relToAbs = p => (p && !isAbsolute(p) ? join(rec.realPath, p) : p);
@@ -452,13 +892,21 @@ export async function collectStudioRuntimeView({
           stateDir: relToAbs(stItem.stateDir),
           planPath: relToAbs(stItem.planPath),
           runsDir: relToAbs(stItem.runsDir),
-          lockPaths: (stItem.lockPaths ?? []).map(relToAbs).filter(Boolean),
+          lockPaths: [...(stItem.lockPaths ?? []).map(relToAbs).filter(Boolean), ...(hasVlock ? [vlockPath] : [])],
         });
       }
       const runsDir = join(rec.realPath, '.runs');
       const stateDir = (await safeLstat(join(rec.realPath, '.artifacts/state-store'))) ? join(rec.realPath, '.artifacts/state-store') : undefined;
       if ((await safeLstat(runsDir)) || stateDir) {
-        autoTargets.push({ id: `auto:${rec.id}`, repoId: rec.id, title: `${rec.name} · 默认运行目录`, badge: '自动发现', runsDir, stateDir });
+        autoTargets.push({
+          id: `auto:${rec.id}`,
+          repoId: rec.id,
+          title: `${rec.name} · 默认运行目录`,
+          badge: '自动发现',
+          runsDir: (await safeLstat(runsDir)) ? runsDir : undefined,
+          stateDir,
+          lockPaths: hasVlock ? [vlockPath] : [],
+        });
       }
     }
   }
@@ -482,9 +930,13 @@ export async function collectStudioRuntimeView({
       runsDir: resolveRuntimeTargetPath(base, raw.runsDir, { allowedRoots: effectiveRoots }),
       lockPaths: (raw.lockPaths ?? []).map(p => resolveRuntimeTargetPath(base, p, { allowedRoots: effectiveRoots })).filter(Boolean),
     };
-    let taskSummary = { total: 0, done: 0, percent: 0 };
+    let taskSummary = { format: 'none', total: 0, done: 0, running: 0, blocked: 0, todo: 0, percent: 0, tasks: [], milestones: [] };
     if (resolved.planPath && (await safeLstat(resolved.planPath))?.isFile()) {
-      taskSummary = parsePlanSummary(await readFile(resolved.planPath, 'utf8'), extname(resolved.planPath).toLowerCase());
+      taskSummary = parsePlanSummary(
+        await readFile(resolved.planPath, 'utf8'),
+        extname(resolved.planPath).toLowerCase(),
+        resolved.title,
+      );
     }
     const [stateStore, locks, processes] = await Promise.all([
       inspectStateStoreReadOnly(resolved.stateDir, { lockWarnMs }),
@@ -506,18 +958,38 @@ export async function collectStudioRuntimeView({
 
   const allLocks = inspected.flatMap(t => t.locks);
   const allProcs = inspected.flatMap(t => t.processes);
+  const allTasks = inspected.flatMap(t => t.taskSummary?.tasks ?? []);
   const stores = inspected.map(t => t.stateStore).filter(s => s?.isStateStore);
   const totalEvents = stores.reduce((n, s) => n + s.events.length, 0);
   const counts = Object.fromEntries(PROCESS_STATUSES.map(s => [s, allProcs.filter(p => p.processStatus === s).length]));
 
+  const tTotal = allTasks.length;
+  const tDone = allTasks.filter(t => t.status === 'done').length;
+  const tRunning = allTasks.filter(t => t.status === 'running').length;
+  const tBlocked = allTasks.filter(t => t.status === 'blocked').length;
+  const tTodo = allTasks.filter(t => t.status === 'todo').length;
+
   const kpi = {
     targetsCount: inspected.length,
-    locks: { activeCount: allLocks.filter(l => l.isActive).length, staleWarnCount: allLocks.filter(l => l.isStaleWarning).length },
+    lockWarnMs,
+    tasks: {
+      total: tTotal,
+      done: tDone,
+      running: tRunning,
+      blocked: tBlocked,
+      todo: tTodo,
+      percent: tTotal > 0 ? Math.round((tDone / tTotal) * 100) : 0,
+    },
+    locks: {
+      activeCount: allLocks.filter(l => l.isActive).length,
+      staleWarnCount: allLocks.filter(l => l.isStaleWarning).length,
+      versionLockCount: allLocks.filter(l => l.lockKind === 'version-lock').length,
+    },
     processes: { total: allProcs.length, counts },
     eventChain: {
       storeCount: stores.length,
       totalEvents,
-      integrity: stores.some(s => s.integrity === 'CHAIN_BROKEN') ? 'CHAIN_BROKEN' : stores.length ? (totalEvents ? 'VALID' : 'EMPTY') : 'NO_STORE',
+      integrity: stores.some(s => s.integrity === 'CHAIN_BROKEN') ? 'CHAIN_BROKEN' : (stores.length ? (totalEvents ? 'VALID' : 'EMPTY') : 'NO_STORE'),
     },
   };
 
@@ -531,6 +1003,7 @@ export async function collectStudioRuntimeView({
     foundationVersion: FOUNDATION_PACKAGE_VERSION,
     generatedAt: new Date().toISOString(),
     workbenchUrl,
+    hasActiveSandboxLock: Boolean(hasActiveSandboxLock),
     kpi,
     targets: cleanTargets,
     currentRepoTargets,

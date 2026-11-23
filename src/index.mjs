@@ -1,3 +1,9 @@
+// @feature STU001
+// @feature STU002
+// @feature STU003
+// @feature STU004
+// @feature STU005
+
 export {
   DEFAULT_STUDIO_REVIEWS_PATH,
   LEGACY_WORKBENCH_REVIEWS_PATH,
@@ -31,11 +37,21 @@ export {
   GROUP_LABELS,
   discoverStudioRepos,
   inspectProjectRepo,
+  loadStudioWorkspaceConfig,
   readRepoArchifyAsset,
   readRepoDocument,
   resolveGroupLabel,
   resolveStudioScanRoots,
 } from './ecosystem.mjs';
+
+export {
+  globToRegExp,
+  inspectInternalCodeLocks,
+  inspectPortfolioAllocations,
+  inspectRepoAlignment,
+  inspectUpstreamBindings,
+  sha256FilePrefixed,
+} from './alignment-inspector.mjs';
 
 export {
   STUDIO_GUIDE_MODEL,
@@ -49,6 +65,9 @@ export {
   STUDIO_RUNTIME_REGISTRY_PATH,
   collectStudioRuntimeView,
   loadMergedMonitorTargets,
+  parsePlanSummary,
+  registerMonitorTarget,
+  runSandboxExercise,
 } from './runtime-bridge.mjs';
 
 export {

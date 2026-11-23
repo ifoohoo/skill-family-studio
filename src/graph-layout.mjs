@@ -1,3 +1,5 @@
+// @feature STU001
+
 export const DEFAULT_LAYERS = Object.freeze([
   { id: 'requirements', order: 0, label: '需求与规格' },
   { id: 'product', order: 1, label: '产品与故事' },
@@ -230,17 +232,17 @@ export function pickDefaultArtifactNode(nodes = []) {
   const INACTIVE_RE = /^(?:deprecated|superseded|abandoned|rejected|archived|retired|history|obsolete|done)$/i;
   const ACTIVE_RE = /^(?:active|accepted|approved|current|implemented|verified|released|captured|open)$/i;
   const TYPE_TIER = {
-    prd: 100,
-    requirement: 96,
+    user_story: 100,
+    story: 100,
+    lifecycle: 98,
+    prd: 96,
+    requirement: 94,
     spec: 90,
-    user_story: 84,
-    story: 84,
-    lifecycle: 82,
-    feature: 80,
-    domain_model: 74,
-    design: 70,
-    decision: 64,
-    scenario: 58,
+    scenario: 84,
+    feature: 78,
+    domain_model: 72,
+    decision: 68,
+    design: 64,
   };
   const designPool = nodes.filter(n => n.isDesignNode !== false);
   const pool = designPool.length > 0 ? designPool : nodes;
