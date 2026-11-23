@@ -226,13 +226,6 @@ async function resolveEffectiveCollections(repoReal, studioCfg = null) {
   const auto = [];
   for (const candidate of [
     {
-      id: 'local-lifecycle-stories',
-      kind: 'lifecycle-story-pack',
-      storiesJson: 'local/lifecycle-user-stories/stories.json',
-      explanationsDir: 'local/lifecycle-user-stories/explanations',
-      comparisonMarkdown: 'local/lifecycle-user-stories/replacement-comparison.md',
-    },
-    {
       id: 'standard-stories-pack',
       kind: 'lifecycle-story-pack',
       storiesJson: 'artifacts/stories/stories.json',

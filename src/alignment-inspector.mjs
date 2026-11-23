@@ -129,10 +129,17 @@ async function resolveRelativeRepo(baseRepoReal, relRepoPath, catalog) {
   return null;
 }
 
+function isValidReceiptPayload(recJson) {
+  if (!recJson || typeof recJson !== 'object') return false;
+  if (recJson.ok === false || recJson.valid === false) return false;
+  if (recJson.status === 'failed' || recJson.decision === 'FAIL') return false;
+  return true;
+}
+
 async function inspectDownstreamLockFreshness(targetRepoReal, verifiedReceiptPath = null) {
   if (verifiedReceiptPath) {
     const recJson = await readJsonContainedSafe(targetRepoReal, verifiedReceiptPath);
-    if (recJson && recJson.ok !== false) {
+    if (isValidReceiptPayload(recJson)) {
       return { fresh: true, hasCodeLocks: true, mode: 'receipt', issueCount: 0 };
     }
     return { fresh: false, hasCodeLocks: false, mode: 'receipt_invalid', issueCount: 1 };
@@ -144,17 +151,46 @@ async function inspectDownstreamLockFreshness(targetRepoReal, verifiedReceiptPat
     return { fresh: false, hasCodeLocks: false, mode: 'empty_code_locks', issueCount: 1 };
   }
   let staleCount = 0;
+  let hasFreshImplements = false;
+  let hasFreshVerifies = false;
   for (const lk of locks) {
+    let lockStale = false;
     if (lk?.artifact?.path && lk?.artifact?.contentHash) {
       const h = await sha256FilePrefixed(targetRepoReal, lk.artifact.path);
-      if (h !== lk.artifact.contentHash) staleCount += 1;
+      if (h !== lk.artifact.contentHash) lockStale = true;
     }
     if (lk?.source?.path && lk?.source?.contentHash) {
       const h = await sha256FilePrefixed(targetRepoReal, lk.source.path);
-      if (h !== lk.source.contentHash) staleCount += 1;
+      if (h !== lk.source.contentHash) lockStale = true;
+    }
+    const verifiedBy = Array.isArray(lk?.verifiedBy) ? lk.verifiedBy : [];
+    for (const vb of verifiedBy) {
+      if (vb?.path && vb?.contentHash) {
+        const h = await sha256FilePrefixed(targetRepoReal, vb.path);
+        if (h !== vb.contentHash) lockStale = true;
+      }
+    }
+    if (lockStale) {
+      staleCount += 1;
+      continue;
+    }
+    if (lk?.kind === 'implements') {
+      hasFreshImplements = true;
+      if (verifiedBy.length > 0) hasFreshVerifies = true;
+    } else if (lk?.kind === 'verifies') {
+      hasFreshVerifies = true;
     }
   }
-  return { fresh: staleCount === 0, hasCodeLocks: true, mode: 'code_locks', issueCount: staleCount };
+  const hasCodeLocks = hasFreshImplements && hasFreshVerifies;
+  const missingKinds = (hasFreshImplements ? 0 : 1) + (hasFreshVerifies ? 0 : 1);
+  return {
+    fresh: staleCount === 0 && hasCodeLocks,
+    hasCodeLocks,
+    hasFreshImplements,
+    hasFreshVerifies,
+    mode: hasCodeLocks ? 'code_locks' : 'incomplete_code_locks',
+    issueCount: staleCount + missingKinds,
+  };
 }
 
 export async function inspectInternalCodeLocks(repoReal) {
