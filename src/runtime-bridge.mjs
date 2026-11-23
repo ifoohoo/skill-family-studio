@@ -1156,7 +1156,16 @@ export async function collectStudioRuntimeView({
     };
   }));
 
-  const allLocks = inspected.flatMap(t => t.locks);
+  const seenLockKeys = new Set();
+  const allLocks = [];
+  for (const t of inspected) {
+    for (const l of t.locks || []) {
+      const k = l.path || l.id;
+      if (k && seenLockKeys.has(k)) continue;
+      if (k) seenLockKeys.add(k);
+      allLocks.push(l);
+    }
+  }
   const allProcs = inspected.flatMap(t => t.processes);
   const allTasks = inspected.flatMap(t => t.taskSummary?.tasks ?? []);
   const stores = inspected.map(t => t.stateStore).filter(s => s?.isStateStore);

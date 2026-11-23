@@ -16,9 +16,9 @@
 ## 核心能力
 
 1. **多仓声明式发现与单仓纯净隔离**：单仓默认 `--scan-roots none` 干净聚焦当前仓库；多仓业务域可通过声明式 `.studio-workspace.json`（或 `artifact-graph.config.yaml` 的 `studio` 节）自定义 `scanRoots`、`groupLabels` 与 `lifecycle-story-pack` / `archify-model-scenes` 扩展集合，对任何第三方技能族开箱即用。
-2. **需求进展三列总览、跨仓互跳与就地 `ⓘ` 解释**：高阶规划仓提供「业务处置与承接去向 / 机器派生满足概况 / 阶段与双向健康度」三列一览表；发现 `UPSTREAM_DESIGN_CHANGED`、`DOWNSTREAM_DESIGN_EVOLVED`、`UNALLOCATED_ACTIVE_DEMAND`、`SOURCE_ARTIFACT_MISSING` 或 `UNCLAIMED_IMPLEMENTATION_ENTRY` 等问题时，均可原地悬停或点击 `ⓘ` 查看人话解释，并一键在上下游仓库间跨仓跳转。
-3. **固定坐标宽屏图谱与 JSON 契约分离审阅**：解除 `1440px` 锁宽并采用双主题原生 SVG，点击图上节点时坐标 100% 恒定不跳变；「逐项审阅」按统一角色动线先展示「首要阅读（用户故事 → 需求总纲 → 场景剧本）」，再展示「关联依据」，并将 `.json`/`.yaml` 数据契约独立置底且支持与同源 Markdown 文稿一键互跳；添加未解决批注自动点亮「🔵 审阅中」，零侵入保存在 `.skill-family-studio/reviews.json`。
-4. **多级任务树与跨宿主智能体编队监控（「⚡ 运行监控」）**：默认首页以可折叠「🌳 任务推进树」呈现波次 → 阶段 → 子步骤及前置依赖（`blockedBy`）；新增「🛰️ 会话与子会话编队」脱敏聚合多宿主（Antigravity / Claude Code / Codex / 本地沙箱）的父子会话树、跨泳道委派回报时序与 Markdown/原文简报；底层 `token-lock`、`state-store` 哈希链与 `supervise-process` 收纳进按需「🩺 底层排障与健康诊断」。
+2. **需求进展与双向对齐总览、跨仓互跳与就地 `ⓘ` 解释**：高阶规划仓在「📝 逐项审阅」→「📋 需求进展与双向对齐总览」提供四列双向对齐总览表（需求、业务处置与承接去向、机器派生满足概况、阶段与双向健康度）；发现 `UPSTREAM_DESIGN_CHANGED`、`DOWNSTREAM_DESIGN_EVOLVED`、`UNALLOCATED_ACTIVE_DEMAND`、`SOURCE_ARTIFACT_MISSING` 或 `UNCLAIMED_IMPLEMENTATION_ENTRY` 等问题时，均可原地悬停或点击 `ⓘ` 查看人话解释，并一键在上下游仓库间跨仓跳转。
+3. **固定坐标宽屏图谱与 JSON 契约分离审阅**：取消 `1440px` 锁宽并采用双主题原生 SVG，点击图上节点时坐标 100% 恒定不跳变；「📝 逐项审阅」→「📖 按阅读任务逐篇审阅」按统一角色动线先展示「首要阅读（用户故事 → 需求总纲 → 场景剧本）」，再展示「关联依据」，并将 `.json`/`.yaml` 数据契约独立置底且支持与同源 Markdown 文稿一键互跳；添加未解决批注（`＋ 添加批注（自动转入审阅中）`）自动点亮「🔵 审阅中」，零侵入保存在 `.skill-family-studio/reviews.json`。
+4. **多级任务树与跨宿主智能体编队监控（「⚡ 运行监控」）**：默认首页以可折叠「🌳 任务推进树（默认）」呈现波次 → 阶段 → 子步骤及前置依赖（`blockedBy`）；新增「🛰️ 会话与子会话编队」脱敏聚合多宿主（Antigravity / Claude Code / Codex / 本地沙箱）的父子会话树、跨泳道委派回报时序与 `原文 | Markdown` 任务简报；底层 `token-lock`、`state-store` 哈希链与 `supervise-process` 收纳进「🩺 底层排障与健康诊断」。
 
 ## 环境要求
 

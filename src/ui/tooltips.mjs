@@ -6,7 +6,7 @@ export const GLOSSARY = Object.freeze({
   'role:portfolio': {
     title: '高阶规划仓',
     meaning: '负责总体业务需求拆解、跨仓分配清单（portfolio-allocations.json）与业务全景闭环图的规划仓库。',
-    rule: '在「📝 逐项审阅」中提供三列需求进展总览表，可一键跨仓跳入子项目详设。',
+    rule: '在「📝 逐项审阅」中提供需求进展与双向对齐总览表，可一键跨仓跳入子项目详设。',
   },
   'role:subproject': {
     title: '详设子仓',
@@ -125,6 +125,11 @@ function ensureTooltipBox(doc = document) {
   box.className = 'st-tooltip-popover';
   box.setAttribute('role', 'tooltip');
   box.hidden = true;
+  box.addEventListener('mouseleave', ev => {
+    if (isPinned) return;
+    if (ev.relatedTarget && activeTrigger && activeTrigger.contains(ev.relatedTarget)) return;
+    box.hidden = true;
+  });
   doc.body.append(box);
   return box;
 }

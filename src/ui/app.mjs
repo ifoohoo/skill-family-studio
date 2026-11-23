@@ -49,6 +49,7 @@ const state = {
   selectedAnchor: null,
   archifySelectedNode: null,
   docCache: new Map(),
+  writable: true,
   rtScope: 'repo', // 'repo' | 'workspace'
   rtSelectedTargetId: '__all__',
   rtView: 'tasks', // 'tasks' | 'fleet' | 'diag'
@@ -167,44 +168,136 @@ function closeRepoPopover() {
   if (trig) trig.setAttribute('aria-expanded', 'false');
 }
 
+let toastTimer = null;
+function showStudioToast(message, { tone = 'emerald', actionLabel = null, onAction = null, durationMs = 6000 } = {}) {
+  const host = document.getElementById('st-toast-host');
+  if (!host) return;
+  if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
+  host.replaceChildren();
+  const bar = el('div', null, `st-toast-bar${tone === 'warn' ? ' is-warn' : (tone === 'error' ? ' is-error' : '')}`);
+  const left = el('div', null, 'st-graph-controls');
+  left.append(el('span', message));
+  if (actionLabel && typeof onAction === 'function') {
+    const act = el('button', actionLabel, 'st-btn');
+    act.type = 'button';
+    act.addEventListener('click', async () => {
+      host.replaceChildren();
+      await onAction();
+    });
+    left.append(act);
+  }
+  const closeBtn = el('button', '✕', 'st-btn');
+  closeBtn.type = 'button';
+  closeBtn.style.height = '26px';
+  closeBtn.addEventListener('click', () => host.replaceChildren());
+  bar.append(left, closeBtn);
+  host.append(bar);
+  if (durationMs > 0) {
+    toastTimer = setTimeout(() => { host.replaceChildren(); toastTimer = null; }, durationMs);
+  }
+}
+
+function renderTopContextBars() {
+  const roBar = document.getElementById('st-readonly-bar');
+  if (roBar) {
+    if (!state.writable) {
+      roBar.replaceChildren(el('span', '🔒 当前工作台处于只读浏览模式（--readonly）：审批签收、批注写入与挂载运行源操作已禁用，可正常浏览图谱、检索与查看汇总。'));
+      roBar.hidden = false;
+    } else {
+      roBar.hidden = true;
+    }
+  }
+  const wbBar = document.getElementById('st-welcome-bar');
+  if (!wbBar) return;
+  const dismissed = typeof localStorage !== 'undefined' && localStorage.getItem('st-welcome-dismissed') === '1';
+  if (dismissed || state.tab === 'guide') {
+    wbBar.hidden = true;
+    return;
+  }
+  const curRepo = state.repos.find(r => r.id === state.repoId) || null;
+  const modeTxt = state.repos.length > 1 ? `业务域多仓套组 (${state.repos.length} 仓)` : (state.repos.length === 1 ? '单仓纯净聚焦' : '空工作区');
+  const role = curRepo?.repoRole || 'standalone';
+  const recLabel = !curRepo
+    ? '📖 查看操作手册 →'
+    : ((role === 'portfolio' || role === 'subproject') ? '📋 查看需求进展与双向对齐总览 →' : '▶ 开始按推荐顺序审阅 →');
+  wbBar.replaceChildren();
+  const left = el('div', null, 'st-graph-controls');
+  left.append(
+    el('span', modeTxt, 'st-badge st-badge-indigo'),
+    el('span', curRepo ? `当前定位：${curRepo.name}（${curRepo.repoRoleLabel || '单项目仓'}）` : '当前目录下未发现包含 artifact-graph.config.yaml 的受管仓库'),
+  );
+  const right = el('div', null, 'st-graph-controls');
+  const recBtn = el('button', recLabel, 'st-btn st-btn-primary');
+  recBtn.type = 'button';
+  recBtn.style.height = '28px';
+  recBtn.addEventListener('click', () => {
+    if (!curRepo) switchTab('guide');
+    else if (role === 'portfolio' || role === 'subproject') { state.reviewMode = 'alignment'; switchTab('review'); }
+    else startGuidedReview();
+  });
+  const guideBtn = el('button', '📖 查看操作手册', 'st-btn');
+  guideBtn.type = 'button';
+  guideBtn.style.height = '28px';
+  guideBtn.addEventListener('click', () => switchTab('guide'));
+  const dismissBtn = el('button', '✕', 'st-btn');
+  dismissBtn.type = 'button';
+  dismissBtn.style.height = '28px';
+  dismissBtn.title = '不再显示引导条';
+  dismissBtn.addEventListener('click', () => {
+    try { localStorage.setItem('st-welcome-dismissed', '1'); } catch {}
+    wbBar.hidden = true;
+  });
+  right.append(recBtn, guideBtn, dismissBtn);
+  wbBar.append(left, right);
+  wbBar.hidden = false;
+}
+
 function updateTopbarSummary() {
   const curRepo = state.repos.find(r => r.id === state.repoId);
-  document.getElementById('st-current-repo-name').textContent = curRepo ? curRepo.name : '未发现仓库';
+  document.getElementById('st-current-repo-name').textContent = curRepo ? curRepo.name : '未发现受管仓库';
 
+  const rolePair = document.getElementById('st-role-pair');
   const roleBadge = document.getElementById('st-repo-role-badge');
-  const infoSlot = document.getElementById('st-topbar-info-slot');
-  if (roleBadge && curRepo) {
+  const roleInfoSlot = document.getElementById('st-role-info-slot');
+  if (rolePair && roleBadge && curRepo) {
     const rRole = curRepo.repoRole || 'standalone';
     roleBadge.textContent = curRepo.repoRoleLabel || '单项目仓';
     roleBadge.className = `st-badge ${rRole === 'portfolio' ? 'st-badge-amber' : (rRole === 'subproject' ? 'st-badge-emerald' : 'st-badge-zinc')}`;
-    roleBadge.hidden = false;
-  } else if (roleBadge) {
-    roleBadge.hidden = true;
+    if (roleInfoSlot) roleInfoSlot.replaceChildren(infoTrigger(`role:${rRole}`, document));
+    rolePair.hidden = false;
+  } else if (rolePair) {
+    rolePair.hidden = true;
   }
 
   const lockBadge = document.getElementById('st-repo-lock-badge');
-  if (state.snap?.versionLock) {
+  const lockInfoSlot = document.getElementById('st-lock-info-slot');
+  if (state.repos.length === 0) {
+    lockBadge.textContent = '空工作区';
+    lockBadge.className = 'st-badge st-badge-zinc';
+  } else if (state.snap?.versionLock) {
     lockBadge.textContent = state.snap.versionLock.badgeLabel;
     lockBadge.className = `st-badge st-badge-${state.snap.versionLock.badgeTone || 'zinc'}`;
   } else if (curRepo) {
     lockBadge.textContent = curRepo.versionLockLabel || '待核实';
     lockBadge.className = 'st-badge st-badge-zinc';
   }
-  if (infoSlot && curRepo) {
-    infoSlot.replaceChildren(
-      infoTrigger(`role:${curRepo.repoRole || 'standalone'}`, document),
-      infoTrigger('versionLock', document),
-    );
+  if (lockInfoSlot && state.repos.length > 0) {
+    lockInfoSlot.replaceChildren(infoTrigger('versionLock', document));
+  } else if (lockInfoSlot) {
+    lockInfoSlot.replaceChildren();
   }
+
+  const pText = document.getElementById('st-progress-text');
   if (curRepo) {
     const p = countRepoProgress(curRepo);
-    document.getElementById('st-progress-text').textContent =
-      `审阅进度：已通过 ${p.approved} · 审阅中 ${p.reviewing} · 需修改 ${p.changes} / 共 ${p.total} 项`;
+    pText.textContent =
+      `审阅进度：已通过 ${p.approved} · 审阅中 ${p.reviewing} · 需修改 ${p.changes} · 暂缓 ${p.deferred} / 共 ${p.total} 项`;
+  } else {
+    pText.textContent = '审阅进度：已通过 0 · 审阅中 0 · 需修改 0 · 暂缓 0 / 共 0 项';
   }
-  const capWrap = document.getElementById('st-progress-capsule')?.parentElement;
-  if (capWrap && !capWrap.querySelector('[data-info-key="progressCapsule"]')) {
-    const refBtn = document.getElementById('st-progress-capsule');
-    if (refBtn) refBtn.after(infoTrigger('progressCapsule', document));
+  const progInfoSlot = document.getElementById('st-progress-info-slot');
+  if (progInfoSlot && !progInfoSlot.childElementCount) {
+    progInfoSlot.append(infoTrigger('progressCapsule', document));
   }
 }
 
@@ -279,6 +372,7 @@ function switchTab(nextTab) {
     b.setAttribute('aria-selected', String(active));
   });
   document.querySelectorAll('[data-panel]').forEach(p => { p.hidden = p.dataset.panel !== nextTab; });
+  renderTopContextBars();
   renderActiveTab();
 }
 
@@ -293,14 +387,18 @@ async function jumpToRepoAndItem(targetRepoId, targetUidOrCode, nextTab = 'revie
       || list.find(i => clean.includes(':') && (i.uid === clean || i.code === clean.split(':').slice(1).join(':')));
     if (hit) state.selectedUid = hit.uid;
   }
+  state.reviewCategory = 'all';
+  state.reviewStatusFilter = 'all';
+  state.reviewQuery = '';
   state.selectedAnchor = null;
   state.reviewMode = nextReviewMode;
+  if (typeof window !== 'undefined') window.scrollTo(0, 0);
   switchTab(nextTab);
 }
 
-function findNextUnreviewed(currentUid = state.selectedUid) {
+function findNextPendingHumanItem(currentUid = state.selectedUid) {
   const list = state.snap?.reviewItems ?? [];
-  if (!list.length) return null;
+  if (!list.length) return { item: null, allCompleted: false };
   const humanOnly = list.filter(i => !i.isMachineContract);
   const pool = humanOnly.length > 0 ? humanOnly : list;
   const idx = currentUid ? pool.findIndex(i => i.uid === currentUid) : -1;
@@ -308,14 +406,29 @@ function findNextUnreviewed(currentUid = state.selectedUid) {
   for (const item of ordered) {
     if (item.uid === currentUid && pool.length > 1) continue;
     const eff = getEffectiveStatus(item.target || item.uid);
-    if (eff === 'pending' || eff === 'reviewing') return item;
+    if (eff === 'pending' || eff === 'reviewing') return { item, allCompleted: false };
   }
-  return ordered[0] ?? null;
+  const curItem = pool.find(i => i.uid === currentUid);
+  const curEff = curItem ? getEffectiveStatus(curItem.target || curItem.uid) : null;
+  if (curItem && (curEff === 'pending' || curEff === 'reviewing')) {
+    return { item: curItem, allCompleted: false };
+  }
+  return { item: null, allCompleted: true };
+}
+
+function findNextUnreviewed(currentUid = state.selectedUid) {
+  const { item } = findNextPendingHumanItem(currentUid);
+  if (item) return item;
+  const list = state.snap?.reviewItems ?? [];
+  const humanOnly = list.filter(i => !i.isMachineContract);
+  const pool = humanOnly.length > 0 ? humanOnly : list;
+  return pool[0] ?? null;
 }
 
 function startGuidedReview() {
-  const first = findNextUnreviewed(null);
-  if (first) state.selectedUid = first.uid;
+  const { item, allCompleted } = findNextPendingHumanItem(null);
+  if (item) state.selectedUid = item.uid;
+  else if (allCompleted) showStudioToast('🎉 当前仓库人读审阅项已全部签收完成', { tone: 'emerald' });
   state.reviewMode = 'reader';
   switchTab('review');
 }
@@ -343,37 +456,83 @@ function restoreReviewScroll(snapScroll) {
   });
 }
 
-async function submitDecision(rawTarget, status, note, andAdvance = false) {
+async function submitDecision(rawTarget, status, note, andAdvance = false, undoContext = null) {
+  if (!state.writable) {
+    showStudioToast('当前处于只读模式（--readonly），无法写入审阅结论。', { tone: 'warn' });
+    return;
+  }
   const scrollSnap = andAdvance ? null : captureReviewScroll();
   const payload = { repo: state.repoId, target: rawTarget, status };
   if (note !== undefined) payload.note = note;
-  const res = await apiJson('/api/studio/decisions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  state.decisions = res.decisions || {};
-  if (andAdvance) {
-    const next = findNextUnreviewed(state.selectedUid);
-    if (next) state.selectedUid = next.uid;
+  try {
+    const res = await apiJson('/api/studio/decisions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    state.decisions = res.decisions || {};
+    let finishedAll = false;
+    if (andAdvance) {
+      const { item: nextItem, allCompleted } = findNextPendingHumanItem(state.selectedUid);
+      if (nextItem) state.selectedUid = nextItem.uid;
+      else finishedAll = allCompleted;
+    }
+    updateTopbarSummary();
+    renderActiveTab();
+    restoreReviewScroll(scrollSnap);
+    if (andAdvance && undoContext) {
+      const suffix = finishedAll ? ' · 🎉 当前仓库人读审阅项已全部签收完成' : '';
+      showStudioToast(`✓ 已将「${undoContext.code}」标为已通过${suffix}`, {
+        tone: 'emerald',
+        actionLabel: '撤销并回到该篇',
+        onAction: async () => {
+          await apiJson('/api/studio/decisions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              repo: undoContext.repoId,
+              target: undoContext.prevRawTarget,
+              status: undoContext.prevStatus,
+              note: undoContext.prevNote,
+            }),
+          });
+          await jumpToRepoAndItem(undoContext.repoId, undoContext.prevUid, 'review', 'reader');
+          const fresh = await apiJson('/api/studio/state');
+          state.decisions = fresh.decisions || {};
+          updateTopbarSummary();
+          renderActiveTab();
+        },
+      });
+    }
+  } catch (err) {
+    showStudioToast(`保存审阅结论失败：${err.message}`, { tone: 'error' });
   }
-  updateTopbarSummary();
-  renderActiveTab();
-  restoreReviewScroll(scrollSnap);
 }
 
-async function mutateAnnotation(payload) {
+async function mutateAnnotation(payload, { silentRender = false } = {}) {
+  if (!state.writable) {
+    showStudioToast('当前处于只读模式（--readonly），无法增改批注。', { tone: 'warn' });
+    return false;
+  }
   const scrollSnap = captureReviewScroll();
-  const res = await apiJson('/api/studio/annotations', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ repo: state.repoId, ...payload }),
-  });
-  state.annotations = res.annotations || [];
-  if (res.decisions) state.decisions = res.decisions;
-  updateTopbarSummary();
-  renderActiveTab();
-  restoreReviewScroll(scrollSnap);
+  try {
+    const res = await apiJson('/api/studio/annotations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repo: state.repoId, ...payload }),
+    });
+    state.annotations = res.annotations || [];
+    if (res.decisions) state.decisions = res.decisions;
+    updateTopbarSummary();
+    if (!silentRender) {
+      renderActiveTab();
+      restoreReviewScroll(scrollSnap);
+    }
+    return true;
+  } catch (err) {
+    showStudioToast(`保存批注失败：${err.message}`, { tone: 'error' });
+    return false;
+  }
 }
 
 function resolveCompanionItem(item) {
@@ -417,24 +576,19 @@ async function mountDocumentReader(container, item, options = {}) {
   const rightBtns = el('div', null, 'st-graph-controls');
   const approveNextBtn = el('button', '✓ 通过并审下一项 →', 'st-btn st-btn-emerald');
   approveNextBtn.type = 'button';
-  approveNextBtn.addEventListener('click', () => submitDecision(rawTarget, 'approved', undefined, true));
+  approveNextBtn.disabled = !state.writable;
 
-  const skipNextBtn = el('button', '跳过看下一项 →', 'st-btn');
-  skipNextBtn.type = 'button';
-  skipNextBtn.addEventListener('click', () => {
-    const nxt = findNextUnreviewed(item.uid);
-    if (nxt) { state.selectedUid = nxt.uid; state.selectedAnchor = null; renderActiveTab(); }
-  });
-
-  const widthToggle = el('button', state.proseWidth === 'full' ? '切换舒适行宽' : '铺满全屏阅读', 'st-btn');
-  widthToggle.type = 'button';
-  widthToggle.addEventListener('click', () => {
-    state.proseWidth = state.proseWidth === 'full' ? 'comfort' : 'full';
-    localStorage.setItem('st-prose-width', state.proseWidth);
-    mountDocumentReader(container, item, options);
-  });
-
-  rightBtns.append(approveNextBtn, skipNextBtn, widthToggle);
+  rightBtns.append(approveNextBtn);
+  if (!options.inGraphInspector) {
+    const widthToggle = el('button', state.proseWidth === 'full' ? '恢复舒适行宽' : '放宽行宽', 'st-btn');
+    widthToggle.type = 'button';
+    widthToggle.addEventListener('click', () => {
+      state.proseWidth = state.proseWidth === 'full' ? 'comfort' : 'full';
+      localStorage.setItem('st-prose-width', state.proseWidth);
+      mountDocumentReader(container, item, options);
+    });
+    rightBtns.append(widthToggle);
+  }
   actionBar.append(leftInfo, rightBtns);
   container.append(actionBar);
 
@@ -522,8 +676,91 @@ async function mountDocumentReader(container, item, options = {}) {
   const mainCol = el('div', null, 'st-reader-main');
   const dockCol = el('div', null, 'st-reader-dock');
 
+  let pendingAnchorId = null;
+  const anchorPillBtn = el('button', '', 'st-anchor-pill');
+  anchorPillBtn.type = 'button';
+  anchorPillBtn.hidden = true;
+  const syncAnchorPill = () => {
+    if (pendingAnchorId) {
+      anchorPillBtn.textContent = `批注定位章节：#${pendingAnchorId} ×`;
+      anchorPillBtn.hidden = false;
+    } else {
+      anchorPillBtn.hidden = true;
+    }
+  };
+  anchorPillBtn.addEventListener('click', () => { pendingAnchorId = null; syncAnchorPill(); });
+
+  const guardErrEl = el('div', '', 'st-guard-error');
+  guardErrEl.hidden = true;
+  const showDockError = msg => {
+    guardErrEl.textContent = msg;
+    guardErrEl.hidden = !msg;
+  };
+
   const quickStatusRow = el('div', null, 'st-graph-toolbar');
   const statusGroup = el('div', null, 'st-graph-controls');
+  const noteInput = el('input', null, 'st-input');
+  noteInput.style.maxWidth = '320px';
+  noteInput.placeholder = '审阅结论备注（可选，回车或点状态保存）…';
+  noteInput.value = curDec.note || '';
+  noteInput.disabled = !state.writable;
+
+  const annBox = el('div', null, 'st-ann-box');
+  annBox.append(el('div', `审阅批注（共 ${anns.length} 条，添加未解决批注即自动点亮「🔵 审阅中」；全部解决或清空且未给结论时自动回到「⚪ 待审阅」）`, 'st-muted-xs'));
+  const annInput = el('textarea', null, 'st-textarea');
+  annInput.style.marginTop = '8px';
+  annInput.placeholder = '记录本篇具体修改意见或疑问，点击下方「＋ 添加批注（自动转入审阅中）」立即落盘…';
+  annInput.disabled = !state.writable;
+
+  const flushPendingDraftIfNeeded = async () => {
+    const draft = annInput.value.trim();
+    if (!draft) return false;
+    const saved = await mutateAnnotation(
+      { action: 'create', target: rawTarget, body: draft, ...(pendingAnchorId ? { anchor: pendingAnchorId } : {}) },
+      { silentRender: true },
+    );
+    if (saved) {
+      annInput.value = '';
+      pendingAnchorId = null;
+      syncAnchorPill();
+      showStudioToast('已自动保存未提交的批注草稿并更新状态', { tone: 'emerald' });
+    }
+    return saved;
+  };
+
+  const handleStatusCommit = async (stKey, andAdvance = false) => {
+    if (!state.writable) {
+      showStudioToast('当前处于只读模式（--readonly），无法写入审阅结论。', { tone: 'warn' });
+      return;
+    }
+    showDockError('');
+    if (stKey === 'changes_requested') {
+      const hasUnresolved = getTargetAnnotations(rawTarget).some(a => !a.resolved);
+      if (!hasUnresolved && !noteInput.value.trim() && !annInput.value.trim()) {
+        showDockError('请先写至少一条批注或在上方填写修改原因，再标为「需修改」');
+        annInput.focus();
+        return;
+      }
+    }
+    await flushPendingDraftIfNeeded();
+    if (stKey === 'pending') {
+      noteInput.value = '';
+      await submitDecision(rawTarget, 'pending', '', false, null);
+      return;
+    }
+    const undoContext = andAdvance ? {
+      repoId: state.repoId,
+      prevUid: item.uid,
+      prevRawTarget: rawTarget,
+      prevStatus: curDec.status || 'pending',
+      prevNote: curDec.note || '',
+      code: item.code || item.uid,
+    } : null;
+    await submitDecision(rawTarget, stKey, noteInput.value, andAdvance, undoContext);
+  };
+
+  approveNextBtn.addEventListener('click', () => handleStatusCommit('approved', true));
+
   for (const [stKey, label] of [
     ['approved', '🟢 标为已通过'],
     ['reviewing', '🔵 标为审阅中'],
@@ -533,49 +770,81 @@ async function mountDocumentReader(container, item, options = {}) {
   ]) {
     const b = el('button', label, `st-btn${eff === stKey ? ' is-active' : ''}`);
     b.type = 'button';
-    b.addEventListener('click', () => submitDecision(rawTarget, stKey, noteInput.value));
+    b.disabled = !state.writable;
+    b.addEventListener('click', () => handleStatusCommit(stKey, false));
     statusGroup.append(b, infoTrigger(`status:${stKey}`, document));
   }
-  const noteInput = el('input', null, 'st-input');
-  noteInput.style.maxWidth = '320px';
-  noteInput.placeholder = '审阅结论备注（可选，回车或点状态保存）…';
-  noteInput.value = curDec.note || '';
   noteInput.addEventListener('keydown', e => {
-    if (e.key === 'Enter') submitDecision(rawTarget, curDec.status || eff, noteInput.value);
+    if (e.key === 'Enter') handleStatusCommit(curDec.status || eff, false);
   });
   quickStatusRow.append(statusGroup, noteInput);
+
+  const jumpDockBar = el('div', null, 'st-jump-dock-bar');
+  const jumpDockBtn = el('button', '↓ 跳至批注签收区', 'st-btn');
+  jumpDockBtn.type = 'button';
+  jumpDockBtn.addEventListener('click', () => dockCol.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+  jumpDockBar.append(el('span', '正在长文阅读模式', 'st-muted-xs'), jumpDockBtn);
 
   const proseWrap = el('article', null, 'st-prose-container');
   proseWrap.dataset.proseWidth = state.proseWidth;
   proseWrap.append(el('p', '正在加载制品正文…', 'st-muted-xs'));
 
-  const annBox = el('div', null, 'st-ann-box');
-  annBox.append(el('div', `审阅批注（共 ${anns.length} 条，添加未解决批注即自动点亮「🔵 审阅中」；全部解决或清空且未给结论时自动回到「⚪ 待审阅」）`, 'st-muted-xs'));
-  const annInput = el('textarea', null, 'st-textarea');
-  annInput.style.marginTop = '8px';
-  annInput.placeholder = '记录本篇具体修改意见或疑问，点击下方「添加批注」立即落盘…';
   const addAnnBtn = el('button', '＋ 添加批注（自动转入审阅中）', 'st-btn st-btn-primary');
   addAnnBtn.type = 'button';
   addAnnBtn.style.marginTop = '8px';
-  addAnnBtn.addEventListener('click', () => {
+  addAnnBtn.disabled = !state.writable;
+  addAnnBtn.addEventListener('click', async () => {
+    showDockError('');
     const val = annInput.value.trim();
-    if (!val) return;
-    mutateAnnotation({ action: 'create', target: rawTarget, body: val });
+    if (!val) {
+      showDockError('请先填写批注内容后再提交。');
+      annInput.focus();
+      return;
+    }
+    const ok = await mutateAnnotation({
+      action: 'create',
+      target: rawTarget,
+      body: val,
+      ...(pendingAnchorId ? { anchor: pendingAnchorId } : {}),
+    });
+    if (ok) { pendingAnchorId = null; syncAnchorPill(); }
   });
-  annBox.append(annInput, addAnnBtn);
+  annBox.append(anchorPillBtn, annInput, guardErrEl, addAnnBtn);
 
+  let bodyDivRef = null;
   for (const a of anns) {
     const row = el('div', null, `st-ann-item${a.resolved ? ' is-resolved' : ''}`);
     const head = el('div', null, 'st-repo-opt-head');
+    const headLeft = el('div', null, 'st-graph-controls');
+    headLeft.append(el('span', `${a.resolved ? '✓ 已解决' : '● 待解决'} ·`, 'st-muted-xs'));
+    if (a.anchor) {
+      const ancBtn = el('button', `#${a.anchor}`, 'st-ann-anchor-btn');
+      ancBtn.type = 'button';
+      ancBtn.addEventListener('click', () => {
+        if (!bodyDivRef) return;
+        const targetHeading = bodyDivRef.querySelector(`#${CSS.escape(a.anchor)}`)
+          || [...bodyDivRef.querySelectorAll('.st-prose-heading')].find(h => String(h.id || '').endsWith(`-${a.anchor}`));
+        if (targetHeading) {
+          bodyDivRef.querySelectorAll('.is-anchor-hit').forEach(x => x.classList.remove('is-anchor-hit'));
+          targetHeading.classList.add('is-anchor-hit');
+          targetHeading.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      });
+      headLeft.append(ancBtn);
+    } else {
+      headLeft.append(el('span', '全文批注', 'st-muted-xs'));
+    }
     head.append(
-      el('span', `${a.resolved ? '✓ 已解决' : '● 待解决'} · ${a.anchor ? `#${a.anchor}` : '全文批注'}`, 'st-muted-xs'),
+      headLeft,
       (() => {
         const g = el('div', null, 'st-graph-controls');
         const tBtn = el('button', a.resolved ? '重新打开' : '标为已解决', 'st-btn');
         tBtn.type = 'button';
+        tBtn.disabled = !state.writable;
         tBtn.addEventListener('click', () => mutateAnnotation({ action: 'toggle', id: a.id }));
         const dBtn = el('button', '删除', 'st-btn');
         dBtn.type = 'button';
+        dBtn.disabled = !state.writable;
         dBtn.addEventListener('click', () => mutateAnnotation({ action: 'delete', id: a.id }));
         g.append(tBtn, dBtn);
         return g;
@@ -585,7 +854,7 @@ async function mountDocumentReader(container, item, options = {}) {
     annBox.append(row);
   }
 
-  mainCol.append(proseWrap);
+  mainCol.append(jumpDockBar, proseWrap);
   dockCol.append(quickStatusRow, annBox);
   readerLayout.append(mainCol, dockCol);
   container.append(readerLayout);
@@ -607,6 +876,7 @@ async function mountDocumentReader(container, item, options = {}) {
   h1.style.marginTop = '0';
 
   const bodyDiv = el('div');
+  bodyDivRef = bodyDiv;
   bodyDiv.innerHTML = doc.html || '';
   if (doc.isMachineContract && state.docViewMode === 'raw') {
     bodyDiv.hidden = true;
@@ -622,7 +892,8 @@ async function mountDocumentReader(container, item, options = {}) {
       }
       const anc = e.target.closest('[data-anchor-id]');
       if (anc) {
-        annInput.value = `[#${anc.dataset.anchorId}] ${annInput.value}`;
+        pendingAnchorId = anc.dataset.anchorId || null;
+        syncAnchorPill();
         annInput.focus();
       }
     });
@@ -646,10 +917,22 @@ function triggerGuideAction(actionId) {
     pop.hidden = false;
     trig?.setAttribute('aria-expanded', 'true');
     renderRepoPopover();
+    document.getElementById('st-repo-search')?.focus();
   } else if (actionId === 'go-tab-graph') switchTab('graph');
   else if (actionId === 'go-tab-alignment') { state.reviewMode = 'alignment'; switchTab('review'); }
   else if (actionId === 'start-guided-review') startGuidedReview();
-  else if (actionId === 'go-tab-review') { state.reviewMode = 'reader'; switchTab('review'); }
+  else if (actionId === 'go-tab-cross-doc') {
+    const upBinding = (state.alignment?.upstreamBindings?.bindings || [])[0];
+    const pfDrift = (state.alignment?.portfolio?.items || []).find(i => (i.issues || []).length > 0);
+    if (upBinding) {
+      jumpToRepoAndItem(state.repoId, upBinding.localUid, 'review', 'reader');
+    } else if (pfDrift?.allocations?.[0]?.targetRepoId) {
+      jumpToRepoAndItem(pfDrift.allocations[0].targetRepoId, pfDrift.allocations[0].targetUid, 'review', 'reader');
+    } else {
+      state.reviewMode = 'reader';
+      switchTab('review');
+    }
+  } else if (actionId === 'go-tab-review') { state.reviewMode = 'reader'; switchTab('review'); }
   else if (actionId === 'open-export-drawer') openExportDrawer();
   else if (actionId === 'go-tab-runtime') { state.rtView = 'tasks'; switchTab('runtime'); }
   else if (actionId === 'go-tab-fleet') { state.rtView = 'fleet'; switchTab('runtime'); }
@@ -671,7 +954,7 @@ function renderGuidePanel() {
   const alignQuickBtn = el('button', '📋 查看需求进展与双向对齐总览', 'st-btn');
   alignQuickBtn.type = 'button';
   alignQuickBtn.addEventListener('click', () => triggerGuideAction('go-tab-alignment'));
-  const startBtn = el('button', '▶ 开始按推荐顺序审阅（用户故事 → 需求总纲 → 场景剧本）', 'st-btn st-btn-primary');
+  const startBtn = el('button', '▶ 开始按推荐顺序审阅（故事 → 需求 → 场景）', 'st-btn st-btn-primary');
   startBtn.type = 'button';
   startBtn.addEventListener('click', startGuidedReview);
   bRight.append(alignQuickBtn, startBtn);
@@ -763,11 +1046,24 @@ function renderGuidePanel() {
     const pGrid = el('div', null, 'st-mode-grid');
     for (const page of g.perPageAnatomy) {
       const box = el('div', null, 'st-reading-step');
-      box.append(el('h3', page.page, ''), el('p', `何时看这里：${page.when}`, 'st-muted-xs'));
-      box.firstChild.style.margin = '0 0 4px 0';
+      box.style.display = 'flex';
+      box.style.flexDirection = 'column';
+      box.style.justifyContent = 'space-between';
+      const inner = el('div');
+      inner.append(el('h3', page.page, ''), el('p', `何时看这里：${page.when}`, 'st-muted-xs'));
+      inner.firstChild.style.margin = '0 0 4px 0';
       const ul = el('ul');
       for (const a of page.areas || []) ul.append(el('li', a));
-      box.append(ul);
+      inner.append(ul);
+      box.append(inner);
+      if (page.actionId && page.actionLabel) {
+        const goBtn = el('button', page.actionLabel, 'st-btn st-btn-primary');
+        goBtn.type = 'button';
+        goBtn.style.alignSelf = 'flex-start';
+        goBtn.style.marginTop = '8px';
+        goBtn.addEventListener('click', () => triggerGuideAction(page.actionId));
+        box.append(goBtn);
+      }
       pGrid.append(box);
     }
     pCard.append(pGrid);
@@ -836,6 +1132,24 @@ function renderGuidePanel() {
     driftTbl.append(dHead, dBody);
     diagCard.append(satTbl, driftTbl);
   }
+  if (Array.isArray(g.shortcutsAndGuards) && g.shortcutsAndGuards.length > 0) {
+    diagCard.append(el('h3', '3. 常用操作防呆与快捷键速查', ''));
+    const scTbl = el('table', null, 'st-prose-table');
+    const scHead = el('thead');
+    const scHr = el('tr');
+    scHr.append(el('th', '快捷键 / 触发行为'), el('th', '精确结果与防呆保护'));
+    scHead.append(scHr);
+    const scBody = el('tbody');
+    for (const row of g.shortcutsAndGuards) {
+      const tr = el('tr');
+      const td1 = el('td');
+      td1.append(el('code', row.key));
+      tr.append(td1, el('td', row.desc));
+      scBody.append(tr);
+    }
+    scTbl.append(scHead, scBody);
+    diagCard.append(scTbl);
+  }
   host.append(diagCard);
 
   // 六、高频疑问解答 FAQ & 折叠脚本附录
@@ -853,18 +1167,37 @@ function renderGuidePanel() {
     cliDet.append(el('summary', '附录：脚本自动化 CLI 与 .studio-workspace.json 配置参考（日常由智能体代劳，按需展开）'));
     const cliBody = el('div', null, 'st-details-body');
     cliBody.append(el('pre', [
-      '# 只读探测当前目录角色与推荐启动参数',
+      '# 只读探测当前仓库角色（单仓 / 高阶仓 / 详设子仓）与推荐启动参数',
       'npx skill-family-studio inspect-setup --root /absolute/project/path --json',
       '',
       '# 按单仓或关联套组安全生成 .studio-workspace.json',
       'npx skill-family-studio init-workspace --root /absolute/project/path --mode related',
       '',
-      '# 幂等守护启动或复用单端口控制台',
+      '# 幂等守护启动或复用单端口控制台（若已有实例未收录当前仓，会自动隔离分配空闲端口）',
       'npx skill-family-studio ensure --root /absolute/project/path --port 57630',
       '',
       '# 离线导出设计态、双向对齐与运行态快照',
       'npx skill-family-studio snapshot --root /absolute/project/path',
+      '',
+      '# 核验本地 Node.js 版本、离线前端资产与仓库发现状态',
+      'npx skill-family-studio doctor --root /absolute/project/path',
     ].join('\n'), 'st-code-block'));
+    cliBody.append(
+      el('p', '声明式多仓配置 .studio-workspace.json 示例（可放在高阶规划仓根目录，或等价写入 artifact-graph.config.yaml 顶层 studio 节）：', 'st-muted-xs'),
+      el('pre', [
+        '{',
+        '  "schemaVersion": "1.0",',
+        '  "role": "portfolio",',
+        '  "title": "我的业务域规划工作区",',
+        '  "scanRoots": ["..", "../sub-skills"],',
+        '  "groupLabels": { "my-domain": "业务域技能族" },',
+        '  "collections": [',
+        '    { "id": "domain-stories", "kind": "lifecycle-story-pack", "storiesJson": "artifacts/stories/stories.json", "explanationsDir": "artifacts/stories/explanations" },',
+        '    { "id": "business-diagrams", "kind": "archify-model-scenes", "manifestJson": "artifacts/diagrams/model-and-scenes.json" }',
+        '  ]',
+        '}',
+      ].join('\n'), 'st-code-block'),
+    );
     cliDet.append(cliBody);
     fCard.append(cliDet);
     host.append(fCard);
@@ -879,6 +1212,13 @@ function renderGraphPanel() {
   host.replaceChildren();
   if (graphResizeRafId) { cancelAnimationFrame(graphResizeRafId); graphResizeRafId = 0; }
   if (graphResizeObserver) { graphResizeObserver.disconnect(); graphResizeObserver = null; }
+  if (state.repos.length === 0) {
+    const empty = el('div', null, 'st-card st-guide-section');
+    empty.append(el('h3', '当前工作区未发现受管仓库', ''), el('p', '请从包含 artifact-graph.config.yaml 的技能族目录启动，或在工作区根目录声明 .studio-workspace.json。', 'st-muted-xs'));
+    empty.firstChild.style.marginTop = '0';
+    host.append(empty);
+    return;
+  }
   if (!state.snap) { host.append(el('p', '正在加载仓库制品图谱…', 'st-muted-xs')); return; }
 
   const split = el('div', null, `st-graph-split${state.fullscreenGraph ? ' is-fullscreen' : ''}`);
@@ -939,7 +1279,28 @@ function renderGraphPanel() {
     locatorRight.replaceChildren();
     const curNode = (state.snap.nodes || []).find(n => n.uid === state.selectedUid) || null;
     if (!curNode) {
-      locatorLeft.append(el('span', '当前位置：请点击任意图谱节点查看上下游依赖与正文（节点坐标始终保持恒定）', 'st-muted-xs'));
+      const nonDagItem = (state.snap.reviewItems || []).find(i => i.uid === state.selectedUid);
+      if (nonDagItem) {
+        locatorLeft.append(
+          el('span', '当前位置：', 'st-muted-xs'),
+          el('span', '非图谱附属文稿', 'st-badge st-badge-zinc'),
+          el('strong', `${nonDagItem.code || nonDagItem.uid} · ${nonDagItem.title}`),
+          el('span', '（无 DAG 连线，可在右侧继续阅读签收）', 'st-muted-xs'),
+        );
+      } else {
+        locatorLeft.append(el('span', '当前位置：请点击任意图谱节点查看上下游依赖与正文（节点坐标始终保持恒定）', 'st-muted-xs'));
+      }
+      if (state.fullscreenGraph) {
+        const openSide = el('button', '退出全屏对照右侧正文 →', 'st-btn st-btn-primary');
+        openSide.type = 'button';
+        openSide.addEventListener('click', () => {
+          state.fullscreenGraph = false;
+          split.classList.remove('is-fullscreen');
+          if (fsBtnRef) { fsBtnRef.classList.remove('is-active'); fsBtnRef.textContent = '全屏画布'; }
+          updateLocatorBar();
+        });
+        locatorRight.append(openSide);
+      }
       return;
     }
     const edges = state.snap.edges || [];
@@ -952,6 +1313,9 @@ function renderGraphPanel() {
       el('strong', `${curNode.code} · ${curNode.title}`),
       el('span', `上游 ${upEdges.length} 项 / 下游 ${downEdges.length} 项`, 'st-muted-xs'),
     );
+    if (state.focusSubgraph && upEdges.length === 0 && downEdges.length === 0) {
+      locatorLeft.append(el('span', '当前节点暂无上下游连线', 'st-badge st-badge-amber'));
+    }
     const edgeKinds = [...new Set([...upEdges, ...downEdges].map(e => e.kind))].slice(0, 3);
     for (const ek of edgeKinds) {
       if (['implements', 'verifies', 'covers', 'derives-from'].includes(ek)) {
@@ -959,7 +1323,7 @@ function renderGraphPanel() {
       }
     }
     if (state.fullscreenGraph) {
-      const openSide = el('button', '退出全屏展开右侧正文对照 →', 'st-btn st-btn-primary');
+      const openSide = el('button', '退出全屏对照右侧正文 →', 'st-btn st-btn-primary');
       openSide.type = 'button';
       openSide.addEventListener('click', () => {
         state.fullscreenGraph = false;
@@ -999,6 +1363,7 @@ function renderGraphPanel() {
     const subBtn = mkCtrl('仅看上下游关联子图', state.focusSubgraph, () => {
       state.focusSubgraph = !state.focusSubgraph;
       subBtn.classList.toggle('is-active', state.focusSubgraph);
+      updateLocatorBar();
       paintSvgCanvas();
     });
     const zoomOutBtn = mkCtrl('－', false, () => {
@@ -1019,13 +1384,14 @@ function renderGraphPanel() {
       wrapBtn.classList.add('is-active');
       subBtn.classList.remove('is-active');
       applyZoomInPlace();
+      updateLocatorBar();
       paintSvgCanvas();
     });
-    fsBtnRef = mkCtrl(state.fullscreenGraph ? '退出全屏画布' : '全屏画布', state.fullscreenGraph, () => {
+    fsBtnRef = mkCtrl(state.fullscreenGraph ? '退出全屏' : '全屏画布', state.fullscreenGraph, () => {
       state.fullscreenGraph = !state.fullscreenGraph;
       split.classList.toggle('is-fullscreen', state.fullscreenGraph);
       fsBtnRef.classList.toggle('is-active', state.fullscreenGraph);
-      fsBtnRef.textContent = state.fullscreenGraph ? '退出全屏画布' : '全屏画布';
+      fsBtnRef.textContent = state.fullscreenGraph ? '退出全屏' : '全屏画布';
       updateLocatorBar();
     });
     canvasControls.append(
@@ -1036,14 +1402,18 @@ function renderGraphPanel() {
     );
   } else {
     const totalArch = state.snap.archifyDiagrams.length;
-    const prevArch = el('button', '◀ 上一张', 'st-btn');
-    prevArch.type = 'button';
-    prevArch.disabled = totalArch <= 1;
-    prevArch.addEventListener('click', () => {
-      state.archifyIdx = (state.archifyIdx - 1 + totalArch) % totalArch;
-      syncArchifyDefaultDoc(state.snap.archifyDiagrams[state.archifyIdx]);
-      renderGraphPanel();
-    });
+    const curFig = state.snap.archifyDiagrams[state.archifyIdx];
+    const docMatch = curFig?.docPageId ? resolveStudioItemByPageId(curFig.docPageId) : null;
+    if (totalArch > 1) {
+      const prevArch = el('button', '◀ 上一张', 'st-btn');
+      prevArch.type = 'button';
+      prevArch.addEventListener('click', () => {
+        state.archifyIdx = (state.archifyIdx - 1 + totalArch) % totalArch;
+        syncArchifyDefaultDoc(state.snap.archifyDiagrams[state.archifyIdx]);
+        renderGraphPanel();
+      });
+      canvasControls.append(prevArch);
+    }
     const sel = el('select', null, 'st-select');
     sel.style.width = 'auto';
     state.snap.archifyDiagrams.forEach((d, idx) => {
@@ -1057,24 +1427,31 @@ function renderGraphPanel() {
       syncArchifyDefaultDoc(state.snap.archifyDiagrams[state.archifyIdx]);
       renderGraphPanel();
     });
-    const nextArch = el('button', '下一张 ▶', 'st-btn');
-    nextArch.type = 'button';
-    nextArch.disabled = totalArch <= 1;
-    nextArch.addEventListener('click', () => {
-      state.archifyIdx = (state.archifyIdx + 1) % totalArch;
-      syncArchifyDefaultDoc(state.snap.archifyDiagrams[state.archifyIdx]);
-      renderGraphPanel();
-    });
-    fsBtnRef = el('button', state.fullscreenGraph ? '退出全屏展开' : '全屏展开', `st-btn${state.fullscreenGraph ? ' is-active' : ''}`);
+    canvasControls.append(sel);
+    if (totalArch > 1) {
+      const nextArch = el('button', '下一张 ▶', 'st-btn');
+      nextArch.type = 'button';
+      nextArch.addEventListener('click', () => {
+        state.archifyIdx = (state.archifyIdx + 1) % totalArch;
+        syncArchifyDefaultDoc(state.snap.archifyDiagrams[state.archifyIdx]);
+        renderGraphPanel();
+      });
+      canvasControls.append(nextArch);
+    }
+    if (docMatch) {
+      canvasControls.append(el('span', `关联正文：${docMatch.code || docMatch.title}`, 'st-badge st-badge-zinc'));
+    }
+    canvasControls.append(el('span', '点击节点联动右侧章节', 'st-muted-xs'));
+    fsBtnRef = el('button', state.fullscreenGraph ? '退出全屏' : '全屏画布', `st-btn${state.fullscreenGraph ? ' is-active' : ''}`);
     fsBtnRef.type = 'button';
     fsBtnRef.addEventListener('click', () => {
       state.fullscreenGraph = !state.fullscreenGraph;
       split.classList.toggle('is-fullscreen', state.fullscreenGraph);
       fsBtnRef.classList.toggle('is-active', state.fullscreenGraph);
-      fsBtnRef.textContent = state.fullscreenGraph ? '退出全屏展开' : '全屏展开';
+      fsBtnRef.textContent = state.fullscreenGraph ? '退出全屏' : '全屏画布';
       if (!state.fullscreenGraph) floatBar.hidden = true;
     });
-    canvasControls.append(prevArch, sel, nextArch, fsBtnRef);
+    canvasControls.append(fsBtnRef);
   }
   toolbar.append(modeControls, canvasControls);
   leftCard.append(toolbar);
@@ -1101,19 +1478,20 @@ function renderGraphPanel() {
       mountDocumentReader(rightCard, targetItem, {
         anchorId: state.selectedAnchor,
         archifyContext: state.archifySelectedNode,
+        inGraphInspector: true,
       });
       if (state.fullscreenGraph) {
         floatBar.replaceChildren();
         floatBar.append(
           el('span', `已选中图节点「${nodeLabel || nodeId}」，定位至：${targetItem.code || targetItem.title}${primary?.anchor ? ` #${primary.anchor}` : ''}（共 ${matched.length} 处关联）`),
           (() => {
-            const openBtn = el('button', '展开右侧说明对照 →', 'st-btn st-btn-primary');
+            const openBtn = el('button', '退出全屏对照右侧正文 →', 'st-btn st-btn-primary');
             openBtn.type = 'button';
             openBtn.style.height = '26px';
             openBtn.addEventListener('click', () => {
               state.fullscreenGraph = false;
               split.classList.remove('is-fullscreen');
-              if (fsBtnRef) { fsBtnRef.classList.remove('is-active'); fsBtnRef.textContent = '全屏展开'; }
+              if (fsBtnRef) { fsBtnRef.classList.remove('is-active'); fsBtnRef.textContent = '全屏画布'; }
               floatBar.hidden = true;
             });
             return openBtn;
@@ -1161,7 +1539,7 @@ function renderGraphPanel() {
       updateLocatorBar();
       const nextItem = (state.snap.reviewItems || []).find(i => i.uid === state.selectedUid)
         || (state.snap.nodes || []).find(n => n.uid === state.selectedUid) || null;
-      mountDocumentReader(rightCard, nextItem);
+      mountDocumentReader(rightCard, nextItem, { inGraphInspector: true });
     };
 
     paintSvgCanvas = () => {
@@ -1275,7 +1653,7 @@ function renderGraphPanel() {
 
   const activeItem = (state.snap.reviewItems || []).find(i => i.uid === state.selectedUid)
     || (state.snap.nodes || []).find(n => n.uid === state.selectedUid) || null;
-  mountDocumentReader(rightCard, activeItem);
+  mountDocumentReader(rightCard, activeItem, { inGraphInspector: true });
 
   split.append(leftCard, rightCard);
   host.append(split);
@@ -1298,7 +1676,7 @@ function renderAlignmentOverview(host) {
     headRow.style.padding = '0 0 12px 0';
     const leftTitle = el('div');
     leftTitle.append(
-      el('h2', pf.title || '高阶需求进展与双向对齐三列一览表', ''),
+      el('h2', pf.title || '高阶需求进展与双向对齐总览表', ''),
       el('p', '满足概况完全由下游存在性、摘要互锁与代码/测试双锁机器派生，悬停任意徽章旁的 ⓘ 可查看判定条件；点击下游胶囊直接跨仓跳入子项目详设。', 'st-muted-xs'),
     );
     leftTitle.firstChild.style.margin = '0 0 4px 0';
@@ -1523,6 +1901,13 @@ function renderReviewPanel() {
   const prevSidebar = host.querySelector('.st-review-sidebar');
   const prevSidebarTop = prevSidebar ? prevSidebar.scrollTop : 0;
   host.replaceChildren();
+  if (state.repos.length === 0) {
+    const empty = el('div', null, 'st-card st-guide-section');
+    empty.append(el('h3', '当前工作区未发现受管仓库', ''), el('p', '请从包含 artifact-graph.config.yaml 的技能族目录启动控制台后再进入逐项审阅。', 'st-muted-xs'));
+    empty.firstChild.style.marginTop = '0';
+    host.append(empty);
+    return;
+  }
   if (!state.snap) { host.append(el('p', '正在加载审阅清单…', 'st-muted-xs')); return; }
 
   const totalAlerts = state.alignment?.totalAlerts ?? 0;
@@ -1541,8 +1926,15 @@ function renderReviewPanel() {
   const nextBtn = el('button', '▶ 跳至下一项待审条目 →', 'st-btn st-btn-primary');
   nextBtn.type = 'button';
   nextBtn.addEventListener('click', () => {
-    const nxt = findNextUnreviewed(state.selectedUid);
-    if (nxt) { state.selectedUid = nxt.uid; state.reviewMode = 'reader'; renderReviewPanel(); }
+    const { item: nxt, allCompleted } = findNextPendingHumanItem(state.selectedUid);
+    if (nxt) {
+      state.selectedUid = nxt.uid;
+      state.selectedAnchor = null;
+      state.reviewMode = 'reader';
+      renderReviewPanel();
+    } else if (allCompleted) {
+      showStudioToast('🎉 当前仓库人读审阅项已全部签收完成', { tone: 'emerald' });
+    }
   });
   banner.append(leftControls, nextBtn);
   host.append(banner);
@@ -1590,7 +1982,7 @@ function renderReviewPanel() {
   };
   addCatGroup('primary', '首要阅读（从诉求到进展与行为）', 'catGroup:primary');
   addCatGroup('supporting', '关联依据（领域、架构与测试追溯）', 'catGroup:supporting');
-  addCatGroup('contracts', '结构化数据契约 (.json · 供脚本校验)', 'catGroup:contracts');
+  addCatGroup('contracts', '结构化数据契约 (.json/.yaml · 供脚本校验)', 'catGroup:contracts');
   sidebar.append(catRow);
 
   const statusSel = el('select', null, 'st-select');
@@ -1816,7 +2208,7 @@ function renderTaskTreeView(host, scopedTargets) {
 
   const card = el('div', null, 'st-card st-guide-section');
   if (total === 0) {
-    card.append(el('p', '当前范围内暂无可执行计划（支持含多级标题/缩进复选框的 .md、嵌套 .json 或 .csv）。可点击右上角「▶ 运行隔离沙箱演练」体验 3 层任务树，或「+ 挂载运行源」接入现有计划文件。', 'st-muted-xs'));
+    card.append(el('p', '当前范围内暂无可执行计划（支持含多级标题/缩进复选框的 .md、嵌套 .json 或 .csv）。可点击上方「▶ 运行隔离沙箱演练」体验 3 层任务树，或「+ 挂载运行源」接入现有计划文件。', 'st-muted-xs'));
     host.append(card);
     return;
   }
@@ -1930,9 +2322,25 @@ function renderTaskTreeView(host, scopedTargets) {
   host.append(card);
 }
 
-function renderLockRadarSubpanel(host, scopedTargets, lockWarnMs) {
+function collectUniqueScopedLocks(scopedTargets) {
+  const byKey = new Map();
+  for (const t of scopedTargets || []) {
+    for (const l of t.locks || []) {
+      const key = l.path || l.id || `${t.id}:${l.name}`;
+      if (!byKey.has(key)) {
+        byKey.set(key, { ...l, targetTitles: t.title ? [t.title] : [] });
+      } else {
+        const prev = byKey.get(key);
+        if (t.title && !prev.targetTitles.includes(t.title)) prev.targetTitles.push(t.title);
+      }
+    }
+  }
+  return [...byKey.values()];
+}
+
+function renderLockRadarSubpanel(host, scopedTargets, lockWarnMs, { hasActiveSandboxLock = false, onReleaseSandbox = null } = {}) {
   const card = el('div', null, 'st-card st-guide-section');
-  const allLocks = scopedTargets.flatMap(t => (t.locks || []).map(l => ({ ...l, targetTitle: t.title })));
+  const allLocks = collectUniqueScopedLocks(scopedTargets);
   const activeCount = allLocks.filter(l => l.isActive).length;
 
   const head = el('div', null, 'st-graph-toolbar');
@@ -1947,8 +2355,16 @@ function renderLockRadarSubpanel(host, scopedTargets, lockWarnMs) {
     b.addEventListener('click', () => { state.rtLockFilter = fk; renderRuntimePanel(); });
     filterBtns.append(b);
   }
+  if (hasActiveSandboxLock && typeof onReleaseSandbox === 'function') {
+    const relInlineBtn = el('button', '🔓 释放沙箱锁', 'st-btn st-btn-amber');
+    relInlineBtn.type = 'button';
+    relInlineBtn.disabled = !state.writable;
+    relInlineBtn.addEventListener('click', () => onReleaseSandbox(relInlineBtn));
+    filterBtns.append(relInlineBtn);
+  }
   head.append(left, filterBtns);
   card.append(head);
+  card.append(el('p', '说明：演练产生的模拟排他锁可直接点击「🔓 释放沙箱锁」解除；真实项目磁盘写锁仅供只读监测预警，避免误拆并行智能体的写保护。', 'st-muted-xs'));
 
   const visibleLocks = state.rtLockFilter === 'active' ? allLocks.filter(l => l.isActive) : allLocks;
   if (!visibleLocks.length) {
@@ -1979,6 +2395,7 @@ function renderLockRadarSubpanel(host, scopedTargets, lockWarnMs) {
     timeRow.append(el('span', `获取：${formatIsoShort(lk.acquiredAt)}`, 'st-muted-xs'), durSpan);
 
     lc.append(top, el('div', lk.displayPath || lk.path || '', 'st-muted-xs st-tabular'), metaRow, timeRow);
+    if (lk.targetTitles?.length > 1) lc.append(el('div', `关联监控源：${lk.targetTitles.join(' · ')}`, 'st-muted-xs'));
     if (lk.summary) lc.append(el('div', lk.summary, 'st-muted-xs'));
     grid.append(lc);
   }
@@ -2097,11 +2514,11 @@ function renderProcessSubpanel(host, scopedTargets) {
   host.append(card);
 }
 
-function renderDiagnosticsView(host, scopedTargets, lockWarnMs) {
+function renderDiagnosticsView(host, scopedTargets, lockWarnMs, { hasActiveSandboxLock = false, onReleaseSandbox = null } = {}) {
   const scenarioBanner = el('div', '什么时候看这里：日常看进度与会话协作无需打开本页；仅当任务长时间卡住不动、报排他写锁超时或子进程异常强杀时点开排障。', 'st-scenario-banner');
   host.append(scenarioBanner);
 
-  const allLocks = scopedTargets.flatMap(t => t.locks || []);
+  const allLocks = collectUniqueScopedLocks(scopedTargets);
   const staleLocks = allLocks.filter(l => l.isActive && l.isStaleWarning);
   const brokenChains = scopedTargets.filter(t => t.stateStore?.integrity === 'CHAIN_BROKEN' || t.stateStore?.integrity === 'STALE_HEAD');
   const timedOutProcs = scopedTargets.flatMap(t => t.processes || []).filter(p => p.processStatus === 'TIMED_OUT');
@@ -2116,7 +2533,7 @@ function renderDiagnosticsView(host, scopedTargets, lockWarnMs) {
   );
   host.append(healthBar);
 
-  renderLockRadarSubpanel(host, scopedTargets, lockWarnMs);
+  renderLockRadarSubpanel(host, scopedTargets, lockWarnMs, { hasActiveSandboxLock, onReleaseSandbox });
   renderEventChainSubpanel(host, scopedTargets);
   renderProcessSubpanel(host, scopedTargets);
 
@@ -2129,6 +2546,43 @@ function renderDiagnosticsView(host, scopedTargets, lockWarnMs) {
     secCard.append(buildRuntimeTargetsTable(scopedTargets, document));
   }
   host.append(secCard);
+}
+
+function renderRuntimeScopeToolbar(targetHost, { curRepo, repoTargets, allTargets, scopeBaseTargets }) {
+  const bar = el('div', null, 'st-card st-rt-toolbar');
+  const leftBar = el('div', null, 'st-graph-controls');
+  const scopeSwitch = el('div', null, 'st-view-switch');
+  const bRepo = el('button', `聚焦当前项目 (${curRepo?.name || '当前仓'} · ${repoTargets.length})`, `st-btn${state.rtScope === 'repo' ? ' is-active' : ''}`);
+  bRepo.type = 'button';
+  bRepo.addEventListener('click', () => { state.rtScope = 'repo'; state.rtSelectedTargetId = '__all__'; renderRuntimePanel(); });
+  const bAll = el('button', `全工作区监控源聚合 (${allTargets.length} 源)`, `st-btn${state.rtScope === 'workspace' ? ' is-active' : ''}`);
+  bAll.type = 'button';
+  bAll.addEventListener('click', () => { state.rtScope = 'workspace'; state.rtSelectedTargetId = '__all__'; renderRuntimePanel(); });
+  scopeSwitch.append(bRepo, bAll);
+
+  const srcSelect = el('select', null, 'st-select');
+  srcSelect.style.width = 'auto';
+  const optAll = el('option', `全部范围运行源 (${scopeBaseTargets.length})`);
+  optAll.value = '__all__';
+  srcSelect.append(optAll);
+  for (const t of scopeBaseTargets) {
+    const o = el('option', `${t.title} [${t.badge}]`);
+    o.value = t.id;
+    if (state.rtSelectedTargetId === t.id) o.selected = true;
+    srcSelect.append(o);
+  }
+  srcSelect.addEventListener('change', () => { state.rtSelectedTargetId = srcSelect.value; renderRuntimePanel(); });
+  leftBar.append(scopeSwitch, infoTrigger('rt:scope', document), srcSelect);
+
+  const rightBar = el('div', null, 'st-graph-controls');
+  const mountBtn = el('button', '+ 挂载运行源', 'st-btn');
+  mountBtn.type = 'button';
+  mountBtn.disabled = !state.writable;
+  mountBtn.addEventListener('click', () => openRegisterRuntimeModal(() => renderRuntimePanel()));
+  rightBar.append(mountBtn);
+
+  bar.append(leftBar, rightBar);
+  targetHost.append(bar);
 }
 
 async function renderRuntimePanel() {
@@ -2158,72 +2612,42 @@ async function renderRuntimePanel() {
     ? scopeBaseTargets
     : scopeBaseTargets.filter(t => t.id === state.rtSelectedTargetId);
 
-  // 顶部范围控制与沙箱动作栏
-  const bar = el('div', null, 'st-card st-rt-toolbar');
-  const leftBar = el('div', null, 'st-graph-controls');
-  const scopeSwitch = el('div', null, 'st-view-switch');
-  const bRepo = el('button', `聚焦当前项目 (${curRepo?.name || '当前仓'} · ${repoTargets.length})`, `st-btn${state.rtScope === 'repo' ? ' is-active' : ''}`);
-  bRepo.type = 'button';
-  bRepo.addEventListener('click', () => { state.rtScope = 'repo'; state.rtSelectedTargetId = '__all__'; renderRuntimePanel(); });
-  const bAll = el('button', `全工作区监控源聚合 (${allTargets.length} 源)`, `st-btn${state.rtScope === 'workspace' ? ' is-active' : ''}`);
-  bAll.type = 'button';
-  bAll.addEventListener('click', () => { state.rtScope = 'workspace'; state.rtSelectedTargetId = '__all__'; renderRuntimePanel(); });
-  scopeSwitch.append(bRepo, bAll);
-
-  const srcSelect = el('select', null, 'st-select');
-  srcSelect.style.width = 'auto';
-  const optAll = el('option', `全部范围运行源 (${scopeBaseTargets.length})`);
-  optAll.value = '__all__';
-  srcSelect.append(optAll);
-  for (const t of scopeBaseTargets) {
-    const o = el('option', `${t.title} [${t.badge}]`);
-    o.value = t.id;
-    if (state.rtSelectedTargetId === t.id) o.selected = true;
-    srcSelect.append(o);
-  }
-  srcSelect.addEventListener('change', () => { state.rtSelectedTargetId = srcSelect.value; renderRuntimePanel(); });
-  leftBar.append(scopeSwitch, infoTrigger('rt:scope', document), srcSelect);
-
-  const rightBar = el('div', null, 'st-graph-controls');
-  const ssePill = el('span', null, 'st-live-pill');
-  ssePill.append(el('span', null, 'st-live-dot'), el('span', state.rtSseStatus === 'connected' ? 'SSE 实时同步' : '重连中…'));
-
-  const mountBtn = el('button', '+ 挂载运行源', 'st-btn');
-  mountBtn.type = 'button';
-  mountBtn.addEventListener('click', () => openRegisterRuntimeModal(() => renderRuntimePanel()));
-
-  const sbxBtn = el('button', '▶ 运行隔离沙箱演练', 'st-btn st-btn-primary');
-  sbxBtn.type = 'button';
-  sbxBtn.addEventListener('click', async () => {
-    sbxBtn.disabled = true;
-    sbxBtn.textContent = '演练中…';
-    await apiJson('/api/studio/runtime/sandbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-    renderRuntimePanel();
-  });
-
-  rightBar.append(ssePill, mountBtn, sbxBtn);
-  if (rt.hasActiveSandboxLock) {
-    const relBtn = el('button', '🔓 释放沙箱锁', 'st-btn st-btn-amber');
-    relBtn.type = 'button';
-    relBtn.addEventListener('click', async () => {
-      relBtn.disabled = true;
-      await apiJson('/api/studio/runtime/sandbox/release', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-      renderRuntimePanel();
-    });
-    rightBar.append(relBtn);
-  }
-  bar.append(leftBar, rightBar);
-  host.append(bar);
-
-  // 场景化三大观测视图切换条（废除旧版 A/B/C/D 平铺）
-  const sLocks = scopedTargets.flatMap(t => t.locks || []);
+  const sLocks = collectUniqueScopedLocks(scopedTargets);
   const sActiveLocks = sLocks.filter(l => l.isActive);
   const sWarnCount = sActiveLocks.filter(l => l.isStaleWarning).length
     + scopedTargets.filter(t => t.stateStore?.integrity === 'CHAIN_BROKEN').length
     + scopedTargets.flatMap(t => t.processes || []).filter(p => p.processStatus === 'TIMED_OUT').length;
   const fleetFamCount = state.fleet?.families?.length ?? 0;
 
-  const subBar = el('div', null, 'st-rt-subtabs');
+  const runSandboxWithGuard = async triggerBtn => {
+    const prevTxt = triggerBtn?.textContent;
+    if (triggerBtn) { triggerBtn.disabled = true; triggerBtn.textContent = '演练中…'; }
+    try {
+      await apiJson('/api/studio/runtime/sandbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      renderRuntimePanel();
+    } catch (err) {
+      showStudioToast(`启动沙箱演练失败：${err.message}`, { tone: 'error' });
+    } finally {
+      if (triggerBtn) { triggerBtn.disabled = !state.writable; triggerBtn.textContent = prevTxt || '▶ 运行隔离沙箱演练'; }
+    }
+  };
+
+  const releaseSandboxWithGuard = async triggerBtn => {
+    if (triggerBtn) triggerBtn.disabled = true;
+    try {
+      await apiJson('/api/studio/runtime/sandbox/release', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      showStudioToast('🔓 已释放沙箱排他写锁', { tone: 'emerald' });
+      renderRuntimePanel();
+    } catch (err) {
+      showStudioToast(`释放沙箱锁失败：${err.message}`, { tone: 'error' });
+    } finally {
+      if (triggerBtn) triggerBtn.disabled = !state.writable;
+    }
+  };
+
+  // 一级子视图导航栏（顶层只放子视图切换 + SSE + 沙箱演练/释放）
+  const topNavCard = el('div', null, 'st-card st-rt-subtabs-head');
+  const subBar = el('div', null, 'st-graph-controls');
   for (const [vk, vl, tipKey] of [
     ['tasks', '🌳 任务推进树（默认）', 'rt:view:tasks'],
     ['fleet', `🛰️ 会话与子会话编队 (${fleetFamCount})`, 'rt:view:fleet'],
@@ -2234,13 +2658,33 @@ async function renderRuntimePanel() {
     b.addEventListener('click', () => { state.rtView = vk; renderRuntimePanel(); });
     subBar.append(b, infoTrigger(tipKey, document));
   }
-  host.append(subBar);
+
+  const rightBar = el('div', null, 'st-graph-controls');
+  const ssePill = el('span', null, 'st-live-pill');
+  ssePill.append(el('span', null, 'st-live-dot'), el('span', state.rtSseStatus === 'connected' ? 'SSE 实时同步' : '重连中…'));
+
+  const sbxBtn = el('button', '▶ 运行隔离沙箱演练', 'st-btn st-btn-primary');
+  sbxBtn.type = 'button';
+  sbxBtn.disabled = !state.writable;
+  sbxBtn.addEventListener('click', () => runSandboxWithGuard(sbxBtn));
+
+  rightBar.append(ssePill, sbxBtn);
+  if (rt.hasActiveSandboxLock) {
+    const relBtn = el('button', '🔓 释放沙箱锁', 'st-btn st-btn-amber');
+    relBtn.type = 'button';
+    relBtn.disabled = !state.writable;
+    relBtn.addEventListener('click', () => releaseSandboxWithGuard(relBtn));
+    rightBar.append(relBtn);
+  }
+  topNavCard.append(subBar, rightBar);
+  host.append(topNavCard);
 
   const viewHost = el('div');
   host.append(viewHost);
 
   const lockWarnMs = rt.kpi?.lockWarnMs || 30000;
   if (state.rtView === 'tasks') {
+    renderRuntimeScopeToolbar(viewHost, { curRepo, repoTargets, allTargets, scopeBaseTargets });
     renderTaskTreeView(viewHost, scopedTargets);
   } else if (state.rtView === 'fleet') {
     const paintFleet = () => {
@@ -2254,15 +2698,16 @@ async function renderRuntimePanel() {
           state.fleet = await apiJson('/api/studio/fleet').catch(() => state.fleet);
           paintFleet();
         },
-        onRunSandbox: async () => {
-          await apiJson('/api/studio/runtime/sandbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-          renderRuntimePanel();
-        },
+        onRunSandbox: () => runSandboxWithGuard(sbxBtn),
       });
     };
     paintFleet();
   } else {
-    renderDiagnosticsView(viewHost, scopedTargets, lockWarnMs);
+    renderRuntimeScopeToolbar(viewHost, { curRepo, repoTargets, allTargets, scopeBaseTargets });
+    renderDiagnosticsView(viewHost, scopedTargets, lockWarnMs, {
+      hasActiveSandboxLock: rt.hasActiveSandboxLock,
+      onReleaseSandbox: releaseSandboxWithGuard,
+    });
   }
 
   if (sActiveLocks.length > 0 && state.tab === 'runtime' && state.rtView === 'diag') {
@@ -2308,10 +2753,11 @@ async function selectRepo(repoId, { skipRender = false } = {}) {
   state.alignment = alignData;
   const def = pickDefaultArtifactNode(state.snap.nodes || []) || (state.snap.reviewItems || [])[0] || null;
   state.selectedUid = def ? def.uid : null;
-  if (!skipRender) {
+  if (!skipRender && state.reviewMode !== 'alignment') {
     state.reviewMode = state.alignment?.portfolio?.present ? 'alignment' : 'reader';
   }
   updateTopbarSummary();
+  renderTopContextBars();
   if (!skipRender) renderActiveTab();
 }
 
@@ -2334,15 +2780,23 @@ async function boot() {
     const frame = document.querySelector('.st-archify-frame');
     try { frame?.contentDocument?.documentElement?.setAttribute('data-theme', nxt); } catch {}
   });
-  document.getElementById('st-help-btn').addEventListener('click', () => switchTab('guide'));
   document.getElementById('st-progress-capsule').addEventListener('click', openExportDrawer);
 
   const exportBackdrop = document.getElementById('st-export-backdrop');
   document.getElementById('st-export-close').addEventListener('click', () => { exportBackdrop.hidden = true; });
   exportBackdrop.addEventListener('click', ev => { if (ev.target === exportBackdrop) exportBackdrop.hidden = true; });
 
-  document.getElementById('st-copy-md-btn').addEventListener('click', async () => {
-    await navigator.clipboard?.writeText(document.getElementById('st-export-preview').textContent || '');
+  const copyMdBtn = document.getElementById('st-copy-md-btn');
+  copyMdBtn.addEventListener('click', async () => {
+    const orig = '📋 一键复制 Markdown 验收单';
+    try {
+      await navigator.clipboard?.writeText(document.getElementById('st-export-preview').textContent || '');
+      copyMdBtn.textContent = '✓ 已复制';
+      setTimeout(() => { copyMdBtn.textContent = orig; }, 1500);
+    } catch {
+      copyMdBtn.textContent = '复制受限，请用下方下载';
+      setTimeout(() => { copyMdBtn.textContent = orig; }, 2000);
+    }
   });
 
   const trig = document.getElementById('st-repo-trigger');
@@ -2379,18 +2833,22 @@ async function boot() {
   });
 
   const init = await apiJson('/api/studio/state');
+  state.writable = init.writable !== false;
   state.repos = init.ecosystem?.repos || [];
   state.decisions = init.decisions || {};
   state.annotations = init.annotations || [];
   state.guide = init.guide || null;
 
   const qs = new URLSearchParams(location.search);
-  const visited = localStorage.getItem('st-visited') === '1';
-  localStorage.setItem('st-visited', '1');
-  const initialTab = qs.get('tab') || init.defaultTab || (visited ? 'graph' : 'guide');
   const initialRepo = qs.get('repo') || init.defaultRepo || init.ecosystem?.primaryRepoId || state.repos[0]?.id;
+  const initRole = state.repos.find(r => r.id === initialRepo)?.repoRole || 'standalone';
+  const fallbackTab = state.repos.length === 0
+    ? 'guide'
+    : ((initRole === 'portfolio' || initRole === 'subproject') ? 'review' : 'graph');
+  const initialTab = qs.get('tab') || init.defaultTab || fallbackTab;
 
   if (initialRepo) await selectRepo(initialRepo);
+  else updateTopbarSummary();
   switchTab(initialTab);
 
   let rtRefreshTimer = null;

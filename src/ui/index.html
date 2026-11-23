@@ -17,37 +17,47 @@
             <span aria-hidden="true">▾</span>
           </button>
           <div id="st-repo-popover" class="st-repo-popover" hidden>
-            <input type="search" id="st-repo-search" class="st-input" placeholder="输入仓库名或关键字过滤（按名称、职责或分组筛选仓库）…" aria-label="过滤项目仓库" />
+            <input type="search" id="st-repo-search" class="st-input" placeholder="输入仓库名或关键字过滤…" aria-label="过滤项目仓库" />
             <div id="st-repo-groups"></div>
           </div>
         </div>
-        <span id="st-repo-role-badge" class="st-badge st-badge-zinc" hidden>单项目仓</span>
-        <span id="st-repo-lock-badge" class="st-badge st-badge-zinc">核验中</span>
-        <span id="st-topbar-info-slot" class="st-graph-controls"></span>
+        <span id="st-role-pair" class="st-badge-pair" hidden>
+          <span id="st-repo-role-badge" class="st-badge st-badge-zinc">单项目仓</span>
+          <span id="st-role-info-slot"></span>
+        </span>
+        <span id="st-lock-pair" class="st-badge-pair">
+          <span id="st-repo-lock-badge" class="st-badge st-badge-zinc">核验中</span>
+          <span id="st-lock-info-slot"></span>
+        </span>
       </div>
 
       <nav class="st-topbar-center" aria-label="控制台主模块导航">
         <div class="st-primary-tabs" role="tablist">
           <button type="button" role="tab" class="st-tab-btn" data-tab="guide" aria-selected="false">📖 使用说明</button>
-          <button type="button" role="tab" class="st-tab-btn is-active" data-tab="graph" aria-selected="true">🕸️ 制品图谱</button>
+          <button type="button" role="tab" class="st-tab-btn" data-tab="graph" aria-selected="false">🕸️ 制品图谱</button>
           <button type="button" role="tab" class="st-tab-btn" data-tab="review" aria-selected="false">📝 逐项审阅</button>
           <button type="button" role="tab" class="st-tab-btn" data-tab="runtime" aria-selected="false">⚡ 运行监控</button>
         </div>
       </nav>
 
       <div class="st-topbar-right">
-        <button type="button" id="st-progress-capsule" class="st-progress-capsule" title="点击查看全仓审阅汇总并一键导出验收单">
-          <span id="st-progress-text">审阅进度：已通过 0 · 审阅中 0 · 需修改 0 / 共 0 项</span>
-          <span>导出 ▾</span>
-        </button>
-        <button type="button" id="st-help-btn" class="st-btn" title="随时打开使用说明书">？使用指南</button>
+        <span id="st-progress-pair" class="st-badge-pair">
+          <button type="button" id="st-progress-capsule" class="st-progress-capsule" title="当前项目审阅进度；点击展开全部受管仓库汇总验收单">
+            <span id="st-progress-text">审阅进度：已通过 0 · 审阅中 0 · 需修改 0 · 暂缓 0 / 共 0 项</span>
+            <span>导出 ▾</span>
+          </button>
+          <span id="st-progress-info-slot"></span>
+        </span>
         <button type="button" id="st-theme-btn" class="st-btn" title="切换浅色 / 深色外观">🌓 外观</button>
       </div>
     </header>
 
     <main id="st-main-canvas" class="studio-canvas wb-canvas" role="main">
+      <div id="st-readonly-bar" class="st-readonly-bar" hidden></div>
+      <div id="st-welcome-bar" class="st-welcome-bar" hidden></div>
+      <div id="st-toast-host" class="st-toast-host" aria-live="polite"></div>
       <section id="st-panel-guide" data-panel="guide" hidden></section>
-      <section id="st-panel-graph" data-panel="graph"></section>
+      <section id="st-panel-graph" data-panel="graph" hidden></section>
       <section id="st-panel-review" data-panel="review" hidden></section>
       <section id="st-panel-runtime" data-panel="runtime" hidden></section>
     </main>
@@ -58,7 +68,7 @@
           <h2 id="st-export-title" style="margin:0;font-size:18px;">审阅汇总与验收单导出</h2>
           <button type="button" id="st-export-close" class="st-btn">关闭 ✕</button>
         </div>
-        <p class="st-muted-xs" style="margin:0;">所有结论与批注均保存在 Studio 本地自管台账，100% 不改动任何受审仓库的 Git 跟踪文件。</p>
+        <p class="st-muted-xs" style="margin:0;">顶栏胶囊显示当前项目进度；下方导出汇总当前工作区全部受管仓库的结论与待解决批注，100% 不改动受审仓的 Git 跟踪文件。</p>
         <div style="display:flex;flex-wrap:wrap;gap:8px;">
           <button type="button" id="st-copy-md-btn" class="st-btn st-btn-primary">📋 一键复制 Markdown 验收单</button>
           <a id="st-dl-md-link" href="/api/studio/summary?format=markdown" download="studio-review-summary.md" class="st-btn">⬇ 下载 Markdown 验收单</a>

@@ -193,7 +193,7 @@ export function mountFleetMonitor(host, {
     const emptyCard = mk(doc, 'div', null, 'st-card st-guide-section');
     emptyCard.append(
       mk(doc, 'h3', '🛰️ 暂未探测到包含子会话派生记录的多智能体编队', ''),
-      mk(doc, 'p', '系统已自动只读检索 Antigravity、Claude Code、Codex 会话目录以及 .skill-family-studio/fleet/。你可以点击右上角「▶ 运行隔离沙箱演练」立即预览完整 6 节点多智能体协作编队。', 'st-muted-xs'),
+      mk(doc, 'p', '系统已自动只读检索 Antigravity、Claude Code、Codex 会话目录以及 .skill-family-studio/fleet/。你可以点击上方「▶ 运行隔离沙箱演练」立即预览完整 6 节点多智能体协作编队。', 'st-muted-xs'),
     );
     emptyCard.firstChild.style.marginTop = '0';
     const tryBtn = mk(doc, 'button', '▶ 运行沙箱演练并预览 6 节点多智能体编队', 'st-btn st-btn-primary');
@@ -217,7 +217,6 @@ export function mountFleetMonitor(host, {
   const hLeft = mk(doc, 'div', null, 'st-fleet-head-left');
   const eye = mk(doc, 'div', null, 'st-fleet-eyebrow');
   eye.append(doc.createTextNode(`AGENT 编队 · ${String(activeFam.host || 'local').toUpperCase()}`));
-  if (infoTrigger) eye.append(infoTrigger('rt:sessionRole', doc));
   const titleRow = mk(doc, 'div', null, 'st-fleet-title-row');
   titleRow.append(mk(doc, 'h2', '多智能体会话编队监控', ''));
   titleRow.firstChild.style.margin = '0';
@@ -369,11 +368,23 @@ export function mountFleetMonitor(host, {
   // --- 右列（上：跨会话协作泳道 + 下：协作任务） ---
   const rightStack = mk(doc, 'div', null, 'st-fleet-right-stack');
 
-  // 2A. 跨会话协作泳道
+  // 2A. 跨会话协作泳道（局部重绘，搜索框绝不失焦）
+  const allEvents = activeFam.events || [];
+  const scopedEvents = selectedAgent
+    ? allEvents.filter(e => e.from === selectedAgent.id || e.to === selectedAgent.id)
+    : allEvents;
+  if (!state.rtFleetSelectedEventId && (scopedEvents[0] || allEvents[0])) {
+    state.rtFleetSelectedEventId = (scopedEvents[0] || allEvents[0]).id;
+  }
+
+  let paintLanes = () => {};
+  let paintEvents = () => {};
+  let paintEventDetail = () => {};
+
   const laneCard = mk(doc, 'section', null, 'st-card st-fleet-lane-card');
   const laneHead = mk(doc, 'div', null, 'st-graph-toolbar');
   const laneLeftTitle = mk(doc, 'div', null, 'st-graph-controls');
-  laneLeftTitle.append(mk(doc, 'strong', '🔀 跨会话协作泳道'), mk(doc, 'span', `${(activeFam.events || []).length} 条交互 · ${(activeFam.delegations || []).length} 项委派`, 'st-muted-xs'));
+  laneLeftTitle.append(mk(doc, 'strong', '🔀 跨会话协作泳道'), mk(doc, 'span', `${allEvents.length} 条交互 · ${(activeFam.delegations || []).length} 项委派`, 'st-muted-xs'));
   const laneTools = mk(doc, 'div', null, 'st-graph-controls');
   const laneSearch = mk(doc, 'input', null, 'st-input');
   laneSearch.type = 'search';
@@ -387,112 +398,112 @@ export function mountFleetMonitor(host, {
   laneTools.append(laneSearch, earliestBtn, latestBtn);
   laneHead.append(laneLeftTitle, laneTools);
 
-  const allEvents = activeFam.events || [];
-  const laneQuery = (state.rtFleetAgentQuery || '').trim().toLowerCase();
-  const visibleAgents = agents.filter(a => {
-    if (laneQuery && !`${a.name} ${a.model} ${a.duty}`.toLowerCase().includes(laneQuery)) return false;
-    return true;
-  });
-  const laneIdxMap = new Map(visibleAgents.map((a, idx) => [a.id, idx]));
-  const scopedEvents = selectedAgent
-    ? allEvents.filter(e => e.from === selectedAgent.id || e.to === selectedAgent.id)
-    : allEvents;
-  const shownEvents = scopedEvents.filter(e => laneIdxMap.has(e.from) || laneIdxMap.has(e.to));
-
-  const laneH = 54;
-  const pitch = 38;
-  const trackPad = 26;
-  const trackW = Math.max(360, trackPad * 2 + Math.max(1, shownEvents.length) * pitch);
-  const trackH = Math.max(laneH, visibleAgents.length * laneH);
-
   const laneBody = mk(doc, 'div', null, 'st-fleet-waterfall');
   const laneLabelsCol = mk(doc, 'div', null, 'st-fleet-lane-labels');
-  visibleAgents.forEach(ag => {
-    const hue = hueFor(ag.hueIndex);
-    const isSel = selectedAgent?.id === ag.id;
-    const rowBtn = mk(doc, 'button', null, `st-fleet-lane-label${isSel ? ' is-selected' : ''}`);
-    rowBtn.type = 'button';
-    rowBtn.style.height = `${laneH}px`;
-    const av = mk(doc, 'span', ag.roleShort || '体', 'st-fleet-avatar st-fleet-avatar-sm');
-    av.style.setProperty('--st-fleet-hue', hue);
-    const info = mk(doc, 'div', null, 'st-fleet-lane-copy');
-    info.append(
-      mk(doc, 'div', ag.name, 'st-fleet-lane-name'),
-      mk(doc, 'div', `${fmtTokens(ag.tokens?.total || 0)} · ${ag.steps || 0} 步`, 'st-fleet-lane-meta st-tabular'),
-    );
-    rowBtn.append(av, info);
-    rowBtn.addEventListener('click', () => {
-      state.rtFleetSelectedAgent = state.rtFleetSelectedAgent === ag.id ? null : ag.id;
-      onStateChange();
-    });
-    laneLabelsCol.append(rowBtn);
-  });
-
   const laneScroller = mk(doc, 'div', null, 'st-fleet-lane-scroller');
-  const laneCanvas = mk(doc, 'div', null, 'st-fleet-lane-canvas');
-  laneCanvas.style.width = `${trackW}px`;
-  laneCanvas.style.height = `${trackH}px`;
-
-  const laneSvg = svgEl(doc, 'svg', {
-    class: 'st-fleet-lane-svg',
-    viewBox: `0 0 ${trackW} ${trackH}`,
-    width: trackW,
-    height: trackH,
-  });
-  for (let li = 0; li < visibleAgents.length; li += 1) {
-    const cy = li * laneH + laneH / 2;
-    laneSvg.append(svgEl(doc, 'line', { x1: 0, y1: cy, x2: trackW, y2: cy, class: 'st-fleet-lane-baseline' }));
-  }
-
-  const activeEvent = allEvents.find(e => e.id === state.rtFleetSelectedEventId) || shownEvents[0] || allEvents[0] || null;
-  if (activeEvent) state.rtFleetSelectedEventId = activeEvent.id;
-
-  shownEvents.forEach((ev, idx) => {
-    const cx = trackPad + idx * pitch;
-    const fromIdx = laneIdxMap.get(ev.from);
-    const toIdx = laneIdxMap.get(ev.to);
-    const evColor = ev.kind === 'delegation' ? '#4f46e5' : (ev.kind === 'report' ? '#059669' : '#0284c7');
-    if (fromIdx !== undefined && toIdx !== undefined && fromIdx !== toIdx) {
-      const y1 = fromIdx * laneH + laneH / 2;
-      const y2 = toIdx * laneH + laneH / 2;
-      laneSvg.append(
-        svgEl(doc, 'circle', { cx, cy: y1, r: 4, fill: evColor }),
-        svgEl(doc, 'line', {
-          x1: cx, y1, x2: cx, y2,
-          stroke: evColor,
-          'stroke-width': activeEvent?.id === ev.id ? 3 : 2,
-          'stroke-opacity': activeEvent?.id === ev.id ? 1 : 0.72,
-        }),
-      );
-    }
-    const targetIdx = toIdx !== undefined ? toIdx : (fromIdx ?? 0);
-    const cy = targetIdx * laneH + laneH / 2;
-    const dotBtn = mk(doc, 'button', ev.kind === 'delegation' ? '+' : (ev.kind === 'report' ? '✓' : '·'), `st-fleet-ev-dot${activeEvent?.id === ev.id ? ' is-selected' : ''}`);
-    dotBtn.type = 'button';
-    dotBtn.title = `${ev.kindLabel}：${ev.summary || ''}`;
-    dotBtn.style.left = `${cx}px`;
-    dotBtn.style.top = `${cy}px`;
-    dotBtn.style.borderColor = evColor;
-    dotBtn.style.color = evColor;
-    dotBtn.addEventListener('click', () => {
-      state.rtFleetSelectedEventId = ev.id;
-      onStateChange();
-    });
-    laneCanvas.append(dotBtn);
-  });
-  laneCanvas.prepend(laneSvg);
-  laneScroller.append(laneCanvas);
   laneScroller.addEventListener('scroll', () => {
     laneLabelsCol.style.transform = `translateY(${-laneScroller.scrollTop}px)`;
   });
   earliestBtn.addEventListener('click', () => { laneScroller.scrollLeft = 0; });
   latestBtn.addEventListener('click', () => { laneScroller.scrollLeft = laneScroller.scrollWidth; });
-  laneSearch.addEventListener('input', () => { state.rtFleetAgentQuery = laneSearch.value; onStateChange(); });
+
+  paintLanes = () => {
+    const prevLeft = laneScroller.scrollLeft;
+    const prevTop = laneScroller.scrollTop;
+    laneLabelsCol.replaceChildren();
+    laneScroller.replaceChildren();
+    const laneQuery = (state.rtFleetAgentQuery || '').trim().toLowerCase();
+    const visibleAgents = agents.filter(a => !laneQuery || `${a.name} ${a.model} ${a.duty}`.toLowerCase().includes(laneQuery));
+    const laneIdxMap = new Map(visibleAgents.map((a, idx) => [a.id, idx]));
+    const shownEvents = scopedEvents.filter(e => laneIdxMap.has(e.from) || laneIdxMap.has(e.to));
+
+    const laneH = 54;
+    const pitch = 38;
+    const trackPad = 26;
+    const trackW = Math.max(360, trackPad * 2 + Math.max(1, shownEvents.length) * pitch);
+    const trackH = Math.max(laneH, visibleAgents.length * laneH);
+
+    visibleAgents.forEach(ag => {
+      const hue = hueFor(ag.hueIndex);
+      const isSel = selectedAgent?.id === ag.id;
+      const rowBtn = mk(doc, 'button', null, `st-fleet-lane-label${isSel ? ' is-selected' : ''}`);
+      rowBtn.type = 'button';
+      rowBtn.style.height = `${laneH}px`;
+      const av = mk(doc, 'span', ag.roleShort || '体', 'st-fleet-avatar st-fleet-avatar-sm');
+      av.style.setProperty('--st-fleet-hue', hue);
+      const info = mk(doc, 'div', null, 'st-fleet-lane-copy');
+      info.append(
+        mk(doc, 'div', ag.name, 'st-fleet-lane-name'),
+        mk(doc, 'div', `${fmtTokens(ag.tokens?.total || 0)} · ${ag.steps || 0} 步`, 'st-fleet-lane-meta st-tabular'),
+      );
+      rowBtn.append(av, info);
+      rowBtn.addEventListener('click', () => {
+        state.rtFleetSelectedAgent = state.rtFleetSelectedAgent === ag.id ? null : ag.id;
+        onStateChange();
+      });
+      laneLabelsCol.append(rowBtn);
+    });
+
+    const laneCanvas = mk(doc, 'div', null, 'st-fleet-lane-canvas');
+    laneCanvas.style.width = `${trackW}px`;
+    laneCanvas.style.height = `${trackH}px`;
+    const laneSvg = svgEl(doc, 'svg', {
+      class: 'st-fleet-lane-svg',
+      viewBox: `0 0 ${trackW} ${trackH}`,
+      width: trackW,
+      height: trackH,
+    });
+    for (let li = 0; li < visibleAgents.length; li += 1) {
+      const cy = li * laneH + laneH / 2;
+      laneSvg.append(svgEl(doc, 'line', { x1: 0, y1: cy, x2: trackW, y2: cy, class: 'st-fleet-lane-baseline' }));
+    }
+    const activeEvent = allEvents.find(e => e.id === state.rtFleetSelectedEventId) || shownEvents[0] || allEvents[0] || null;
+    shownEvents.forEach((ev, idx) => {
+      const cx = trackPad + idx * pitch;
+      const fromIdx = laneIdxMap.get(ev.from);
+      const toIdx = laneIdxMap.get(ev.to);
+      const evColor = ev.kind === 'delegation' ? '#4f46e5' : (ev.kind === 'report' ? '#059669' : '#0284c7');
+      if (fromIdx !== undefined && toIdx !== undefined && fromIdx !== toIdx) {
+        const y1 = fromIdx * laneH + laneH / 2;
+        const y2 = toIdx * laneH + laneH / 2;
+        laneSvg.append(
+          svgEl(doc, 'circle', { cx, cy: y1, r: 4, fill: evColor }),
+          svgEl(doc, 'line', {
+            x1: cx, y1, x2: cx, y2,
+            stroke: evColor,
+            'stroke-width': activeEvent?.id === ev.id ? 3 : 2,
+            'stroke-opacity': activeEvent?.id === ev.id ? 1 : 0.72,
+          }),
+        );
+      }
+      const targetIdx = toIdx !== undefined ? toIdx : (fromIdx ?? 0);
+      const cy = targetIdx * laneH + laneH / 2;
+      const dotBtn = mk(doc, 'button', ev.kind === 'delegation' ? '+' : (ev.kind === 'report' ? '✓' : '·'), `st-fleet-ev-dot${activeEvent?.id === ev.id ? ' is-selected' : ''}`);
+      dotBtn.type = 'button';
+      dotBtn.title = `${ev.kindLabel}：${ev.summary || ''}`;
+      dotBtn.style.left = `${cx}px`;
+      dotBtn.style.top = `${cy}px`;
+      dotBtn.style.borderColor = evColor;
+      dotBtn.style.color = evColor;
+      dotBtn.addEventListener('click', () => {
+        state.rtFleetSelectedEventId = ev.id;
+        paintLanes();
+        paintEvents();
+      });
+      laneCanvas.append(dotBtn);
+    });
+    laneCanvas.prepend(laneSvg);
+    laneScroller.append(laneCanvas);
+    laneScroller.scrollLeft = prevLeft;
+    laneScroller.scrollTop = prevTop;
+  };
+  laneSearch.addEventListener('input', () => { state.rtFleetAgentQuery = laneSearch.value; paintLanes(); });
+  paintLanes();
 
   laneBody.append(laneLabelsCol, laneScroller);
   laneCard.append(laneHead, laneBody);
 
-  // 2B. 协作任务（委派工作项卡片）
+  // 2B. 协作任务（委派工作项卡片，局部重绘状态过滤）
   const workCard = mk(doc, 'section', null, 'st-card st-fleet-work-card');
   const workHead = mk(doc, 'div', null, 'st-graph-toolbar');
   const delegations = activeFam.delegations || [];
@@ -509,17 +520,17 @@ export function mountFleetMonitor(host, {
     pending: scopedDelegations.filter(d => d.status === 'pending').length,
     completed: scopedDelegations.filter(d => d.status === 'completed').length,
   };
-  for (const [pk, pl] of [['all', '全部'], ['in_progress', '运行中'], ['pending', '待处理'], ['completed', '已完成']]) {
-    const b = mk(doc, 'button', `${pl} ${phaseCounts[pk]}`, `st-btn${(state.rtFleetTaskPhase || 'all') === pk ? ' is-active' : ''}`);
-    b.type = 'button';
-    b.addEventListener('click', () => { state.rtFleetTaskPhase = pk; onStateChange(); });
-    workFilters.append(b);
-  }
   const workList = mk(doc, 'div', null, 'st-fleet-work-list');
-  const filteredDelegations = scopedDelegations.filter(d => (state.rtFleetTaskPhase || 'all') === 'all' || d.status === state.rtFleetTaskPhase);
-  if (!filteredDelegations.length) {
-    workList.append(mk(doc, 'p', '当前筛选条件下无委派工作项。', 'st-muted-xs'));
-  } else {
+  const paintWorkList = () => {
+    workFilters.querySelectorAll('.st-btn').forEach(btn => {
+      btn.classList.toggle('is-active', btn.dataset.phase === (state.rtFleetTaskPhase || 'all'));
+    });
+    workList.replaceChildren();
+    const filteredDelegations = scopedDelegations.filter(d => (state.rtFleetTaskPhase || 'all') === 'all' || d.status === state.rtFleetTaskPhase);
+    if (!filteredDelegations.length) {
+      workList.append(mk(doc, 'p', '当前筛选条件下无委派工作项。', 'st-muted-xs'));
+      return;
+    }
     for (const d of filteredDelegations) {
       const toAg = agentMap.get(d.to);
       const hue = hueFor(toAg?.hueIndex ?? 1);
@@ -536,42 +547,48 @@ export function mountFleetMonitor(host, {
       itemBox.append(top, prev);
       itemBox.addEventListener('click', () => {
         const hitEv = allEvents.find(e => e.kind === 'delegation' && e.to === d.to && e.from === d.from);
-        if (hitEv) { state.rtFleetSelectedEventId = hitEv.id; onStateChange(); }
+        if (hitEv) {
+          state.rtFleetSelectedEventId = hitEv.id;
+          paintLanes();
+          paintEvents();
+        }
       });
       workList.append(itemBox);
     }
+  };
+  for (const [pk, pl] of [['all', '全部'], ['in_progress', '运行中'], ['pending', '待处理'], ['completed', '已完成']]) {
+    const b = mk(doc, 'button', `${pl} ${phaseCounts[pk]}`, `st-btn${(state.rtFleetTaskPhase || 'all') === pk ? ' is-active' : ''}`);
+    b.type = 'button';
+    b.dataset.phase = pk;
+    b.addEventListener('click', () => { state.rtFleetTaskPhase = pk; paintWorkList(); });
+    workFilters.append(b);
   }
+  paintWorkList();
   workCard.append(workHead, workFilters, workList);
 
   rightStack.append(laneCard, workCard);
   mainGrid.append(netCard, rightStack);
   host.append(mainGrid);
 
-  // 3. 底部全宽「事件检查」左右分栏详情器
+  // 3. 底部全宽「事件检查」左右分栏详情器（局部重绘，搜索框绝不失焦）
   const inspCard = mk(doc, 'section', null, 'st-card st-fleet-inspector-card');
   const inspHead = mk(doc, 'div', null, 'st-graph-toolbar');
-  const evKind = state.rtFleetEventKind || 'all';
-  const evQuery = (state.rtFleetEventQuery || '').trim().toLowerCase();
-  const baseEvs = scopedEvents;
   const kindCounts = {
-    all: baseEvs.length,
-    message: baseEvs.filter(e => e.kind === 'message').length,
-    report: baseEvs.filter(e => e.kind === 'report').length,
-    delegation: baseEvs.filter(e => e.kind === 'delegation').length,
+    all: scopedEvents.length,
+    message: scopedEvents.filter(e => e.kind === 'message').length,
+    report: scopedEvents.filter(e => e.kind === 'report').length,
+    delegation: scopedEvents.filter(e => e.kind === 'delegation').length,
   };
-  const filteredEvs = baseEvs.filter(e => {
-    if (evKind !== 'all' && e.kind !== evKind) return false;
-    if (evQuery && !`${e.summary} ${e.body} ${e.duty} ${agentMap.get(e.from)?.name || ''} ${agentMap.get(e.to)?.name || ''}`.toLowerCase().includes(evQuery)) return false;
-    return true;
-  });
 
   const inspLeftHead = mk(doc, 'div', null, 'st-graph-controls');
-  inspLeftHead.append(mk(doc, 'strong', '🔎 事件检查'), mk(doc, 'span', `显示 ${filteredEvs.length} / ${baseEvs.length} 条`, 'st-muted-xs'));
+  const inspCountSpan = mk(doc, 'span', '', 'st-muted-xs');
+  inspLeftHead.append(mk(doc, 'strong', '🔎 事件检查'), inspCountSpan);
   const inspTools = mk(doc, 'div', null, 'st-graph-controls');
   for (const [ek, elLbl] of [['all', '全部'], ['message', '消息'], ['report', '回报'], ['delegation', '委派']]) {
-    const b = mk(doc, 'button', `${elLbl} ${kindCounts[ek]}`, `st-btn${evKind === ek ? ' is-active' : ''}`);
+    const b = mk(doc, 'button', `${elLbl} ${kindCounts[ek]}`, `st-btn${(state.rtFleetEventKind || 'all') === ek ? ' is-active' : ''}`);
     b.type = 'button';
-    b.addEventListener('click', () => { state.rtFleetEventKind = ek; onStateChange(); });
+    b.dataset.evKind = ek;
+    b.addEventListener('click', () => { state.rtFleetEventKind = ek; paintEvents(); });
     inspTools.append(b);
   }
   const evSearchInp = mk(doc, 'input', null, 'st-input');
@@ -579,37 +596,19 @@ export function mountFleetMonitor(host, {
   evSearchInp.style.width = '180px';
   evSearchInp.placeholder = '搜索事件内容…';
   evSearchInp.value = state.rtFleetEventQuery || '';
-  evSearchInp.addEventListener('input', () => { state.rtFleetEventQuery = evSearchInp.value; onStateChange(); });
   inspTools.append(evSearchInp);
   inspHead.append(inspLeftHead, inspTools);
 
   const inspSplit = mk(doc, 'div', null, 'st-fleet-insp-split');
   const evListCol = mk(doc, 'div', null, 'st-fleet-ev-list');
-  const curEv = filteredEvs.find(e => e.id === state.rtFleetSelectedEventId) || filteredEvs[0] || null;
-
-  if (!filteredEvs.length) {
-    evListCol.append(mk(doc, 'p', '当前筛选条件下暂无交互事件。', 'st-muted-xs'));
-  } else {
-    for (const ev of filteredEvs) {
-      const fromAg = agentMap.get(ev.from);
-      const toAg = agentMap.get(ev.to);
-      const row = mk(doc, 'button', null, `st-fleet-ev-row${curEv?.id === ev.id ? ' is-selected' : ''}`);
-      row.type = 'button';
-      const rTop = mk(doc, 'div', null, 'st-repo-opt-head');
-      rTop.append(
-        mk(doc, 'span', `${fmtTimeShort(ev.time)} · ${fromAg?.name || ev.from} → ${toAg?.name || ev.to}`, 'st-muted-xs'),
-        mk(doc, 'span', ev.kindLabel || ev.kind, `st-badge ${ev.kind === 'report' ? 'st-badge-emerald' : (ev.kind === 'delegation' ? 'st-badge-amber' : 'st-badge-indigo')}`),
-      );
-      row.append(rTop, mk(doc, 'div', ev.summary || ev.duty || '—', 'st-fleet-ev-preview'));
-      row.addEventListener('click', () => { state.rtFleetSelectedEventId = ev.id; onStateChange(); });
-      evListCol.append(row);
-    }
-  }
-
   const evDetailCol = mk(doc, 'div', null, 'st-fleet-ev-detail');
-  if (!curEv) {
-    evDetailCol.append(mk(doc, 'p', '点击左侧任意事件查看完整委派路由与简报内容。', 'st-muted-xs'));
-  } else {
+
+  paintEventDetail = curEv => {
+    evDetailCol.replaceChildren();
+    if (!curEv) {
+      evDetailCol.append(mk(doc, 'p', '点击左侧任意事件查看完整委派路由与简报内容。', 'st-muted-xs'));
+      return;
+    }
     const fromAg = agentMap.get(curEv.from);
     const toAg = agentMap.get(curEv.to);
     const dMeta = mk(doc, 'div', null, 'st-repo-opt-head');
@@ -652,16 +651,21 @@ export function mountFleetMonitor(host, {
     const isRich = state.rtFleetRichMode !== false;
     const rawBtn = mk(doc, 'button', '原文', `st-btn${!isRich ? ' is-active' : ''}`);
     rawBtn.type = 'button';
-    rawBtn.addEventListener('click', () => { state.rtFleetRichMode = false; onStateChange(); });
+    rawBtn.addEventListener('click', () => { state.rtFleetRichMode = false; paintEventDetail(curEv); });
     const mdBtn = mk(doc, 'button', 'Markdown', `st-btn${isRich ? ' is-active' : ''}`);
     mdBtn.type = 'button';
-    mdBtn.addEventListener('click', () => { state.rtFleetRichMode = true; onStateChange(); });
+    mdBtn.addEventListener('click', () => { state.rtFleetRichMode = true; paintEventDetail(curEv); });
     const copyBtn = mk(doc, 'button', '📋 复制', 'st-btn');
     copyBtn.type = 'button';
     copyBtn.addEventListener('click', async () => {
-      await navigator.clipboard?.writeText(curEv.body || '');
-      copyBtn.textContent = '✓ 已复制';
-      setTimeout(() => { copyBtn.textContent = '📋 复制'; }, 1200);
+      try {
+        await navigator.clipboard?.writeText(curEv.body || '');
+        copyBtn.textContent = '✓ 已复制';
+        setTimeout(() => { copyBtn.textContent = '📋 复制'; }, 1200);
+      } catch {
+        copyBtn.textContent = '复制受限';
+        setTimeout(() => { copyBtn.textContent = '📋 复制'; }, 1500);
+      }
     });
     modeTools.append(rawBtn, mdBtn, copyBtn);
     bodyHead.append(modeTools);
@@ -670,7 +674,54 @@ export function mountFleetMonitor(host, {
     if (isRich) bodyBox.append(renderSafeMarkdownToDom(curEv.body || '', doc));
     else bodyBox.append(mk(doc, 'pre', curEv.body || '（暂无内容）', 'st-code-block'));
     evDetailCol.append(bodyHead, bodyBox);
-  }
+  };
+
+  paintEvents = () => {
+    const evKind = state.rtFleetEventKind || 'all';
+    const evQuery = (state.rtFleetEventQuery || '').trim().toLowerCase();
+    inspTools.querySelectorAll('[data-ev-kind]').forEach(btn => {
+      btn.classList.toggle('is-active', btn.dataset.evKind === evKind);
+    });
+    const filteredEvs = scopedEvents.filter(e => {
+      if (evKind !== 'all' && e.kind !== evKind) return false;
+      if (evQuery && !`${e.summary} ${e.body} ${e.duty} ${agentMap.get(e.from)?.name || ''} ${agentMap.get(e.to)?.name || ''}`.toLowerCase().includes(evQuery)) return false;
+      return true;
+    });
+    inspCountSpan.textContent = `显示 ${filteredEvs.length} / ${scopedEvents.length} 条`;
+
+    const curEv = filteredEvs.find(e => e.id === state.rtFleetSelectedEventId) || filteredEvs[0] || null;
+    if (curEv) state.rtFleetSelectedEventId = curEv.id;
+
+    const prevListTop = evListCol.scrollTop;
+    evListCol.replaceChildren();
+    if (!filteredEvs.length) {
+      evListCol.append(mk(doc, 'p', '当前筛选条件下暂无交互事件。', 'st-muted-xs'));
+    } else {
+      for (const ev of filteredEvs) {
+        const fromAg = agentMap.get(ev.from);
+        const toAg = agentMap.get(ev.to);
+        const row = mk(doc, 'button', null, `st-fleet-ev-row${curEv?.id === ev.id ? ' is-selected' : ''}`);
+        row.type = 'button';
+        const rTop = mk(doc, 'div', null, 'st-repo-opt-head');
+        rTop.append(
+          mk(doc, 'span', `${fmtTimeShort(ev.time)} · ${fromAg?.name || ev.from} → ${toAg?.name || ev.to}`, 'st-muted-xs'),
+          mk(doc, 'span', ev.kindLabel || ev.kind, `st-badge ${ev.kind === 'report' ? 'st-badge-emerald' : (ev.kind === 'delegation' ? 'st-badge-amber' : 'st-badge-indigo')}`),
+        );
+        row.append(rTop, mk(doc, 'div', ev.summary || ev.duty || '—', 'st-fleet-ev-preview'));
+        row.addEventListener('click', () => {
+          state.rtFleetSelectedEventId = ev.id;
+          paintLanes();
+          paintEvents();
+        });
+        evListCol.append(row);
+      }
+    }
+    evListCol.scrollTop = prevListTop;
+    paintEventDetail(curEv);
+  };
+
+  evSearchInp.addEventListener('input', () => { state.rtFleetEventQuery = evSearchInp.value; paintEvents(); });
+  paintEvents();
 
   inspSplit.append(evListCol, evDetailCol);
   inspCard.append(inspHead, inspSplit);
