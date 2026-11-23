@@ -7,7 +7,7 @@
 import { computeAdaptiveGraphLayout, pickDefaultArtifactNode } from '../graph-layout.mjs';
 import { buildReviewStatusFlowSvg, buildTriLayerLockSvg } from './diagram-svg.mjs';
 import { mountFleetMonitor } from './fleet-ui.mjs';
-import { closeGlobalTooltip, GLOSSARY, infoTrigger, initTooltipManager, isTooltipOpen } from './tooltips.mjs';
+import { closeGlobalTooltip, GLOSSARY, infoTrigger, initTooltipManager, isTooltipOpen, renderEntityBrief, thWithInfo } from './tooltips.mjs';
 
 const STATUS_META = {
   pending: { label: '待审阅', badge: 'st-badge st-badge-zinc', dot: '⚪', color: '#64748b' },
@@ -35,6 +35,7 @@ const state = {
   reviewCategory: 'all',
   reviewStatusFilter: 'all',
   reviewQuery: '',
+  reviewManualToggles: new Map(),
   docViewMode: 'summary', // 'summary' | 'raw'
   graphMode: 'dag',
   archifyIdx: 0,
@@ -51,10 +52,15 @@ const state = {
   rtScope: 'repo', // 'repo' | 'workspace'
   rtSelectedTargetId: '__all__',
   rtView: 'tasks', // 'tasks' | 'fleet' | 'diag'
+  rtSelectedPlanId: null,
+  rtPlanFilter: 'all', // 'all' | 'in_progress' | 'completed'
+  rtPlanQuery: '',
   rtTaskFilter: 'all', // 'all' | 'incomplete' | 'focus'
   rtTaskQuery: '',
   rtCollapsedTreeIds: new Set(),
   rtFleetFamilyId: null,
+  rtFleetHostFilter: 'all',
+  rtFleetPickerQuery: '',
   rtFleetSelectedAgent: null,
   rtFleetSelectedEventId: null,
   rtFleetEventKind: 'all',
@@ -207,7 +213,10 @@ function renderTopContextBars() {
 
 function updateTopbarSummary() {
   const curRepo = state.repos.find(r => r.id === state.repoId);
-  document.getElementById('st-current-repo-name').textContent = curRepo ? curRepo.name : '未发现受管仓库';
+  document.getElementById('st-current-repo-name').textContent = curRepo ? (curRepo.displayName || curRepo.name) : '未发现受管仓库';
+
+  const editMetaBtn = document.getElementById('st-edit-repo-meta-btn');
+  if (editMetaBtn) editMetaBtn.hidden = !curRepo;
 
   const rolePair = document.getElementById('st-role-pair');
   const roleBadge = document.getElementById('st-repo-role-badge');
@@ -254,43 +263,286 @@ function updateTopbarSummary() {
   }
 }
 
+async function applyEcosystemUpdate(nextEco, preferRepoId = null) {
+  state.repos = nextEco?.repos || [];
+  const keepId = preferRepoId && state.repos.some(r => r.id === preferRepoId)
+    ? preferRepoId
+    : (state.repos.some(r => r.id === state.repoId) ? state.repoId : (nextEco?.primaryRepoId || state.repos[0]?.id || null));
+  if (keepId) await selectRepo(keepId, { skipRender: true });
+  else {
+    state.repoId = null;
+    state.snap = null;
+    state.alignment = null;
+    updateTopbarSummary();
+  }
+  renderActiveTab();
+}
+
+function openAddRepoModal() {
+  if (!state.writable) {
+    showStudioToast('当前处于只读模式（--readonly），无法添加本地项目。', { tone: 'warn' });
+    return;
+  }
+  closeRepoPopover();
+  document.getElementById('st-repo-modal')?.remove();
+  const backdrop = el('div', null, 'st-modal-backdrop');
+  backdrop.id = 'st-repo-modal';
+  const modal = el('div', null, 'st-card st-modal');
+  const head = el('div', null, 'st-repo-opt-head');
+  head.append(el('h3', '＋ 添加受管本地项目', ''), (() => {
+    const x = el('button', '✕', 'st-btn');
+    x.type = 'button';
+    x.addEventListener('click', () => backdrop.remove());
+    return x;
+  })());
+  head.firstChild.style.margin = '0';
+
+  const desc = el('p', '输入包含 artifact-graph.config.yaml 的本地仓库目录路径（相对当前启动目录或绝对路径均可）。所有登记仅保存在当前工作区配置文件中，不修改目标项目。', 'st-muted-xs');
+  const mkField = (lbl, ph, val = '', req = false) => {
+    const box = el('label', null, 'st-field');
+    box.append(el('span', lbl, 'st-field-label'));
+    const inp = el('input', null, 'st-input');
+    inp.value = val;
+    inp.placeholder = ph;
+    inp.required = req;
+    box.append(inp);
+    return { box, inp };
+  };
+  const fPath = mkField('本地仓库路径 *', '例如：../another-skill-repo 或本地绝对路径', '', true);
+  const fTitle = mkField('自定义显示名称（可选）', '留空则自动采用 package.json / .studio-workspace.json 名称', '');
+  const fDesc = mkField('自定义项目说明（可选）', '留空则自动读取 package.json#description 或 README.md 首段', '');
+  const errEl = el('div', '', 'st-guard-error');
+  errEl.hidden = true;
+
+  const actions = el('div', null, 'st-graph-controls');
+  actions.style.justifyContent = 'flex-end';
+  const cancelBtn = el('button', '取消', 'st-btn');
+  cancelBtn.type = 'button';
+  cancelBtn.addEventListener('click', () => backdrop.remove());
+  const submitBtn = el('button', '✓ 确认添加并接入工作台', 'st-btn st-btn-primary');
+  submitBtn.type = 'button';
+  submitBtn.addEventListener('click', async () => {
+    errEl.hidden = true;
+    if (!fPath.inp.value.trim()) {
+      errEl.textContent = '请填写要接入的本地仓库目录路径。';
+      errEl.hidden = false;
+      fPath.inp.focus();
+      return;
+    }
+    submitBtn.disabled = true;
+    submitBtn.textContent = '接入中…';
+    try {
+      const res = await apiJson('/api/studio/repos/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          repoPath: fPath.inp.value.trim(),
+          title: fTitle.inp.value.trim(),
+          description: fDesc.inp.value.trim(),
+        }),
+      });
+      backdrop.remove();
+      await applyEcosystemUpdate(res.ecosystem, res.addedRepoId);
+      showStudioToast(`✓ 已接入本地项目（配置写入 ${res.storagePath}）`, { tone: 'emerald' });
+    } catch (err) {
+      errEl.textContent = err.message;
+      errEl.hidden = false;
+      submitBtn.disabled = false;
+      submitBtn.textContent = '✓ 确认添加并接入工作台';
+    }
+  });
+  actions.append(cancelBtn, submitBtn);
+  modal.append(head, desc, fPath.box, fTitle.box, fDesc.box, errEl, actions);
+  backdrop.append(modal);
+  backdrop.addEventListener('click', ev => { if (ev.target === backdrop) backdrop.remove(); });
+  document.body.append(backdrop);
+  fPath.inp.focus();
+}
+
+function openRepoMetaModal(repo) {
+  if (!repo) return;
+  closeRepoPopover();
+  document.getElementById('st-repo-modal')?.remove();
+  const backdrop = el('div', null, 'st-modal-backdrop');
+  backdrop.id = 'st-repo-modal';
+  const modal = el('div', null, 'st-card st-modal');
+  const head = el('div', null, 'st-repo-opt-head');
+  const leftHead = el('div', null, 'st-graph-controls');
+  leftHead.append(el('h3', `✎ 项目说明与来源：${repo.displayName || repo.name}`, ''), infoTrigger('repo:provenance', document));
+  leftHead.firstChild.style.margin = '0';
+  const closeX = el('button', '✕', 'st-btn');
+  closeX.type = 'button';
+  closeX.addEventListener('click', () => backdrop.remove());
+  head.append(leftHead, closeX);
+
+  const srcBox = el('div', null, 'st-provenance-list');
+  const sources = repo.metaSources || [];
+  if (sources.length) {
+    for (const s of sources) {
+      const row = el('div', null, 'st-provenance-card');
+      row.append(
+        el('span', `${s.field}：${s.sourceFile}`, 'st-tabular'),
+        el('span', s.active ? '✓ 当前生效' : '备选来源', `st-badge ${s.active ? 'st-badge-emerald' : 'st-badge-zinc'}`),
+      );
+      srcBox.append(row);
+    }
+  } else {
+    srcBox.append(el('p', '当前使用仓库目录默认名称，可在下方补全中文说明。', 'st-muted-xs'));
+  }
+
+  const mkField = (lbl, val, ph) => {
+    const box = el('label', null, 'st-field');
+    box.append(el('span', lbl, 'st-field-label'));
+    const inp = el('input', null, 'st-input');
+    inp.value = val || '';
+    inp.placeholder = ph;
+    inp.disabled = !state.writable;
+    box.append(inp);
+    return { box, inp };
+  };
+  const fTitle = mkField('显示名称（自定义覆写）', repo.hasCustomMeta ? repo.displayName : '', `默认：${repo.originalName || repo.name}`);
+  const fGroup = mkField('所属分组标签', repo.hasCustomMeta ? repo.groupLabel : '', `默认：${repo.originalGroupLabel || repo.groupLabel}`);
+  const fDesc = mkField('项目一句话说明', repo.description || '', repo.originalDescription || '填写中文项目定位或职责说明…');
+  const errEl = el('div', '', 'st-guard-error');
+  errEl.hidden = true;
+
+  const actions = el('div', null, 'st-repo-opt-head');
+  const leftOps = el('div', null, 'st-graph-controls');
+  if (state.repos.length > 1) {
+    let confirmPending = false;
+    const rmBtn = el('button', '从列表移除该项目', 'st-btn');
+    rmBtn.type = 'button';
+    rmBtn.disabled = !state.writable;
+    rmBtn.addEventListener('click', async () => {
+      if (!confirmPending) {
+        confirmPending = true;
+        rmBtn.textContent = '⚠️ 再次点击确认移除';
+        rmBtn.classList.add('st-btn-amber');
+        setTimeout(() => {
+          confirmPending = false;
+          rmBtn.textContent = '从列表移除该项目';
+          rmBtn.classList.remove('st-btn-amber');
+        }, 4000);
+        return;
+      }
+      try {
+        const res = await apiJson('/api/studio/repos/unregister', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ repoId: repo.id }),
+        });
+        backdrop.remove();
+        await applyEcosystemUpdate(res.ecosystem);
+        showStudioToast(`✓ 已从当前工作台视图移除「${repo.name}」（未删除磁盘文件）`, { tone: 'emerald' });
+      } catch (err) {
+        errEl.textContent = err.message;
+        errEl.hidden = false;
+      }
+    });
+    leftOps.append(rmBtn);
+  }
+  const rightOps = el('div', null, 'st-graph-controls');
+  if (repo.hasCustomMeta) {
+    const resetBtn = el('button', '恢复默认来源', 'st-btn');
+    resetBtn.type = 'button';
+    resetBtn.disabled = !state.writable;
+    resetBtn.addEventListener('click', async () => {
+      const res = await apiJson('/api/studio/repos/meta', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repoId: repo.id, reset: true }),
+      });
+      backdrop.remove();
+      await applyEcosystemUpdate(res.ecosystem, repo.id);
+      showStudioToast('✓ 已恢复读取仓库原始名称与说明', { tone: 'emerald' });
+    });
+    rightOps.append(resetBtn);
+  }
+  const saveBtn = el('button', '💾 保存自定义说明', 'st-btn st-btn-primary');
+  saveBtn.type = 'button';
+  saveBtn.disabled = !state.writable;
+  saveBtn.addEventListener('click', async () => {
+    errEl.hidden = true;
+    try {
+      const res = await apiJson('/api/studio/repos/meta', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          repoId: repo.id,
+          title: fTitle.inp.value.trim(),
+          groupLabel: fGroup.inp.value.trim(),
+          description: fDesc.inp.value.trim(),
+        }),
+      });
+      backdrop.remove();
+      await applyEcosystemUpdate(res.ecosystem, repo.id);
+      showStudioToast(`✓ 已保存自定义说明至 ${res.storagePath}`, { tone: 'emerald' });
+    } catch (err) {
+      errEl.textContent = err.message;
+      errEl.hidden = false;
+    }
+  });
+  rightOps.append(saveBtn);
+  actions.append(leftOps, rightOps);
+  modal.append(head, el('div', '以下信息来源由服务端真实探测生成，不修改受审仓库源码：', 'st-muted-xs'), srcBox, fTitle.box, fGroup.box, fDesc.box, errEl, actions);
+  backdrop.append(modal);
+  backdrop.addEventListener('click', ev => { if (ev.target === backdrop) backdrop.remove(); });
+  document.body.append(backdrop);
+}
+
 function renderRepoPopover() {
   const host = document.getElementById('st-repo-groups');
   const q = (document.getElementById('st-repo-search').value || '').trim().toLowerCase();
   host.replaceChildren();
-  const filtered = state.repos.filter(r => !q || `${r.name} ${r.groupLabel} ${r.repoRoleLabel || ''} ${r.description}`.toLowerCase().includes(q));
+  const filtered = state.repos.filter(r => !q || `${r.name} ${r.displayName || ''} ${r.groupLabel} ${r.repoRoleLabel || ''} ${r.description}`.toLowerCase().includes(q));
   const byGroup = new Map();
   for (const r of filtered) {
     if (!byGroup.has(r.groupLabel)) byGroup.set(r.groupLabel, []);
     byGroup.get(r.groupLabel).push(r);
   }
+  if (!filtered.length) {
+    host.append(el('p', '当前搜索条件下暂无匹配项目，可点右上角「＋ 添加本地项目」接入新仓库。', 'st-muted-xs'));
+    return;
+  }
   for (const [gLabel, list] of byGroup.entries()) {
     host.append(el('div', `${gLabel} (${list.length})`, 'st-repo-group-title'));
     for (const r of list) {
       const p = countRepoProgress(r);
-      const btn = el('button', null, `st-repo-option${r.id === state.repoId ? ' is-selected' : ''}`);
+      const row = el('div', null, `st-repo-item-row${r.id === state.repoId ? ' is-selected' : ''}`);
+      const btn = el('button', null, 'st-repo-item-btn');
       btn.type = 'button';
       const head = el('div', null, 'st-repo-opt-head');
-      const leftHead = el('div', null, 'st-graph-controls');
-      leftHead.append(el('span', r.name));
-      if (r.repoRoleLabel) {
-        const roleTone = r.repoRole === 'portfolio' ? 'st-badge-amber' : (r.repoRole === 'subproject' ? 'st-badge-emerald' : 'st-badge-zinc');
-        leftHead.append(el('span', r.repoRoleLabel, `st-badge ${roleTone}`));
-      }
-      head.append(leftHead, el('span', `已审 ${p.decided}/${p.total}`, 'st-badge st-badge-indigo'));
+      const roleTone = r.repoRole === 'portfolio' ? 'st-badge-amber' : (r.repoRole === 'subproject' ? 'st-badge-emerald' : 'st-badge-zinc');
+      const briefNode = renderEntityBrief(document, {
+        title: r.displayName || r.name,
+        summary: r.description,
+        code: r.name !== (r.displayName || r.name) ? r.name : '',
+        typeLabel: r.isExtraRepo ? '已手动接入' : '',
+      }, { compact: true, showPath: false, maxSummaryChars: 86 });
+      const badges = el('div', null, 'st-graph-controls');
+      badges.append(el('span', r.repoRoleLabel || '单项目仓', `st-badge ${roleTone}`), el('span', `已审 ${p.decided}/${p.total}`, 'st-badge st-badge-indigo'));
+      head.append(briefNode, badges);
+
+      const foot = el('div', null, 'st-repo-opt-head');
       const metrics = el('div', null, 'st-repo-opt-metrics');
       metrics.append(
-        el('span', `制品节点 ${r.nodeCount ?? 0}`),
+        el('span', `制品 ${r.nodeCount ?? 0}`),
         el('span', `· ${r.versionLockLabel}`),
-        el('span', `· 审阅中 ${p.reviewing}`),
         el('span', `· ${r.runtimeLabel}`),
       );
-      btn.append(head, metrics);
+      const ops = el('div', null, 'st-repo-actions');
+      const editBtn = el('button', '✎ 说明与来源', 'st-btn st-btn-xs');
+      editBtn.type = 'button';
+      editBtn.addEventListener('click', ev => { ev.stopPropagation(); openRepoMetaModal(r); });
+      ops.append(editBtn);
+      btn.append(head);
       btn.addEventListener('click', () => {
         closeRepoPopover();
         selectRepo(r.id);
       });
-      host.append(btn);
+      foot.append(metrics, ops);
+      row.append(btn, foot);
+      host.append(row);
     }
   }
 }
@@ -555,7 +807,6 @@ async function mountDocumentReader(container, item, options = {}) {
     el('span', item.formatLabel || (item.isMachineContract ? 'JSON 数据契约' : 'Markdown 阅读稿'), `st-badge ${item.isMachineContract ? 'st-badge-amber' : 'st-badge-zinc'}`),
     infoTrigger(item.isMachineContract ? 'docFmt:json' : 'docFmt:markdown', document),
     el('span', `${meta.dot} ${meta.label}`, meta.badge),
-    infoTrigger(`status:${eff}`, document),
   );
   const rightBtns = el('div', null, 'st-graph-controls');
   const approveNextBtn = el('button', '✓ 通过并审下一项 →', 'st-btn st-btn-emerald');
@@ -612,9 +863,12 @@ async function mountDocumentReader(container, item, options = {}) {
     const upLeft = el('div', null, 'st-graph-controls');
     upLeft.append(el('span', directMatches.length > 0 ? '↖ 上游高阶来源：' : `↖ 所属高阶规划仓 (${upInfo.upstreamRepoName})：`, 'st-muted-xs'));
     for (const b of listToShow) {
-      const pill = el('button', `${upInfo.upstreamRepoName} · ${b.upstreamUid}`, 'st-jump-pill');
+      const upLabel = b.upstreamTitle && b.upstreamTitle !== b.upstreamUid
+        ? `${b.upstreamTitle} (${b.upstreamCode || b.upstreamUid})`
+        : b.upstreamUid;
+      const pill = el('button', `${upInfo.upstreamRepoName} · ${upLabel}`, 'st-jump-pill');
       pill.type = 'button';
-      pill.title = b.upstreamTitle || b.upstreamUid;
+      pill.title = b.upstreamSummary || b.upstreamTitle || b.upstreamUid;
       pill.addEventListener('click', () => jumpToRepoAndItem(b.upstreamRepoId || upInfo.upstreamRepoId, b.upstreamUid, 'review', 'reader'));
       upLeft.append(pill);
       const tone = b.health?.tone || 'zinc';
@@ -775,6 +1029,7 @@ async function mountDocumentReader(container, item, options = {}) {
 
   approveNextBtn.addEventListener('click', () => handleStatusCommit('approved', true));
 
+  statusGroup.append(el('span', '审阅签收', 'st-muted-xs'), infoTrigger('review:statusRules', document));
   for (const [stKey, label, btnTitle] of [
     ['approved', '🟢 标为已通过', '确认内容准确并签收通过'],
     ['reviewing', '🔵 标为审阅中', '作为阅读书签暂时搁置或标为正在梳理意见（写批注也会自动点亮）'],
@@ -787,7 +1042,7 @@ async function mountDocumentReader(container, item, options = {}) {
     b.title = btnTitle;
     b.disabled = !state.writable;
     b.addEventListener('click', () => handleStatusCommit(stKey, false));
-    statusGroup.append(b, infoTrigger(`status:${stKey}`, document));
+    statusGroup.append(b);
   }
   noteInput.addEventListener('keydown', e => {
     if (e.key === 'Enter') handleStatusCommit(curDec.status || eff, false);
@@ -878,11 +1133,12 @@ async function mountDocumentReader(container, item, options = {}) {
   readerLayout.append(mainCol, dockCol);
   container.append(readerLayout);
 
-  const cacheKey = `${state.repoId}::${item.uid}::${item.path}`;
+  const activeRepoId = state.snap?.repoId || state.repoId;
+  const cacheKey = `${activeRepoId}::${item.uid}::${item.path}`;
   let doc = state.docCache.get(cacheKey);
   if (!doc) {
     try {
-      const q = new URLSearchParams({ repo: state.repoId || '', path: item.path || '', uid: item.uid || '' });
+      const q = new URLSearchParams({ repo: activeRepoId || '', path: item.path || '', uid: item.uid || '' });
       doc = await apiJson(`/api/studio/doc?${q}`);
       state.docCache.set(cacheKey, doc);
     } catch (err) {
@@ -891,14 +1147,14 @@ async function mountDocumentReader(container, item, options = {}) {
     }
   }
   proseWrap.replaceChildren();
-  const h1 = el('h1', doc.title || item.title);
-  h1.style.marginTop = '0';
-
+  const hasHero = String(doc.html || '').includes('st-doc-hero');
   const bodyDiv = el('div');
   bodyDivRef = bodyDiv;
   bodyDiv.innerHTML = doc.html || '';
   if (doc.isMachineContract && state.docViewMode === 'raw') {
     bodyDiv.hidden = true;
+    const h1 = el('h1', doc.title || item.title);
+    h1.style.marginTop = '0';
     const rawPre = el('pre', doc.rawText || '', 'st-code-block');
     proseWrap.append(h1, bodyDiv, rawPre);
   } else {
@@ -917,7 +1173,13 @@ async function mountDocumentReader(container, item, options = {}) {
         annInput.focus();
       }
     });
-    proseWrap.append(h1, bodyDiv);
+    if (hasHero) {
+      proseWrap.append(bodyDiv);
+    } else {
+      const h1 = el('h1', doc.title || item.title);
+      h1.style.marginTop = '0';
+      proseWrap.append(h1, bodyDiv);
+    }
   }
 
   if (anchorId && !(doc.isMachineContract && state.docViewMode === 'raw')) {
@@ -1253,8 +1515,16 @@ function renderGraphPanel() {
   if (graphResizeObserver) { graphResizeObserver.disconnect(); graphResizeObserver = null; }
   if (state.repos.length === 0) {
     const empty = el('div', null, 'st-card st-guide-section');
-    empty.append(el('h3', '当前工作区未发现受管仓库', ''), el('p', '请从包含 artifact-graph.config.yaml 的技能族目录启动，或在工作区根目录声明 .studio-workspace.json。', 'st-muted-xs'));
+    empty.append(
+      el('h3', '当前工作区未发现受管仓库', ''),
+      el('p', '请从包含 artifact-graph.config.yaml 的技能族目录启动，或直接点击下方按钮添加本地项目仓库。', 'st-muted-xs'),
+    );
     empty.firstChild.style.marginTop = '0';
+    const addBtn = el('button', '＋ 添加本地项目', 'st-btn st-btn-primary');
+    addBtn.type = 'button';
+    addBtn.disabled = !state.writable;
+    addBtn.addEventListener('click', openAddRepoModal);
+    empty.append(addBtn);
     host.append(empty);
     return;
   }
@@ -1323,8 +1593,8 @@ function renderGraphPanel() {
         locatorLeft.append(
           el('span', '当前位置：', 'st-muted-xs'),
           el('span', '非图谱附属文稿', 'st-badge st-badge-zinc'),
-          el('strong', `${nonDagItem.code || nonDagItem.uid} · ${nonDagItem.title}`),
-          el('span', '（无 DAG 连线，可在右侧继续阅读签收）', 'st-muted-xs'),
+          el('strong', nonDagItem.title || nonDagItem.code || nonDagItem.uid),
+          el('span', `(${nonDagItem.code || nonDagItem.uid} · 可在右侧继续阅读签收)`, 'st-muted-xs'),
         );
       } else {
         locatorLeft.append(el('span', '当前位置：请点击任意图谱节点查看上下游依赖与正文（节点坐标始终保持恒定）', 'st-muted-xs'));
@@ -1712,7 +1982,7 @@ function renderAlignmentOverview(host) {
     const leftTitle = el('div');
     leftTitle.append(
       el('h2', pf.title || '高阶需求进展与双向对齐总览表', ''),
-      el('p', '满足概况完全由下游存在性、摘要互锁与代码/测试双锁机器派生，悬停任意徽章旁的 ⓘ 可查看判定条件；点击下游胶囊直接跨仓跳入子项目详设。', 'st-muted-xs'),
+      el('p', '满足概况由下游存在性、摘要互锁与代码/测试双锁自动派生；表头 ⓘ 提供列口径与全部枚举规则，点击条目或下游胶囊可直接阅读原文或跨仓跳入详设。', 'st-muted-xs'),
     );
     leftTitle.firstChild.style.margin = '0 0 4px 0';
     leftTitle.lastChild.style.margin = '0';
@@ -1737,8 +2007,8 @@ function renderAlignmentOverview(host) {
     filterGroup.append(stepNextBtn);
     const qInp = el('input', null, 'st-input');
     qInp.type = 'search';
-    qInp.style.width = '220px';
-    qInp.placeholder = '按需求编号/目标仓搜索…';
+    qInp.style.width = '240px';
+    qInp.placeholder = '按需求标题、摘要、编号或目标仓搜索…';
     qInp.value = state.alignQuery;
     headRow.append(leftTitle, filterGroup);
 
@@ -1750,7 +2020,14 @@ function renderAlignmentOverview(host) {
     const tbl = el('table', null, 'st-prose-table');
     const thead = el('thead');
     const hr = el('tr');
-    for (const h of ['高阶需求条目', '业务处置与承接去向', '满足概况（机器派生）', '阶段与双向健康度']) hr.append(el('th', h));
+    for (const [hLbl, tipKey] of [
+      ['需求标题与摘要', 'col:alignItem'],
+      ['业务处置与承接去向', 'col:alignDisposition'],
+      ['实际满足度（机器派生）', 'col:alignSatisfaction'],
+      ['双向对齐结论', 'col:alignHealth'],
+    ]) {
+      hr.append(thWithInfo(document, hLbl, tipKey));
+    }
     thead.append(hr);
     const tbody = el('tbody');
 
@@ -1763,7 +2040,7 @@ function renderAlignmentOverview(host) {
         if (state.alignFilter === 'verified' && item.computedSatisfaction !== 'verified_satisfied') return false;
         if (state.alignFilter === 'not_applicable' && item.computedSatisfaction !== 'not_applicable') return false;
         if (q) {
-          const hay = `${item.sourceUid} ${item.title} ${item.dispositionNote} ${(item.allocations || []).map(a => `${a.targetRepoName} ${a.targetUid}`).join(' ')}`.toLowerCase();
+          const hay = `${item.sourceUid} ${item.sourceCode || ''} ${item.title} ${item.sourceSummary || ''} ${item.dispositionNote} ${(item.allocations || []).map(a => `${a.targetRepoName} ${a.targetUid} ${a.targetTitle || ''} ${a.targetSummary || ''}`).join(' ')}`.toLowerCase();
           if (!hay.includes(q)) return false;
         }
         return true;
@@ -1790,41 +2067,54 @@ function renderAlignmentOverview(host) {
       for (const item of rows) {
         const tr = el('tr');
         const tdSrc = el('td');
-        const srcBtn = el('button', item.sourceUid, 'st-inline-jump');
+        const srcBtn = el('button', null, 'st-repo-item-btn');
         srcBtn.type = 'button';
+        srcBtn.append(renderEntityBrief(document, {
+          title: item.title,
+          summary: item.sourceSummary,
+          code: item.sourceCode || item.sourceUid,
+          typeLabel: item.sourceTypeLabel || '高阶需求',
+          path: item.sourcePath,
+        }));
         srcBtn.addEventListener('click', () => jumpToRepoAndItem(state.repoId, item.sourceUid, 'review', 'reader'));
-        tdSrc.append(srcBtn, el('div', item.title, ''));
+        tdSrc.append(srcBtn);
 
         const tdDisp = el('td');
         const allocWrap = el('div', null, 'st-alignment-alloc-list');
         const dispHead = el('div', null, 'st-graph-controls');
-        dispHead.append(el('span', item.dispositionLabel, 'st-badge st-badge-zinc'), infoTrigger(`disp:${item.disposition || 'allocated'}`, document));
+        dispHead.append(el('span', item.dispositionLabel, 'st-badge st-badge-zinc'));
         if (item.mergedInto) dispHead.append(el('span', `→ ${item.mergedInto}`, 'st-muted-xs'));
         allocWrap.append(dispHead);
         if (item.dispositionNote) allocWrap.append(el('div', item.dispositionNote, 'st-muted-xs'));
         for (const alRowItem of item.allocations || []) {
           const aRow = el('div', null, 'st-alignment-alloc-row');
+          const allocHead = el('div', null, 'st-graph-controls');
+          const jumpLbl = `↗ ${alRowItem.targetRepoName} · ${alRowItem.targetTitle || alRowItem.targetCode || alRowItem.targetUid}`;
           if (alRowItem.targetRepoId) {
-            const jumpBtn = el('button', `↗ ${alRowItem.targetRepoName} · ${alRowItem.targetUid}`, 'st-jump-pill');
+            const jumpBtn = el('button', jumpLbl, 'st-jump-pill');
             jumpBtn.type = 'button';
             jumpBtn.addEventListener('click', () => jumpToRepoAndItem(alRowItem.targetRepoId, alRowItem.targetUid, 'review', 'reader'));
-            aRow.append(jumpBtn);
+            allocHead.append(jumpBtn);
           } else {
-            aRow.append(el('span', `${alRowItem.targetRepoName} · ${alRowItem.targetUid}`, 'st-badge st-badge-zinc'));
+            allocHead.append(el('span', `${alRowItem.targetRepoName} · ${alRowItem.targetTitle || alRowItem.targetUid}`, 'st-badge st-badge-zinc'));
           }
-          aRow.append(el('span', alRowItem.codeLocksFresh ? '双锁新鲜' : '待补代码/测试锁', `st-badge ${alRowItem.codeLocksFresh ? 'st-badge-emerald' : 'st-badge-amber'}`));
+          allocHead.append(el('span', alRowItem.codeLocksFresh ? '双锁新鲜' : '待补代码/测试锁', `st-badge ${alRowItem.codeLocksFresh ? 'st-badge-emerald' : 'st-badge-amber'}`));
+          aRow.append(allocHead);
+          if (alRowItem.targetSummary) {
+            aRow.append(renderEntityBrief(document, {
+              title: '',
+              summary: alRowItem.targetSummary,
+              code: alRowItem.targetCode || alRowItem.targetUid,
+              path: alRowItem.targetPath,
+            }, { compact: true, showPath: true, maxSummaryChars: 88 }));
+          }
           allocWrap.append(aRow);
         }
         tdDisp.append(allocWrap);
 
         const tdSat = el('td');
         const satMeta = item.satisfactionMeta || {};
-        const satRow = el('div', null, 'st-graph-controls');
-        satRow.append(
-          el('span', satMeta.label || item.computedSatisfaction, `st-badge st-badge-${satMeta.tone || 'zinc'}`),
-          infoTrigger(`sat:${item.computedSatisfaction}`, document),
-        );
-        tdSat.append(satRow);
+        tdSat.append(el('span', satMeta.label || item.computedSatisfaction, `st-badge st-badge-${satMeta.tone || 'zinc'}`));
         if (Array.isArray(item.remainingScope) && item.remainingScope.length > 0) {
           const ul = el('ul');
           ul.style.margin = '6px 0 0 16px';
@@ -1840,9 +2130,7 @@ function renderAlignmentOverview(host) {
           const issLine = el('div', null, 'st-graph-controls');
           issLine.style.marginTop = '4px';
           issLine.append(el('span', `${iss.code}：${iss.message}`, 'st-muted-xs'));
-          if (GLOSSARY[`err:${iss.code}`]) {
-            issLine.append(infoTrigger(`err:${iss.code}`, document));
-          }
+          if (GLOSSARY[`err:${iss.code}`]) issLine.append(infoTrigger(`err:${iss.code}`, document));
           tdHealth.append(issLine);
         }
 
@@ -1868,27 +2156,44 @@ function renderAlignmentOverview(host) {
     const tbl = el('table', null, 'st-prose-table');
     const thead = el('thead');
     const hr = el('tr');
-    for (const h of ['本地详设条目', '上游高阶规划来源', '双向互锁健康度']) hr.append(el('th', h));
+    for (const [hLbl, tipKey] of [
+      ['本仓详设条目', 'col:upstreamLocal'],
+      ['对应高阶规划来源', 'col:upstreamSource'],
+      ['双向互锁健康度', 'col:upstreamHealth'],
+    ]) {
+      hr.append(thWithInfo(document, hLbl, tipKey));
+    }
     thead.append(hr);
     const tbody = el('tbody');
     for (const b of up.bindings || []) {
       const tr = el('tr');
       const tdLocal = el('td');
-      const localBtn = el('button', b.localUid, 'st-inline-jump');
+      const localBtn = el('button', null, 'st-repo-item-btn');
       localBtn.type = 'button';
+      localBtn.append(renderEntityBrief(document, {
+        title: b.localTitle || b.localUid,
+        summary: b.localSummary,
+        code: b.localCode || b.localUid,
+        typeLabel: b.localTypeLabel || '本仓详设',
+        path: b.localPath,
+      }));
       localBtn.addEventListener('click', () => jumpToRepoAndItem(state.repoId, b.localUid, 'review', 'reader'));
-      tdLocal.append(localBtn, el('div', b.localPath, 'st-muted-xs'));
+      tdLocal.append(localBtn);
 
       const tdUp = el('td');
       if (b.upstreamRepoId || up.upstreamRepoId) {
-        const upBtn = el('button', `↖ ${up.upstreamRepoName} · ${b.upstreamUid}`, 'st-jump-pill');
+        const upBtn = el('button', `↖ ${up.upstreamRepoName} · ${b.upstreamTitle || b.upstreamCode || b.upstreamUid}`, 'st-jump-pill');
         upBtn.type = 'button';
         upBtn.addEventListener('click', () => jumpToRepoAndItem(b.upstreamRepoId || up.upstreamRepoId, b.upstreamUid, 'review', 'reader'));
         tdUp.append(upBtn);
-      } else {
-        tdUp.append(el('code', b.upstreamUid));
       }
-      tdUp.append(el('div', b.upstreamTitle, 'st-muted-xs'));
+      tdUp.append(renderEntityBrief(document, {
+        title: b.upstreamTitle || b.upstreamUid,
+        summary: b.upstreamSummary,
+        code: b.upstreamCode || b.upstreamUid,
+        typeLabel: b.upstreamTypeLabel || '上游高阶',
+        path: b.upstreamPath,
+      }, { compact: true }));
 
       const tdHealth = el('td');
       tdHealth.append(el('span', b.health?.label || '已绑定', `st-badge st-badge-${b.health?.tone || 'zinc'}`));
@@ -1933,21 +2238,31 @@ function renderAlignmentOverview(host) {
   mkBox('未认领入口与锁漂移', `${(ic.unclaimedEntries?.length ?? 0) + (ic.drifts?.length ?? 0)} 项`, ic.healthy ? 'emerald' : 'rose', 'lockCard:unclaimed');
   codeCard.append(kpiRow);
 
-  if ((ic.unclaimedEntries || []).length > 0) {
+  const unclaimedDetails = ic.unclaimedEntryDetails || (ic.unclaimedEntries || []).map(p => ({ path: p, title: p, typeLabel: '源码入口' }));
+  if (unclaimedDetails.length > 0) {
     const warnLine = el('div', null, 'st-graph-controls');
     warnLine.append(
       el('span', '⚠️ 以下入口文件尚未在 traceability-version-lock.json 中被任何 @feature / @scenario 认领 (UNCLAIMED_IMPLEMENTATION_ENTRY)：', 'st-muted-xs'),
       infoTrigger('err:UNCLAIMED_IMPLEMENTATION_ENTRY', document),
     );
-    const ul = el('ul');
-    for (const p of ic.unclaimedEntries) ul.append(el('li', p, 'st-inline-code'));
-    codeCard.append(warnLine, ul);
+    const list = el('div', null, 'st-md-list');
+    for (const det of unclaimedDetails) list.append(renderEntityBrief(document, det, { compact: true }));
+    codeCard.append(warnLine, list);
   }
-  if ((ic.drifts || []).length > 0) {
+  const driftDetails = ic.driftDetails || ic.drifts || [];
+  if (driftDetails.length > 0) {
     codeCard.append(el('div', '⚠️ 以下代码/测试锁存在摘要漂移（修改后尚未刷新 version-lock）：', 'st-muted-xs'));
-    const ul = el('ul');
-    for (const d of ic.drifts) ul.append(el('li', `${d.code} · ${d.path}`, ''));
-    codeCard.append(ul);
+    const list = el('div', null, 'st-md-list');
+    for (const d of driftDetails) {
+      list.append(renderEntityBrief(document, {
+        title: d.title || d.path || d.code,
+        summary: d.summary,
+        code: d.code,
+        typeLabel: d.typeLabel || '锁漂移',
+        path: d.path,
+      }, { compact: true }));
+    }
+    codeCard.append(list);
   }
   if (ic.healthy) {
     codeCard.append(el('p', '🟢 本仓核心源码、SKILL.md 入口与测试文件均已完成双向版本锁绑定且哈希新鲜。', 'st-muted-xs'));
@@ -1963,8 +2278,16 @@ function renderReviewPanel() {
   host.replaceChildren();
   if (state.repos.length === 0) {
     const empty = el('div', null, 'st-card st-guide-section');
-    empty.append(el('h3', '当前工作区未发现受管仓库', ''), el('p', '请从包含 artifact-graph.config.yaml 的技能族目录启动控制台后再进入逐项审阅。', 'st-muted-xs'));
+    empty.append(
+      el('h3', '当前工作区未发现受管仓库', ''),
+      el('p', '请从包含 artifact-graph.config.yaml 的技能族目录启动控制台，或直接点击下方按钮接入本地项目。', 'st-muted-xs'),
+    );
     empty.firstChild.style.marginTop = '0';
+    const addBtn = el('button', '＋ 添加本地项目', 'st-btn st-btn-primary');
+    addBtn.type = 'button';
+    addBtn.disabled = !state.writable;
+    addBtn.addEventListener('click', openAddRepoModal);
+    empty.append(addBtn);
     host.append(empty);
     return;
   }
@@ -2019,42 +2342,9 @@ function renderReviewPanel() {
 
   const searchInp = el('input', null, 'st-input');
   searchInp.type = 'search';
-  searchInp.placeholder = '按编号或标题搜索审阅项…';
+  searchInp.placeholder = '搜索标题、摘要或编号…';
   searchInp.value = state.reviewQuery;
-  searchInp.addEventListener('input', () => {
-    state.reviewQuery = searchInp.value;
-    paintList();
-  });
   sidebar.append(searchInp);
-
-  const catRow = el('div', null, 'st-cat-pills');
-  const cats = state.snap.categories || [];
-  const allCat = cats.find(c => c.id === 'all');
-  if (allCat) {
-    const bAll = el('button', `${allCat.label} (${allCat.count})`, `st-btn${state.reviewCategory === 'all' ? ' is-active' : ''}`);
-    bAll.type = 'button';
-    bAll.addEventListener('click', () => { state.reviewCategory = 'all'; renderReviewPanel(); });
-    catRow.append(bAll);
-  }
-  const addCatGroup = (pred, titleTxt, tipKey) => {
-    const grpCats = cats.filter(pred);
-    if (!grpCats.length) return;
-    const hdr = el('div', null, 'st-cat-group-label');
-    hdr.append(el('span', titleTxt), infoTrigger(tipKey, document));
-    catRow.append(hdr);
-    for (const c of grpCats) {
-      const b = el('button', `${c.label} (${c.count})`, `st-btn${state.reviewCategory === c.id ? ' is-active' : ''}`);
-      b.type = 'button';
-      b.addEventListener('click', () => { state.reviewCategory = c.id; renderReviewPanel(); });
-      catRow.append(b);
-    }
-  };
-  const STORY_CAT_IDS = new Set(['stories', 'lc_explanations', 'us_stories', 'gap_resolutions']);
-  addCatGroup(c => c.group === 'primary' && STORY_CAT_IDS.has(c.id), '第 1 顺位：先看诉求（用户故事）', 'catGroup:primary1');
-  addCatGroup(c => c.group === 'primary' && !STORY_CAT_IDS.has(c.id), '第 2 顺位：核对边界（需求与场景）', 'catGroup:primary2');
-  addCatGroup(c => c.group === 'supporting', '备查依据（领域、架构与测试）', 'catGroup:supporting');
-  addCatGroup(c => c.group === 'contracts', '附：机器契约（默认自动跳过）', 'catGroup:contracts');
-  sidebar.append(catRow);
 
   const statusSel = el('select', null, 'st-select');
   for (const [val, txt] of [
@@ -2070,18 +2360,19 @@ function renderReviewPanel() {
     if (state.reviewStatusFilter === val) o.selected = true;
     statusSel.append(o);
   }
-  statusSel.addEventListener('change', () => {
-    state.reviewStatusFilter = statusSel.value;
-    const filtered = paintList();
-    syncReaderToFiltered(filtered);
-  });
   sidebar.append(statusSel);
 
-  const listWrap = el('div');
-  listWrap.style.display = 'flex';
-  listWrap.style.flexDirection = 'column';
-  listWrap.style.gap = '6px';
+  const listWrap = el('div', null, 'st-acc-tree');
   sidebar.append(listWrap);
+
+  const FOLDER_DEFS = [
+    { id: 'f1_stories', label: '① 用户故事', cats: new Set(['stories', 'us_stories', 'gap_resolutions']), defaultOpen: true },
+    { id: 'f2_lifecycle', label: '② 生命周期讲解', cats: new Set(['lc_explanations']) },
+    { id: 'f3_reqs', label: '③ 需求总纲', cats: new Set(['requirements']) },
+    { id: 'f4_scenarios', label: '④ 场景剧本', cats: new Set(['scenarios']) },
+    { id: 'f5_arch', label: '⑤ 领域模型与架构设计', cats: new Set(['domain', 'business_articles', 'architecture', 'verification']) },
+    { id: 'f6_contracts', label: '附：机器数据契约 (.json/.yaml · 自动跳过)', cats: new Set(['contracts']), isContracts: true },
+  ];
 
   const resetReviewFilters = () => {
     state.reviewCategory = 'all';
@@ -2113,52 +2404,111 @@ function renderReviewPanel() {
   const paintList = () => {
     listWrap.replaceChildren();
     const q = state.reviewQuery.trim().toLowerCase();
-    const items = (state.snap.reviewItems || []).filter(item => {
+    const hasFilter = Boolean(q || state.reviewStatusFilter !== 'all');
+    const allItems = state.snap.reviewItems || [];
+    const matchedItems = allItems.filter(item => {
       if (state.reviewCategory !== 'all' && item.category !== state.reviewCategory) return false;
       const eff = getEffectiveStatus(item.target || item.uid);
       if (state.reviewStatusFilter !== 'all' && eff !== state.reviewStatusFilter) return false;
-      if (q && !`${item.code} ${item.title} ${item.typeLabel}`.toLowerCase().includes(q)) return false;
+      if (q && !`${item.code} ${item.title} ${item.summary || ''} ${item.typeLabel}`.toLowerCase().includes(q)) return false;
       return true;
     });
-    if (!items.length) {
+    if (!matchedItems.length) {
       listWrap.append(el('p', '当前筛选条件下暂无匹配项。', 'st-muted-xs'));
       const clrBtn = el('button', '🔄 清空筛选条件', 'st-btn');
       clrBtn.type = 'button';
       clrBtn.addEventListener('click', resetReviewFilters);
       listWrap.append(clrBtn);
-      return items;
+      return matchedItems;
     }
-    for (const item of items) {
-      const eff = getEffectiveStatus(item.target || item.uid);
-      const sm = STATUS_META[eff] || STATUS_META.pending;
-      const b = el('button', null, `st-review-item-btn${item.uid === state.selectedUid ? ' is-active' : ''}`);
-      b.type = 'button';
-      b.dataset.uid = item.uid;
-      const r1 = el('div', null, 'st-repo-opt-head');
-      const contractExt = item.isMachineContract
-        ? (/\.ya?ml$/i.test(String(item.path || '')) ? ' · .yaml' : ' · .json')
-        : '';
-      const r1Right = el('div', null, 'st-graph-controls');
-      if (hasSavedDraft(item.uid)) r1Right.append(el('span', '📝 草稿', 'st-draft-tag'));
-      r1Right.append(el('span', `${sm.dot} ${sm.label}`, sm.badge));
-      r1.append(
-        el('span', `${item.code} · ${item.typeLabel}${contractExt}`, 'st-muted-xs'),
-        r1Right,
-      );
-      b.append(r1, el('div', item.title));
-      b.addEventListener('click', () => {
-        // 原地切换选中高亮并加载右侧正文，绝不销毁重建侧边栏导致滚动跳变
-        state.selectedUid = item.uid;
-        state.selectedAnchor = null;
-        listWrap.querySelectorAll('.st-review-item-btn').forEach(btn => {
-          btn.classList.toggle('is-active', btn.dataset.uid === item.uid);
-        });
-        mountDocumentReader(readerCard, item);
+
+    const bucketed = new Map(FOLDER_DEFS.map(f => [f.id, { def: f, visible: [], totalAll: [] }]));
+    for (const item of allItems) {
+      const targetDef = FOLDER_DEFS.find(f => f.cats.has(item.category)) || FOLDER_DEFS[4];
+      bucketed.get(targetDef.id).totalAll.push(item);
+    }
+    for (const item of matchedItems) {
+      const targetDef = FOLDER_DEFS.find(f => f.cats.has(item.category)) || FOLDER_DEFS[4];
+      bucketed.get(targetDef.id).visible.push(item);
+    }
+
+    for (const { def, visible, totalAll } of bucketed.values()) {
+      if (!visible.length) continue;
+      const toggleKey = `${state.repoId}:${def.id}`;
+      const manual = state.reviewManualToggles?.get(toggleKey);
+      const containsSelected = visible.some(i => i.uid === state.selectedUid);
+      const isOpen = hasFilter
+        ? true
+        : (containsSelected ? (manual !== 'closed') : (manual ? manual === 'open' : Boolean(def.defaultOpen)));
+
+      const decidedCnt = totalAll.filter(i => {
+        const eff = getEffectiveStatus(i.target || i.uid);
+        return eff && eff !== 'pending';
+      }).length;
+
+      const folderEl = el('div', null, `st-acc-folder${def.isContracts ? ' is-contracts' : ''}`);
+      const hdrBtn = el('button', null, 'st-acc-folder-hdr');
+      hdrBtn.type = 'button';
+      hdrBtn.setAttribute('aria-expanded', String(isOpen));
+      const hLeft = el('span', null, 'st-acc-folder-hdr-left');
+      hLeft.append(el('span', isOpen ? '▾' : '▸'), el('span', def.label));
+      if (def.isContracts) hLeft.append(infoTrigger('catGroup:contracts', document));
+      const cntLbl = hasFilter
+        ? `命中 ${visible.length}/${totalAll.length}`
+        : `已审 ${decidedCnt}/${totalAll.length}`;
+      hdrBtn.append(hLeft, el('span', cntLbl, 'st-badge st-badge-zinc'));
+      hdrBtn.addEventListener('click', ev => {
+        if (ev.target?.closest?.('.st-info-btn')) return;
+        state.reviewManualToggles?.set(toggleKey, isOpen ? 'closed' : 'open');
+        paintList();
       });
-      listWrap.append(b);
+      folderEl.append(hdrBtn);
+
+      if (isOpen) {
+        const bodyEl = el('div', null, 'st-acc-folder-body');
+        for (const item of visible) {
+          const eff = getEffectiveStatus(item.target || item.uid);
+          const sm = STATUS_META[eff] || STATUS_META.pending;
+          const b = el('button', null, `st-review-item-btn${item.uid === state.selectedUid ? ' is-active' : ''}`);
+          b.type = 'button';
+          b.dataset.uid = item.uid;
+          const contractExt = item.isMachineContract
+            ? (/\.ya?ml$/i.test(String(item.path || '')) ? ' · .yaml' : ' · .json')
+            : '';
+          const r1 = el('div', null, 'st-repo-opt-head');
+          const r1Right = el('div', null, 'st-graph-controls');
+          if (hasSavedDraft(item.uid)) r1Right.append(el('span', '📝 草稿', 'st-draft-tag'));
+          r1Right.append(el('span', `${sm.dot} ${sm.label}`, sm.badge));
+          r1.append(el('span', `${item.code || ''} · ${item.typeLabel}${contractExt}`, 'st-muted-xs'), r1Right);
+          b.append(
+            r1,
+            renderEntityBrief(document, {
+              title: item.title,
+              summary: item.summary,
+              code: '',
+              typeLabel: '',
+            }, { compact: true, showPath: false, maxSummaryChars: 68 }),
+          );
+          b.addEventListener('click', () => {
+            state.selectedUid = item.uid;
+            state.selectedAnchor = null;
+            listWrap.querySelectorAll('.st-review-item-btn').forEach(btn => {
+              btn.classList.toggle('is-active', btn.dataset.uid === item.uid);
+            });
+            mountDocumentReader(readerCard, item);
+          });
+          bodyEl.append(b);
+        }
+        folderEl.append(bodyEl);
+      }
+      listWrap.append(folderEl);
     }
-    return items;
+    return matchedItems;
   };
+  statusSel.addEventListener('change', () => {
+    state.reviewStatusFilter = statusSel.value;
+    syncReaderToFiltered(paintList());
+  });
   searchInp.addEventListener('input', () => {
     state.reviewQuery = searchInp.value;
     const filtered = paintList();
@@ -2166,8 +2516,7 @@ function renderReviewPanel() {
       syncReaderToFiltered(filtered);
     }
   });
-  const initialItems = paintList();
-  syncReaderToFiltered(initialItems);
+  syncReaderToFiltered(paintList());
 
   split.append(sidebar, readerCard);
   host.append(split);
@@ -2186,9 +2535,25 @@ export function buildRuntimeTargetsTable(targetsToShow = [], doc = document, opt
   const thead = mk('thead');
   const htr = mk('tr');
   const cols = showActions
-    ? ['监控目标', '计划进度', '活跃令牌锁', '事件哈希链', '受管子进程', '操作']
-    : ['监控目标', '计划进度', '活跃令牌锁', '事件哈希链', '受管子进程'];
-  for (const h of cols) htr.append(mk('th', h));
+    ? [
+      ['监控目标', 'col:runtimeTargets'],
+      ['计划进度', null],
+      ['活跃令牌锁', 'rt:tokenLock'],
+      ['事件哈希链', 'rt:stateStore'],
+      ['受管子进程', 'rt:processStatus'],
+      ['操作', null],
+    ]
+    : [
+      ['监控目标', 'col:runtimeTargets'],
+      ['计划进度', null],
+      ['活跃令牌锁', 'rt:tokenLock'],
+      ['事件哈希链', 'rt:stateStore'],
+      ['受管子进程', 'rt:processStatus'],
+    ];
+  const hasRealDom = typeof doc?.getElementById === 'function';
+  for (const [h, tipKey] of cols) {
+    htr.append(hasRealDom && tipKey ? thWithInfo(doc, h, tipKey) : mk('th', h));
+  }
   thead.append(htr);
   const tbody = mk('tbody');
   for (const t of targetsToShow) {
@@ -2319,52 +2684,23 @@ function openRegisterRuntimeModal(onRegistered, editTarget = null) {
   (isEdit ? fTitle.inp : fId.inp).focus();
 }
 
-function renderTaskTreeView(host, scopedTargets, { fleetFamCount = 0, onGoFleet = null, onRunSandbox = null, onMountSource = null } = {}) {
-  const bannerNote = el('div', '什么时候看这里：当你发起一个跨波次长程任务时，默认看本页确认总体进度、正在执行哪一步以及哪一环被前置依赖阻塞。', 'st-scenario-banner');
+function renderTaskTreeView(host, scopedTargets, { plans = [], fleetFamCount = 0, onGoFleet = null, onRunSandbox = null, onMountSource = null } = {}) {
+  const bannerNote = el('div', '什么时候看这里：不仅跟踪实时沙箱与当前挂载的活跃执行计划，也聚合工作区近期进行中与已完成的历史执行计划与规划总览，点击左侧任意计划卡右侧即刻展开任务树与摘要。', 'st-scenario-banner');
   host.append(bannerNote);
 
-  const planTargets = scopedTargets.filter(t => (t.taskSummary?.total ?? 0) > 0 || (t.taskSummary?.tree?.length ?? 0) > 0);
-  const allTasks = planTargets.flatMap(t => (t.taskSummary?.tasks || []).map(tk => ({ ...tk, targetTitle: t.title })));
-  const total = allTasks.length;
-  const done = allTasks.filter(t => t.status === 'done').length;
-  const running = allTasks.filter(t => t.status === 'running').length;
-  const blocked = allTasks.filter(t => t.status === 'blocked').length;
-  const todo = allTasks.filter(t => t.status === 'todo').length;
-  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  const scopedPlans = plans.filter(p => {
+    if (state.rtSelectedTargetId !== '__all__' && p.targetId !== state.rtSelectedTargetId) return false;
+    if (state.rtScope === 'repo' && p.repoId && p.repoId !== state.repoId && !p.isSandbox) return false;
+    return true;
+  });
 
-  const focusTarget = planTargets.find(t => (t.taskSummary?.running ?? 0) > 0 || (t.taskSummary?.blocked ?? 0) > 0) || planTargets[0] || null;
-  const focusInfo = focusTarget?.taskSummary?.focusBanner || null;
-
-  const focusBox = el('div', null, 'st-focus-banner');
-  const fTop = el('div', null, 'st-repo-opt-head');
-  const fLeft = el('div', null, 'st-graph-controls');
-  fLeft.append(
-    el('strong', '🎯 当前推进焦点'),
-    el('span', focusInfo?.activePath?.length ? focusInfo.activePath.join(' › ') : (total > 0 ? '所有步骤均已完成' : '暂无活跃执行计划'), 'st-badge st-badge-indigo'),
-    infoTrigger('rt:taskStatus', document),
-  );
-  fTop.append(fLeft, el('span', `已完成 ${done} · 进行中 ${running} · 阻断 ${blocked} · 待办 ${todo} / 共 ${total} 项 (${pct}%)`, 'st-muted-xs st-tabular'));
-  focusBox.append(fTop);
-
-  if (total > 0) {
-    const bar = el('div', null, 'st-progress-multi');
-    const seg = (cls, cnt) => {
-      const d = el('div', null, cls);
-      d.style.width = `${((cnt / total) * 100).toFixed(2)}%`;
-      return d;
-    };
-    bar.append(seg('st-prog-seg-done', done), seg('st-prog-seg-running', running), seg('st-prog-seg-blocked', blocked), seg('st-prog-seg-todo', todo));
-    focusBox.append(bar);
-  }
-  host.append(focusBox);
-
-  const card = el('div', null, 'st-card st-guide-section');
-  if (total === 0) {
-    card.append(
-      el('h3', '当前范围内暂无活跃执行计划文件', ''),
+  if (scopedPlans.length === 0) {
+    const emptyCard = el('div', null, 'st-card st-guide-section');
+    emptyCard.append(
+      el('h3', '当前范围内暂无活跃或历史执行计划文件', ''),
       el('p', '支持多级标题/缩进复选框的 .md、嵌套 .json 或 .csv；若你正在观测本机已运行的多智能体协作会话，可直接点下方按钮切换编队视图，或一键体验沙箱演练 / 挂载计划文件。', 'st-muted-xs'),
     );
-    card.firstChild.style.marginTop = '0';
+    emptyCard.firstChild.style.marginTop = '0';
     const actRow = el('div', null, 'st-empty-actions');
     if (fleetFamCount > 0 && typeof onGoFleet === 'function') {
       const fleetBtn = el('button', `🛰️ 查看本机 ${fleetFamCount} 组智能体会话 →`, 'st-btn st-btn-primary');
@@ -2376,35 +2712,38 @@ function renderTaskTreeView(host, scopedTargets, { fleetFamCount = 0, onGoFleet 
     sbxEmptyBtn.type = 'button';
     sbxEmptyBtn.disabled = !state.writable;
     sbxEmptyBtn.addEventListener('click', () => onRunSandbox?.(sbxEmptyBtn));
-    const mntEmptyBtn = el('button', '+ 挂载运行源', 'st-btn');
+    const mntEmptyBtn = el('button', '＋ 挂载运行源', 'st-btn');
     mntEmptyBtn.type = 'button';
     mntEmptyBtn.disabled = !state.writable;
     mntEmptyBtn.addEventListener('click', () => onMountSource?.());
     actRow.append(sbxEmptyBtn, mntEmptyBtn);
-    card.append(actRow);
-    host.append(card);
+    emptyCard.append(actRow);
+    host.append(emptyCard);
     return;
   }
 
-  const ctrl = el('div', null, 'st-graph-toolbar');
-  ctrl.style.padding = '0 0 12px 0';
-  const pills = el('div', null, 'st-graph-controls');
-  for (const [fk, fl] of [['all', '全部任务树'], ['incomplete', '仅看未完成'], ['focus', '聚焦当前活跃链路']]) {
-    const b = el('button', fl, `st-btn${state.rtTaskFilter === fk ? ' is-active' : ''}`);
-    b.type = 'button';
-    b.addEventListener('click', () => { state.rtTaskFilter = fk; paintTree(); });
-    pills.append(b);
-  }
-  const qInp = el('input', null, 'st-input');
-  qInp.type = 'search';
-  qInp.style.width = '240px';
-  qInp.placeholder = '按波次、编号或步骤关键词过滤…';
-  qInp.value = state.rtTaskQuery;
-  ctrl.append(pills, qInp);
-  card.append(ctrl);
+  const shell = el('div', null, 'st-master-detail');
+  const masterCard = el('aside', null, 'st-card st-md-master');
+  const detailCol = el('div', null, 'st-md-detail');
 
-  const treeMount = el('div', null, 'st-task-tree-root');
-  card.append(treeMount);
+  const mTop = el('div', null, 'st-repo-opt-head');
+  mTop.append(el('strong', `🌳 执行计划清单 (${scopedPlans.length})`));
+  const mntBtn = el('button', '＋ 挂载', 'st-btn st-btn-xs');
+  mntBtn.type = 'button';
+  mntBtn.disabled = !state.writable;
+  mntBtn.addEventListener('click', () => onMountSource?.());
+  mTop.append(mntBtn);
+
+  const filterRow = el('div', null, 'st-graph-controls');
+  const planSearch = el('input', null, 'st-input');
+  planSearch.type = 'search';
+  planSearch.placeholder = '搜索计划标题、摘要或仓库…';
+  planSearch.value = state.rtPlanQuery || '';
+
+  const planList = el('div', null, 'st-md-list');
+  masterCard.append(mTop, filterRow, planSearch, planList);
+  shell.append(masterCard, detailCol);
+  host.append(shell);
 
   const matchesNodeFilter = (node, q) => {
     const children = node.children || [];
@@ -2420,14 +2759,12 @@ function renderTaskTreeView(host, scopedTargets, { fleetFamCount = 0, onGoFleet 
     return true;
   };
 
-  const renderNodeBranch = (node, targetId, q) => {
+  const renderNodeBranch = (node, targetId, q, onRepaint) => {
     if (!matchesNodeFilter(node, q)) return null;
     const hasKids = Array.isArray(node.children) && node.children.length > 0;
     const key = `${targetId}::${node.id}`;
-    // 关键词搜索时自动穿透已折叠分支，防止命中叶子步骤被隐藏
     const isCollapsed = !q && state.rtCollapsedTreeIds.has(key);
     const box = el('div', null, 'st-tree-node');
-
     const row = el('div', null, `st-tree-row${!hasKids && node.status === 'running' ? ' is-active-leaf' : ''}`);
     const left = el('div', null, 'st-graph-controls');
     if (hasKids) {
@@ -2437,7 +2774,7 @@ function renderTaskTreeView(host, scopedTargets, { fleetFamCount = 0, onGoFleet 
       tog.addEventListener('click', () => {
         if (state.rtCollapsedTreeIds.has(key)) state.rtCollapsedTreeIds.delete(key);
         else state.rtCollapsedTreeIds.add(key);
-        paintTree();
+        onRepaint();
       });
       left.append(tog);
     }
@@ -2446,23 +2783,18 @@ function renderTaskTreeView(host, scopedTargets, { fleetFamCount = 0, onGoFleet 
     if (Array.isArray(node.blockedBy) && node.blockedBy.length > 0) {
       left.append(el('span', `依赖前置：${node.blockedBy.join(', ')}`, 'st-badge st-badge-amber'));
     }
-
     const right = el('div', null, 'st-graph-controls');
     const stTone = node.status === 'done' ? 'emerald' : (node.status === 'running' ? 'indigo' : (node.status === 'blocked' ? 'rose' : 'zinc'));
     const stTxt = node.status === 'done' ? '🟢 已完成' : (node.status === 'running' ? '🔵 进行中' : (node.status === 'blocked' ? '🔴 阻断' : '⚪ 待办'));
-    if (hasKids) {
-      right.append(el('span', `${node.done}/${node.total} (${node.percent}%)`, 'st-muted-xs st-tabular'));
-    } else if (node.detail) {
-      right.append(el('span', node.detail, 'st-muted-xs'));
-    }
+    if (hasKids) right.append(el('span', `${node.done}/${node.total} (${node.percent}%)`, 'st-muted-xs st-tabular'));
+    else if (node.detail) right.append(el('span', node.detail, 'st-muted-xs'));
     right.append(el('span', stTxt, `st-badge st-badge-${stTone}`));
     row.append(left, right);
     box.append(row);
-
     if (hasKids && !isCollapsed) {
       const chWrap = el('div', null, 'st-tree-children');
       for (const ch of node.children) {
-        const chEl = renderNodeBranch(ch, targetId, q);
+        const chEl = renderNodeBranch(ch, targetId, q, onRepaint);
         if (chEl) chWrap.append(chEl);
       }
       if (chWrap.children.length > 0) box.append(chWrap);
@@ -2470,42 +2802,178 @@ function renderTaskTreeView(host, scopedTargets, { fleetFamCount = 0, onGoFleet 
     return box;
   };
 
-  const paintTree = () => {
-    ctrl.querySelectorAll('.st-btn').forEach(btn => {
-      const m = [['all', '全部任务树'], ['incomplete', '仅看未完成'], ['focus', '聚焦当前活跃链路']].find(x => x[1] === btn.textContent);
-      if (m) btn.classList.toggle('is-active', state.rtTaskFilter === m[0]);
-    });
-    treeMount.replaceChildren();
-    const q = state.rtTaskQuery.trim().toLowerCase();
-    for (const pt of planTargets) {
-      const subHdr = el('div', null, 'st-repo-opt-head');
-      subHdr.style.margin = '6px 0 2px';
-      subHdr.append(el('strong', pt.title), el('span', `${pt.taskSummary.done}/${pt.taskSummary.total} (${pt.taskSummary.percent}%)`, 'st-badge st-badge-indigo'));
-      treeMount.append(subHdr);
-      const treeRoots = pt.taskSummary?.tree || [];
+  const renderPlanDetail = plan => {
+    detailCol.replaceChildren();
+    if (!plan) {
+      detailCol.append(el('p', '请从左侧选择一条运行计划或历史规划查看任务树详情。', 'st-muted-xs'));
+      return;
+    }
+    const ts = plan.taskSummary || { total: 0, done: 0, running: 0, blocked: 0, todo: 0, percent: plan.percent || 0, tree: [] };
+    const focusBox = el('div', null, 'st-focus-banner');
+    const fTop = el('div', null, 'st-repo-opt-head');
+    fTop.append(
+      renderEntityBrief(document, {
+        title: plan.title,
+        summary: plan.summary,
+        code: plan.statusLabel,
+        typeLabel: plan.repoName,
+        badge: plan.badge,
+        path: plan.planPath,
+      }),
+      el('div', null, 'st-graph-controls'),
+    );
+    const toneCls = plan.status === 'completed' ? 'st-badge-emerald' : (plan.status === 'in_progress' ? 'st-badge-indigo' : 'st-badge-zinc');
+    fTop.lastChild.append(
+      el('span', `${plan.statusLabel} · ${plan.percent ?? ts.percent ?? 0}%`, `st-badge ${toneCls}`),
+      infoTrigger('rt:taskStatus', document),
+    );
+    focusBox.append(fTop);
+
+    const total = ts.total || 0;
+    if (total > 0) {
+      const bar = el('div', null, 'st-progress-multi');
+      const seg = (cls, cnt) => { const d = el('div', null, cls); d.style.width = `${((cnt / total) * 100).toFixed(2)}%`; return d; };
+      bar.append(seg('st-prog-seg-done', ts.done), seg('st-prog-seg-running', ts.running), seg('st-prog-seg-blocked', ts.blocked), seg('st-prog-seg-todo', ts.todo));
+      const focusLine = el('div', `已完成 ${ts.done} · 进行中 ${ts.running} · 阻断 ${ts.blocked} · 待办 ${ts.todo} / 共 ${total} 项 (${ts.percent}%)`, 'st-muted-xs st-tabular');
+      focusLine.style.marginTop = '8px';
+      focusBox.append(bar, focusLine);
+    } else if (plan.updatedAt) {
+      focusBox.append(el('div', `最近更新：${formatIsoShort(plan.updatedAt)}${plan.isHistorical ? ' · 已归档历史规划' : ''}`, 'st-muted-xs'));
+    }
+    detailCol.append(focusBox);
+
+    const card = el('div', null, 'st-card st-guide-section');
+    const treeRoots = ts.tree || [];
+    if (!treeRoots.length) {
+      card.append(
+        el('h3', '文档型历史规划 / 规格说明摘要', ''),
+        el('p', `该文档以自然章节描述波次目标（当前含 ${total} 条复选框步骤），已展示中文标题、摘要与最新更新时间；如需进入实时 6 节点编队或 3 层复选框演练，可运行沙箱演练或切换到编队视图。`, 'st-muted-xs'),
+      );
+      card.firstChild.style.marginTop = '0';
+      const quickRow = el('div', null, 'st-empty-actions');
+      if (fleetFamCount > 0 && typeof onGoFleet === 'function') {
+        const fb = el('button', `🛰️ 查看本机 ${fleetFamCount} 组智能体会话 →`, 'st-btn st-btn-primary');
+        fb.type = 'button';
+        fb.addEventListener('click', onGoFleet);
+        quickRow.append(fb);
+      }
+      const sb = el('button', '▶ 运行隔离沙箱演练', 'st-btn');
+      sb.type = 'button';
+      sb.disabled = !state.writable;
+      sb.addEventListener('click', () => onRunSandbox?.(sb));
+      quickRow.append(sb);
+      card.append(quickRow);
+      detailCol.append(card);
+      return;
+    }
+
+    const ctrl = el('div', null, 'st-graph-toolbar');
+    ctrl.style.padding = '0 0 12px 0';
+    const pills = el('div', null, 'st-graph-controls');
+    const qInp = el('input', null, 'st-input');
+    qInp.type = 'search';
+    qInp.style.width = '240px';
+    qInp.placeholder = '按波次、编号或步骤关键词过滤…';
+    qInp.value = state.rtTaskQuery;
+    ctrl.append(pills, qInp);
+    const treeMount = el('div', null, 'st-task-tree-root');
+    card.append(ctrl, treeMount);
+    detailCol.append(card);
+
+    const paintTree = () => {
+      pills.replaceChildren();
+      for (const [fk, fl] of [['all', '全部任务树'], ['incomplete', '仅看未完成'], ['focus', '聚焦当前活跃链路']]) {
+        const b = el('button', fl, `st-btn${state.rtTaskFilter === fk ? ' is-active' : ''}`);
+        b.type = 'button';
+        b.addEventListener('click', () => { state.rtTaskFilter = fk; paintTree(); });
+        pills.append(b);
+      }
+      treeMount.replaceChildren();
+      const q = state.rtTaskQuery.trim().toLowerCase();
       let renderedCount = 0;
       for (const rootNode of treeRoots) {
-        const elNode = renderNodeBranch(rootNode, pt.id, q);
+        const elNode = renderNodeBranch(rootNode, plan.id, q, paintTree);
         if (elNode) { treeMount.append(elNode); renderedCount += 1; }
       }
       if (renderedCount === 0) {
         const emptyRow = el('div', null, 'st-empty-actions');
         const clrTreeBtn = el('button', '🔄 清空筛选条件', 'st-btn');
         clrTreeBtn.type = 'button';
-        clrTreeBtn.addEventListener('click', () => {
-          state.rtTaskFilter = 'all';
-          state.rtTaskQuery = '';
-          qInp.value = '';
-          paintTree();
-        });
+        clrTreeBtn.addEventListener('click', () => { state.rtTaskFilter = 'all'; state.rtTaskQuery = ''; qInp.value = ''; paintTree(); });
         emptyRow.append(el('span', '该计划在当前筛选下无匹配项。', 'st-muted-xs'), clrTreeBtn);
         treeMount.append(emptyRow);
       }
-    }
+    };
+    qInp.addEventListener('input', () => { state.rtTaskQuery = qInp.value; paintTree(); });
+    paintTree();
   };
-  qInp.addEventListener('input', () => { state.rtTaskQuery = qInp.value; paintTree(); });
-  paintTree();
-  host.append(card);
+
+  const paintMaster = () => {
+    filterRow.replaceChildren();
+    const counts = {
+      all: scopedPlans.length,
+      in_progress: scopedPlans.filter(p => p.status === 'in_progress' || p.status === 'pending').length,
+      completed: scopedPlans.filter(p => p.status === 'completed').length,
+    };
+    for (const [fk, fl] of [['all', `全部 ${counts.all}`], ['in_progress', `进行中 ${counts.in_progress}`], ['completed', `已完成 ${counts.completed}`]]) {
+      const b = el('button', fl, `st-btn st-btn-xs${state.rtPlanFilter === fk ? ' is-active' : ''}`);
+      b.type = 'button';
+      b.addEventListener('click', () => { state.rtPlanFilter = fk; paintMaster(); });
+      filterRow.append(b);
+    }
+
+    const pq = (state.rtPlanQuery || '').trim().toLowerCase();
+    const visiblePlans = scopedPlans.filter(p => {
+      if (state.rtPlanFilter === 'in_progress' && p.status === 'completed') return false;
+      if (state.rtPlanFilter === 'completed' && p.status !== 'completed') return false;
+      if (pq && !`${p.title} ${p.summary} ${p.repoName} ${p.planPath}`.toLowerCase().includes(pq)) return false;
+      return true;
+    });
+
+    planList.replaceChildren();
+    if (!visiblePlans.length) {
+      planList.append(el('p', '当前筛选条件下无匹配计划。', 'st-muted-xs'));
+      const clr = el('button', '🔄 清空筛选条件', 'st-btn');
+      clr.type = 'button';
+      clr.addEventListener('click', () => { state.rtPlanFilter = 'all'; state.rtPlanQuery = ''; planSearch.value = ''; paintMaster(); });
+      planList.append(clr);
+      return visiblePlans;
+    }
+    if (!visiblePlans.some(p => p.id === state.rtSelectedPlanId)) {
+      state.rtSelectedPlanId = visiblePlans[0].id;
+    }
+
+    for (const p of visiblePlans) {
+      const card = el('button', null, `st-task-card${p.id === state.rtSelectedPlanId ? ' is-selected' : ''}`);
+      card.type = 'button';
+      card.dataset.planId = p.id;
+      card.append(renderEntityBrief(document, {
+        title: p.title,
+        summary: p.summary,
+        code: p.statusLabel,
+        typeLabel: p.repoName,
+        badge: p.badge,
+        path: p.planPath,
+      }, { compact: true, showPath: true, maxSummaryChars: 74 }));
+      const foot = el('div', null, 'st-task-card-meta st-tabular');
+      foot.append(
+        el('span', p.totalSteps > 0 ? `步骤 ${p.completedSteps}/${p.totalSteps} (${p.percent}%)` : p.statusLabel),
+        el('span', formatIsoShort(p.updatedAt)),
+      );
+      card.append(foot);
+      card.addEventListener('click', () => {
+        state.rtSelectedPlanId = p.id;
+        planList.querySelectorAll('.st-task-card').forEach(c => c.classList.toggle('is-selected', c.dataset.planId === p.id));
+        renderPlanDetail(p);
+      });
+      planList.append(card);
+    }
+    return visiblePlans;
+  };
+
+  planSearch.addEventListener('input', () => { state.rtPlanQuery = planSearch.value; paintMaster(); });
+  const initList = paintMaster();
+  renderPlanDetail(initList.find(p => p.id === state.rtSelectedPlanId) || initList[0] || null);
 }
 
 function collectUniqueScopedLocks(scopedTargets) {
@@ -2609,7 +3077,9 @@ function renderEventChainSubpanel(host, scopedTargets) {
       const tbl = el('table', null, 'st-prose-table');
       const thead = el('thead');
       const hr = el('tr');
-      for (const h of ['序号', '事件类型 (eventType)', '产生者 (producer)', '时间戳', 'recordDigest 摘要', '链接校验']) hr.append(el('th', h));
+      for (const [h, tip] of [['序号', null], ['事件类型 (eventType)', null], ['产生者 (producer)', null], ['时间戳', null], ['recordDigest 摘要', null], ['链接校验', 'col:chainVer']]) {
+        hr.append(tip ? thWithInfo(document, h, tip) : el('th', h));
+      }
       thead.append(hr);
       const tbody = el('tbody');
       for (const ev of [...events].reverse().slice(0, 50)) {
@@ -2656,7 +3126,9 @@ function renderProcessSubpanel(host, scopedTargets) {
   const tbl = el('table', null, 'st-prose-table');
   const thead = el('thead');
   const hr = el('tr');
-  for (const h of ['运行源 / 文件', 'PID', '命令/脚本', '状态', '退出码', '耗时', '保护标记']) hr.append(el('th', h));
+  for (const [h, tip] of [['运行源 / 文件', null], ['PID', null], ['命令/脚本', null], ['状态', 'rt:processStatus'], ['退出码', null], ['耗时', null], ['保护标记', 'col:procGuard']]) {
+    hr.append(tip ? thWithInfo(document, h, tip) : el('th', h));
+  }
   thead.append(hr);
   const tbody = el('tbody');
   for (const p of procs) {
@@ -2919,6 +3391,7 @@ async function renderRuntimePanel() {
       onRemoveTarget: handleRemoveTarget,
     });
     renderTaskTreeView(viewHost, scopedTargets, {
+      plans: rt.plans || [],
       fleetFamCount,
       onGoFleet: () => { state.rtView = 'fleet'; renderRuntimePanel(); },
       onRunSandbox: runSandboxWithGuard,
@@ -2977,15 +3450,22 @@ function renderActiveTab() {
   else if (state.tab === 'runtime') renderRuntimePanel();
 }
 
+let selectRepoSeq = 0;
+
 async function selectRepo(repoId, { skipRender = false } = {}) {
   if (!repoId) return;
+  const mySeq = ++selectRepoSeq;
   state.repoId = repoId;
+  state.snap = null;
+  state.alignment = null;
+  state.selectedUid = null;
   state.graphMode = 'dag';
   state.archifyIdx = 0;
   state.archifySelectedNode = null;
   state.selectedAnchor = null;
   state.reviewCategory = 'all';
   state.rtSelectedTargetId = '__all__';
+  if (!skipRender) renderActiveTab();
   const u = new URL(location.href);
   u.searchParams.set('repo', repoId);
   if (state.tab) u.searchParams.set('tab', state.tab);
@@ -2994,6 +3474,7 @@ async function selectRepo(repoId, { skipRender = false } = {}) {
     apiJson(`/api/studio/repo?repo=${encodeURIComponent(repoId)}`),
     apiJson(`/api/studio/alignment?repo=${encodeURIComponent(repoId)}`).catch(() => null),
   ]);
+  if (mySeq !== selectRepoSeq) return;
   state.snap = data.snapshot;
   state.alignment = alignData;
   const def = pickDefaultArtifactNode(state.snap.nodes || []) || (state.snap.reviewItems || [])[0] || null;
@@ -3064,9 +3545,14 @@ async function boot() {
     if (nextOpen) { renderRepoPopover(); document.getElementById('st-repo-search').focus(); }
   });
   document.getElementById('st-repo-search').addEventListener('input', renderRepoPopover);
+  document.getElementById('st-add-repo-btn')?.addEventListener('click', openAddRepoModal);
+  document.getElementById('st-edit-repo-meta-btn')?.addEventListener('click', () => {
+    const cur = state.repos.find(r => r.id === state.repoId);
+    if (cur) openRepoMetaModal(cur);
+  });
   document.querySelectorAll('.st-tab-btn').forEach(b => b.addEventListener('click', () => switchTab(b.dataset.tab)));
 
-  // 点击空白处收起项目切换器；Escape 按优先级依次关闭 5 类浮层/全屏模式
+  // 点击空白处收起项目切换器；Escape 按优先级依次关闭浮层/全屏模式
   document.addEventListener('pointerdown', ev => {
     if (!pop.hidden && !pop.contains(ev.target) && !trig.contains(ev.target)) {
       closeRepoPopover();
@@ -3075,6 +3561,8 @@ async function boot() {
   document.addEventListener('keydown', ev => {
     if (ev.key !== 'Escape') return;
     if (isTooltipOpen(document)) { closeGlobalTooltip(document); return; }
+    const repoModal = document.getElementById('st-repo-modal');
+    if (repoModal) { repoModal.remove(); return; }
     const rtModal = document.getElementById('st-rt-reg-modal');
     if (rtModal) { rtModal.remove(); return; }
     if (!exportBackdrop.hidden) { exportBackdrop.hidden = true; return; }
@@ -3115,6 +3603,10 @@ async function boot() {
       state.decisions = fresh.decisions || {};
       state.annotations = fresh.annotations || [];
       updateTopbarSummary();
+    });
+    es.addEventListener('catalog-change', async () => {
+      const fresh = await apiJson('/api/studio/state?refresh=1');
+      await applyEcosystemUpdate(fresh.ecosystem);
     });
     es.addEventListener('runtime-change', () => {
       state.rtSseStatus = 'connected';

@@ -12,7 +12,15 @@ import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { FOUNDATION_PACKAGE_VERSION } from 'skill-family-harness-node';
 import { inspectRepoAlignment } from './alignment-inspector.mjs';
-import { discoverStudioRepos, inspectProjectRepo, readRepoArchifyAsset, readRepoDocument } from './ecosystem.mjs';
+import {
+  discoverStudioRepos,
+  inspectProjectRepo,
+  readRepoArchifyAsset,
+  readRepoDocument,
+  registerStudioRepo,
+  unregisterStudioRepo,
+  updateStudioRepoMeta,
+} from './ecosystem.mjs';
 import { STUDIO_GUIDE_MODEL } from './guide-content.mjs';
 import {
   DEFAULT_STUDIO_REVIEWS_PATH,
@@ -21,6 +29,7 @@ import {
   assertSafeObjectKeys,
   buildStudioReviewSummary,
   cleanString,
+  qualifyRepoTargetId,
   readStudioReviewStore,
   splitQualifiedTargetId,
   writeStudioReviewStore,
@@ -356,7 +365,28 @@ export async function createStudioServer({
           legacyFallbackRoot: fb.legacyFallbackRoot,
           defaultPrimaryRepoId: fb.defaultPrimaryRepoId,
         });
-        const summary = buildStudioReviewSummary(store, { repos: catalog.repos });
+        const itemMetaByTarget = new Map();
+        const touchedRepos = new Set();
+        for (const qt of Object.keys(store.decisions ?? {})) {
+          const { repoId } = splitQualifiedTargetId(qt);
+          if (repoId) touchedRepos.add(repoId);
+        }
+        for (const ann of store.annotations ?? []) {
+          const { repoId } = splitQualifiedTargetId(ann?.target || '');
+          if (repoId) touchedRepos.add(repoId);
+        }
+        for (const rid of touchedRepos) {
+          const rec = catalog.byId.get(rid);
+          if (!rec) continue;
+          try {
+            const entry = await getRepoEntry(rec, false);
+            for (const it of entry.publicSnapshot.reviewItems || []) {
+              const qt = qualifyRepoTargetId(rid, it.target || it.uid);
+              itemMetaByTarget.set(qt, { title: it.title || '', summary: it.summary || '', typeLabel: it.typeLabel || '' });
+            }
+          } catch {}
+        }
+        const summary = buildStudioReviewSummary(store, { repos: catalog.repos, itemMetaByTarget });
         if (url.searchParams.get('format') === 'markdown') {
           res.writeHead(200, { 'Content-Type': 'text/markdown; charset=utf-8', 'Cache-Control': 'no-store' });
           res.end(Buffer.from(summary.markdown, 'utf8'));
@@ -513,6 +543,73 @@ export async function createStudioServer({
           sendJson(res, 200, { ok: true, released, lockHeld: Boolean(sandboxHandle?.isLockHeld?.()) });
           return;
         }
+
+        if (pathname === '/api/studio/repos/register') {
+          const saved = await enqueueWrite(async () => registerStudioRepo(resolvedRoot, body));
+          cachedCatalog = null;
+          catalogAt = 0;
+          repoCache.clear();
+          const nextCatalog = await getCatalog(true);
+          const addedRec = [...nextCatalog.byId.values()].find(r => r.realPath === saved.realPath);
+          broadcast('catalog-change', { action: 'register', repoId: addedRec?.id || null, at: new Date().toISOString() });
+          sendJson(res, 200, {
+            ok: true,
+            addedRepoId: addedRec?.id || null,
+            storagePath: saved.storagePath,
+            ecosystem: {
+              available: nextCatalog.available,
+              count: nextCatalog.count,
+              primaryRepoId: nextCatalog.primaryRepoId,
+              repos: nextCatalog.repos,
+            },
+          });
+          return;
+        }
+
+        if (pathname === '/api/studio/repos/unregister') {
+          const curCatalog = await getCatalog(false);
+          const saved = await enqueueWrite(async () => unregisterStudioRepo(resolvedRoot, body, curCatalog));
+          cachedCatalog = null;
+          catalogAt = 0;
+          repoCache.clear();
+          const nextCatalog = await getCatalog(true);
+          broadcast('catalog-change', { action: 'unregister', repoId: saved.removedRepoId, at: new Date().toISOString() });
+          sendJson(res, 200, {
+            ok: true,
+            removedRepoId: saved.removedRepoId,
+            mode: saved.mode,
+            storagePath: saved.storagePath,
+            ecosystem: {
+              available: nextCatalog.available,
+              count: nextCatalog.count,
+              primaryRepoId: nextCatalog.primaryRepoId,
+              repos: nextCatalog.repos,
+            },
+          });
+          return;
+        }
+
+        if (pathname === '/api/studio/repos/meta') {
+          const curCatalog = await getCatalog(false);
+          const saved = await enqueueWrite(async () => updateStudioRepoMeta(resolvedRoot, body, curCatalog));
+          cachedCatalog = null;
+          catalogAt = 0;
+          repoCache.clear();
+          const nextCatalog = await getCatalog(true);
+          broadcast('catalog-change', { action: 'meta', repoId: saved.repoId, at: new Date().toISOString() });
+          sendJson(res, 200, {
+            ok: true,
+            repoId: saved.repoId,
+            storagePath: saved.storagePath,
+            ecosystem: {
+              available: nextCatalog.available,
+              count: nextCatalog.count,
+              primaryRepoId: nextCatalog.primaryRepoId,
+              repos: nextCatalog.repos,
+            },
+          });
+          return;
+        }
       }
 
       if (!['GET', 'HEAD'].includes(req.method ?? 'GET')) {
@@ -531,6 +628,11 @@ export async function createStudioServer({
         '/graph-layout.mjs': { file: join(PKG_SRC_DIR, 'graph-layout.mjs'), type: MIME_TYPES['.mjs'] },
         '/assets/graph-layout.mjs': { file: join(PKG_SRC_DIR, 'graph-layout.mjs'), type: MIME_TYPES['.mjs'] },
       };
+      if (pathname === '/favicon.ico') {
+        res.writeHead(204, { 'Cache-Control': 'public, max-age=86400' });
+        res.end();
+        return;
+      }
       const hit = staticMap[pathname];
       if (!hit) {
         sendJson(res, 404, { ok: false, error: `未找到请求路径：${pathname}` });

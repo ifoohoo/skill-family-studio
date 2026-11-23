@@ -110,6 +110,40 @@ export const GLOSSARY = Object.freeze({
   'rt:tokenLock': { title: 'token-lock 排他文件锁', meaning: 'Foundation 写集保护锁，防止多个并行智能体同时覆写同一批文件；超过阈值（默认 30 秒）自动琥珀色预警，沙箱演练锁可在运行监控右上角一键释放。' },
   'rt:stateStore': { title: 'state-store 事件哈希链 & Fencing', meaning: '每一步状态变迁均以 SHA-256 链接到前序摘要并递增 Fencing 纪元，保证长任务断点续跑防脑裂；VALID 表示校验完整无篡改。' },
   'rt:processStatus': { title: '受管子进程状态 (EXITED / TIMED_OUT)', meaning: 'supervise-process 对子进程的看门狗记录：RUNNING 运行中、EXITED 正常退出、TIMED_OUT 触发超时代杀保护（SIGTERM/SIGKILL）。' },
+
+  // Wave 14：表头统一字典与审阅签收总规则
+  'col:alignItem': { title: '高阶需求与原文入口', meaning: '显示高阶需求或规划条目的中文标题、一句话摘要与源码入口，点击条目即可直接跳读正文。' },
+  'col:alignDisposition': {
+    title: '业务处置与承接去向规则',
+    meaning: '定义高阶条目在本轮的去向：已拆派 (allocated) 表示已指派给下游技能族仓；暂缓 (deferred)、已合并 (merged)、已废弃 (abandoned) 表示不计入当前交付欠账。',
+    rule: '每条拆派胶囊旁的绿/橙徽章分别表示目标仓已补齐新鲜代码/测试双锁，或尚待补锁。',
+  },
+  'col:alignSatisfaction': {
+    title: '实际满足度（机器派生口径）',
+    meaning: '严格由下游目标文件存在性、上下游摘要互锁与双锁新鲜度派生，绝不信任人工口头填表：',
+    rule: '🟢 已验证满足：目标存在 + 双向一致 + 含新鲜 implements/verifies 双锁；🔵 部分覆盖：仍有 remainingScope 未拆；⏳ 推进中：已派单但未补齐验证双锁；⚪ 不计满足：已按处置结案；🔴 漏拆：未派单。',
+  },
+  'col:alignHealth': {
+    title: '双向对齐结论与漂移诊断',
+    meaning: '核对高阶规划仓与详设子仓之间的 SHA-256 互指是否一致。出现 🟠 或 🔴 时，下方会列出具体缺失或漂移告警代码。',
+  },
+  'col:upstreamLocal': { title: '本仓详细设计条目', meaning: '显示本子仓 artifacts/upstream-bindings.json 登记的本地详设标题、摘要与文件路径，点击即可跳读本仓文档。' },
+  'col:upstreamSource': { title: '上游高阶规划来源', meaning: '对应高阶规划仓中的来源需求标题与摘要，点击胶囊直接跨仓跳回高阶需求原文。' },
+  'col:upstreamHealth': {
+    title: '上下游双向同步状态',
+    meaning: '🟢 双向一致表示本仓详设与高阶来源均未发生未同步修改；若高阶或详设任一方改动未回写，会直接标橙/标红提醒。',
+  },
+  'col:chainVer': { title: '哈希链单条校验结果', meaning: '实时核验每条事件的 recordDigest 与 prevDigest 是否连续无缝，防止状态日志中途损坏或被越界改写。' },
+  'col:procGuard': { title: '看门狗退出与超时强杀标记', meaning: '标明子进程是受控正常退出（exitCode=0），还是因超过 maxSeconds 触发 SIGTERM/SIGKILL 超时代杀保护。' },
+  'col:runtimeTargets': { title: '监控目标与运行计划进度规则', meaning: '汇总活跃监控源、自定义挂载计划及近期历史计划的完成步数、活跃写锁、状态哈希链与子进程监督记录。' },
+  'review:statusRules': {
+    title: '审阅签收 5 种状态流转规则',
+    meaning: '⚪ 待审阅：未给终态且无未解决批注；🔵 审阅中：添加第 1 条未解决批注即自动点亮，清空或全部解决批注且无终态时自动退回待审；🟠 需修改：需至少写 1 条批注或备注后才可退回；🟢 已通过：签收并在队列中跳过；🟣 暂缓：留待后续波次。',
+  },
+  'repo:provenance': {
+    title: '项目名称与说明的真实来源',
+    meaning: '工作台按「自定义覆写 (.studio-workspace.json / workspace-projects.json) → .studio-workspace.json 标题 → package.json#description → README.md 首段」自动聚合项目身份，可随时点击查看来源或覆写更名。',
+  },
 });
 
 let managerInitialized = false;
@@ -259,4 +293,78 @@ export function infoTrigger(key, doc = document) {
 export function isTooltipOpen(doc = document) {
   const box = doc.getElementById('st-global-tooltip');
   return Boolean(box && !box.hidden);
+}
+
+export function thWithInfo(doc, label, tipKey) {
+  const th = doc.createElement('th');
+  const wrap = doc.createElement('span');
+  wrap.className = 'st-th-flex';
+  const txt = doc.createElement('span');
+  txt.textContent = label;
+  wrap.append(txt);
+  if (tipKey && GLOSSARY[tipKey]) wrap.append(infoTrigger(tipKey, doc));
+  th.append(wrap);
+  return th;
+}
+
+export function renderEntityBrief(doc, entity = {}, options = {}) {
+  const {
+    compact = false,
+    showPath = !compact,
+    hideSummary = false,
+    maxSummaryChars = compact ? 76 : 112,
+  } = options;
+  const wrap = doc.createElement('div');
+  wrap.className = `st-entity-brief${compact ? ' is-compact' : ''}`;
+
+  const rawTitle = String(entity.title || entity.name || entity.code || entity.uid || '未命名条目').trim();
+  const rawCode = String(entity.code || '').trim();
+  const typeLabel = String(entity.typeLabel || '').trim();
+  const badgeText = String(entity.badge || '').trim();
+
+  const head = doc.createElement('div');
+  head.className = 'st-entity-head';
+  const titleEl = doc.createElement('strong');
+  titleEl.className = 'st-entity-title';
+  titleEl.textContent = rawTitle;
+  head.append(titleEl);
+
+  if (rawCode && rawCode !== rawTitle) {
+    const codeSpan = doc.createElement('span');
+    codeSpan.className = 'st-entity-code';
+    codeSpan.textContent = rawCode;
+    head.append(codeSpan);
+  }
+  if (typeLabel) {
+    const typeSpan = doc.createElement('span');
+    typeSpan.className = 'st-entity-type';
+    typeSpan.textContent = typeLabel;
+    head.append(typeSpan);
+  }
+  if (badgeText) {
+    const badgeSpan = doc.createElement('span');
+    badgeSpan.className = 'st-badge st-badge-zinc';
+    badgeSpan.textContent = badgeText;
+    head.append(badgeSpan);
+  }
+  wrap.append(head);
+
+  if (!hideSummary && entity.summary) {
+    const rawSum = String(entity.summary).trim();
+    const sumText = rawSum.length > maxSummaryChars ? `${rawSum.slice(0, maxSummaryChars - 1)}…` : rawSum;
+    const sumEl = doc.createElement('div');
+    sumEl.className = 'st-entity-summary';
+    sumEl.textContent = sumText;
+    wrap.append(sumEl);
+  }
+
+  if (showPath && entity.path) {
+    const pathEl = doc.createElement('div');
+    pathEl.className = 'st-entity-path';
+    pathEl.textContent = String(entity.path);
+    pathEl.title = String(entity.path);
+    wrap.append(pathEl);
+  }
+
+  return wrap;
 }

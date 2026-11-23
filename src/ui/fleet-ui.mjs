@@ -1,6 +1,8 @@
 // @feature STU006
 // @feature STU003
 
+import { renderEntityBrief } from './tooltips.mjs';
+
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const HUE_PALETTE = [
   '#4f46e5', // 0: 主控 indigo
@@ -205,67 +207,157 @@ export function mountFleetMonitor(host, {
     return;
   }
 
-  const activeFam = families.find(f => f.id === state.rtFleetFamilyId) || families[0];
-  state.rtFleetFamilyId = activeFam.id;
-  const agents = activeFam.agents || [];
-  const agentMap = new Map(agents.map(a => [a.id, a]));
-  const selectedAgent = state.rtFleetSelectedAgent && agentMap.has(state.rtFleetSelectedAgent)
-    ? agentMap.get(state.rtFleetSelectedAgent)
-    : null;
+  const HOST_ZH = { all: '全部', sandbox: '沙箱演练', antigravity: 'Antigravity', claude: 'Claude', codex: 'Codex', local: '本地快照' };
+  const layoutShell = mk(doc, 'div', null, 'st-master-detail');
+  const pickerCard = mk(doc, 'aside', null, 'st-card st-md-master st-fleet-picker');
+  const detailHost = mk(doc, 'div', null, 'st-md-detail');
 
-  // 1. 顶部编队脉冲摘要卡 + 4 KPI
-  const header = mk(doc, 'div', null, 'st-fleet-header');
-  const hLeft = mk(doc, 'div', null, 'st-fleet-head-left');
-  const eye = mk(doc, 'div', null, 'st-fleet-eyebrow');
-  eye.append(doc.createTextNode(`AGENT 编队 · ${String(activeFam.host || 'local').toUpperCase()}`));
-  const titleRow = mk(doc, 'div', null, 'st-fleet-title-row');
-  titleRow.append(mk(doc, 'h2', '多智能体会话编队监控', ''));
-  titleRow.firstChild.style.margin = '0';
-
-  const famSel = mk(doc, 'select', null, 'st-select');
-  famSel.style.width = 'auto';
-  famSel.style.maxWidth = '420px';
-  for (const f of families) {
-    const opt = mk(doc, 'option', `[${f.host}] ${f.title} (${f.summary?.totalAgents ?? f.agents?.length ?? 0} 会话)`);
-    opt.value = f.id;
-    if (f.id === activeFam.id) opt.selected = true;
-    famSel.append(opt);
-  }
-  famSel.addEventListener('change', () => {
-    state.rtFleetFamilyId = famSel.value;
-    state.rtFleetSelectedAgent = null;
-    state.rtFleetSelectedEventId = null;
-    onStateChange();
-  });
-  const refreshBtn = mk(doc, 'button', '↻ 刷新日志', 'st-btn');
+  const pickerTop = mk(doc, 'div', null, 'st-repo-opt-head');
+  pickerTop.append(mk(doc, 'strong', `🛰️ 会话编队 (${families.length})`));
+  const refreshBtn = mk(doc, 'button', '↻ 刷新日志', 'st-btn st-btn-xs');
   refreshBtn.type = 'button';
   refreshBtn.addEventListener('click', onRefresh);
-  titleRow.append(famSel, refreshBtn);
+  pickerTop.append(refreshBtn);
 
-  if (selectedAgent) {
-    const selPill = mk(doc, 'button', `已锁定会话：${selectedAgent.name} ×`, 'st-jump-pill');
-    selPill.type = 'button';
-    selPill.addEventListener('click', () => { state.rtFleetSelectedAgent = null; onStateChange(); });
-    titleRow.append(selPill);
-  }
-  const subP = mk(doc, 'p', `在统一时间线上联动查看主会话与子会话拓扑网络、委派与回报泳道，以及每条任务简报。${activeFam.repoHint ? `关联目录：${activeFam.repoHint}` : ''}`, 'st-muted-xs');
-  subP.style.margin = '4px 0 0';
-  hLeft.append(eye, titleRow, subP);
+  const hostPills = mk(doc, 'div', null, 'st-graph-controls');
+  const presentHosts = new Set(families.map(f => f.host));
+  const pillKeys = ['all', 'antigravity', 'claude', 'codex'];
+  if (presentHosts.has('sandbox')) pillKeys.splice(1, 0, 'sandbox');
+  if (presentHosts.has('local')) pillKeys.push('local');
 
-  const kpiWrap = mk(doc, 'dl', null, 'st-fleet-stats');
-  const sum = activeFam.summary || {};
-  for (const [label, val, tone] of [
-    ['会话总数', sum.totalAgents ?? agents.length, ''],
-    ['运行中', sum.runningAgents ?? agents.filter(a => a.status === 'running').length, 'is-cyan'],
-    ['委派工作项', sum.totalDelegations ?? (activeFam.delegations || []).length, ''],
-    ['消息 / 回报', sum.totalMessages ?? (activeFam.events || []).length, 'is-indigo'],
-  ]) {
-    const d = mk(doc, 'div', null, `st-fleet-stat ${tone}`);
-    d.append(mk(doc, 'dt', label), mk(doc, 'dd', String(val), 'st-tabular'));
-    kpiWrap.append(d);
-  }
-  header.append(hLeft, kpiWrap);
-  host.append(header);
+  const pickerSearch = mk(doc, 'input', null, 'st-input');
+  pickerSearch.type = 'search';
+  pickerSearch.placeholder = '筛选编队标题、摘要或仓库…';
+  pickerSearch.value = state.rtFleetPickerQuery || '';
+
+  const pickerList = mk(doc, 'div', null, 'st-md-list');
+  pickerCard.append(pickerTop, hostPills, pickerSearch, pickerList);
+  layoutShell.append(pickerCard, detailHost);
+  host.append(layoutShell);
+
+  const getFilteredFamilies = () => {
+    const hf = state.rtFleetHostFilter || 'all';
+    const pq = (state.rtFleetPickerQuery || '').trim().toLowerCase();
+    return families.filter(f => {
+      if (hf !== 'all' && f.host !== hf) return false;
+      if (pq && !`${f.title} ${f.briefSummary || ''} ${f.repoHint || ''} ${f.host}`.toLowerCase().includes(pq)) return false;
+      return true;
+    });
+  };
+
+  let renderRightDetail = () => {};
+
+  const paintPicker = () => {
+    hostPills.replaceChildren();
+    const curHf = state.rtFleetHostFilter || 'all';
+    for (const hk of pillKeys) {
+      const cnt = hk === 'all' ? families.length : families.filter(f => f.host === hk).length;
+      const pb = mk(doc, 'button', `${HOST_ZH[hk] || hk} ${cnt}`, `st-btn st-btn-xs${curHf === hk ? ' is-active' : ''}`);
+      pb.type = 'button';
+      pb.addEventListener('click', () => {
+        state.rtFleetHostFilter = hk;
+        paintPicker();
+      });
+      hostPills.append(pb);
+    }
+
+    pickerList.replaceChildren();
+    const list = getFilteredFamilies();
+    if (!list.length) {
+      pickerList.append(mk(doc, 'p', '当前筛选条件下无匹配会话编队。', 'st-muted-xs'));
+      const clrBtn = mk(doc, 'button', '🔄 清空筛选条件', 'st-btn');
+      clrBtn.type = 'button';
+      clrBtn.addEventListener('click', () => {
+        state.rtFleetHostFilter = 'all';
+        state.rtFleetPickerQuery = '';
+        pickerSearch.value = '';
+        paintPicker();
+      });
+      pickerList.append(clrBtn);
+      return;
+    }
+
+    for (const f of list) {
+      const isSel = state.rtFleetFamilyId === f.id;
+      const card = mk(doc, 'button', null, `st-fleet-sess-card${isSel ? ' is-selected' : ''}`);
+      card.type = 'button';
+      card.dataset.familyId = f.id;
+      card.append(renderEntityBrief(doc, {
+        title: f.title,
+        summary: f.briefSummary || `${HOST_ZH[f.host] || f.host} · ${f.agents?.length || 0} 个会话`,
+        code: HOST_ZH[f.host] || String(f.host || '').toUpperCase(),
+        typeLabel: f.repoHint || '',
+        badge: f.host === 'sandbox' ? '演练样板' : '',
+      }, { compact: true, showPath: false, maxSummaryChars: 80 }));
+
+      const foot = mk(doc, 'div', null, 'st-fleet-sess-meta st-tabular');
+      foot.append(
+        mk(doc, 'span', `${f.summary?.totalAgents ?? f.agents?.length ?? 0} 会话 · ${f.summary?.totalDelegations ?? f.delegations?.length ?? 0} 委派`),
+        mk(doc, 'span', `${fmtTokens(f.summary?.totalTokens || 0)} · ${fmtTimeShort(f.updatedAt)}`),
+      );
+      card.append(foot);
+      card.addEventListener('click', () => {
+        if (state.rtFleetFamilyId === f.id) return;
+        state.rtFleetFamilyId = f.id;
+        state.rtFleetSelectedAgent = null;
+        state.rtFleetSelectedEventId = null;
+        pickerList.querySelectorAll('.st-fleet-sess-card').forEach(btn => {
+          btn.classList.toggle('is-selected', btn.dataset.familyId === f.id);
+        });
+        renderRightDetail(f);
+      });
+      pickerList.append(card);
+    }
+  };
+
+  pickerSearch.addEventListener('input', () => {
+    state.rtFleetPickerQuery = pickerSearch.value;
+    paintPicker();
+  });
+
+  renderRightDetail = activeFam => {
+    detailHost.replaceChildren();
+    if (!activeFam) {
+      detailHost.append(mk(doc, 'p', '请在左侧选择一条会话编队查看拓扑网络与交互泳道。', 'st-muted-xs'));
+      return;
+    }
+    const agents = activeFam.agents || [];
+    const agentMap = new Map(agents.map(a => [a.id, a]));
+    const selectedAgent = state.rtFleetSelectedAgent && agentMap.has(state.rtFleetSelectedAgent)
+      ? agentMap.get(state.rtFleetSelectedAgent)
+      : null;
+
+    // 1. 顶部编队脉冲摘要卡 + 4 KPI
+    const header = mk(doc, 'div', null, 'st-fleet-header');
+    const hLeft = mk(doc, 'div', null, 'st-fleet-head-left');
+    hLeft.append(renderEntityBrief(doc, {
+      title: activeFam.title || '多智能体会话编队监控',
+      summary: activeFam.briefSummary || '在统一时间线上联动查看主会话与子会话拓扑网络、委派与回报泳道，以及每条任务简报。',
+      code: HOST_ZH[activeFam.host] || String(activeFam.host || 'local').toUpperCase(),
+      typeLabel: activeFam.repoHint ? `关联目录：${activeFam.repoHint}` : '多智能体编队',
+    }, { compact: false, showPath: false, maxSummaryChars: 130 }));
+    if (selectedAgent) {
+      const selPill = mk(doc, 'button', `已锁定会话：${selectedAgent.name} ×`, 'st-jump-pill');
+      selPill.type = 'button';
+      selPill.style.marginTop = '8px';
+      selPill.addEventListener('click', () => { state.rtFleetSelectedAgent = null; renderRightDetail(activeFam); });
+      hLeft.append(selPill);
+    }
+
+    const kpiWrap = mk(doc, 'dl', null, 'st-fleet-stats');
+    const sum = activeFam.summary || {};
+    for (const [label, val, tone] of [
+      ['会话总数', sum.totalAgents ?? agents.length, ''],
+      ['运行中', sum.runningAgents ?? agents.filter(a => a.status === 'running').length, 'is-cyan'],
+      ['委派工作项', sum.totalDelegations ?? (activeFam.delegations || []).length, ''],
+      ['消息 / 回报', sum.totalMessages ?? (activeFam.events || []).length, 'is-indigo'],
+    ]) {
+      const d = mk(doc, 'div', null, `st-fleet-stat ${tone}`);
+      d.append(mk(doc, 'dt', label), mk(doc, 'dd', String(val), 'st-tabular'));
+      kpiWrap.append(d);
+    }
+    header.append(hLeft, kpiWrap);
+    detailHost.append(header);
 
   // 2. 主双列区域：左「Agent 会话网络」 + 右「跨会话协作泳道」&「协作任务」
   const mainGrid = mk(doc, 'div', null, 'st-fleet-main-grid');
@@ -358,7 +450,7 @@ export function mountFleetMonitor(host, {
     card.append(r1, r2, barWrap, r3);
     card.addEventListener('click', () => {
       state.rtFleetSelectedAgent = state.rtFleetSelectedAgent === ag.id ? null : ag.id;
-      onStateChange();
+      renderRightDetail(activeFam);
     });
     cardEls.set(ag.id, card);
     treeCanvas.append(card);
@@ -440,7 +532,7 @@ export function mountFleetMonitor(host, {
       rowBtn.append(av, info);
       rowBtn.addEventListener('click', () => {
         state.rtFleetSelectedAgent = state.rtFleetSelectedAgent === ag.id ? null : ag.id;
-        onStateChange();
+        renderRightDetail(activeFam);
       });
       laneLabelsCol.append(rowBtn);
     });
@@ -588,7 +680,7 @@ export function mountFleetMonitor(host, {
 
   rightStack.append(laneCard, workCard);
   mainGrid.append(netCard, rightStack);
-  host.append(mainGrid);
+  detailHost.append(mainGrid);
 
   // 3. 底部全宽「事件检查」左右分栏详情器（局部重绘，搜索框绝不失焦）
   const inspCard = mk(doc, 'section', null, 'st-card st-fleet-inspector-card');
@@ -754,5 +846,11 @@ export function mountFleetMonitor(host, {
 
   inspSplit.append(evListCol, evDetailCol);
   inspCard.append(inspHead, inspSplit);
-  host.append(inspCard);
+  detailHost.append(inspCard);
+  };
+
+  const initFam = families.find(f => f.id === state.rtFleetFamilyId) || families[0] || null;
+  state.rtFleetFamilyId = initFam?.id || null;
+  paintPicker();
+  renderRightDetail(initFam);
 }

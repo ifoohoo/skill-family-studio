@@ -22,6 +22,113 @@ export function sanitizePublicText(value) {
     .replace(/\/Users\/[A-Za-z0-9._-]+/g, '<USER_HOME>');
 }
 
+export function cleanInlinePlain(text) {
+  return sanitizePublicText(String(text ?? ''))
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function extractArtifactBrief({
+  rawText = '',
+  frontmatter = null,
+  fallbackTitle = '',
+  code = '',
+  typeLabel = '',
+  path = '',
+} = {}) {
+  const normalized = sanitizePublicText(String(rawText ?? '')).replace(/\r\n/g, '\n');
+  let body = normalized;
+  const fmParsed = { ...(frontmatter && typeof frontmatter === 'object' ? frontmatter : {}) };
+  const fmMatch = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(normalized);
+  if (fmMatch) {
+    body = fmMatch[2];
+    if (!frontmatter) {
+      for (const line of fmMatch[1].split('\n')) {
+        const kv = /^([A-Za-z0-9_.-]+)\s*:\s*(.+)$/.exec(line.trim());
+        if (!kv) continue;
+        const k = kv[1];
+        if (['__proto__', 'constructor', 'prototype'].includes(k)) continue;
+        const v = kv[2].trim().replace(/^["']|["']$/g, '');
+        if (v && !fmParsed[k]) fmParsed[k] = v;
+      }
+    }
+  }
+
+  let h1Title = '';
+  const bodyLines = body.split('\n');
+  const proseSnippets = [];
+  let inCodeFence = false;
+  for (const rawLine of bodyLines) {
+    const t = rawLine.trim();
+    if (/^```/.test(t)) { inCodeFence = !inCodeFence; continue; }
+    if (inCodeFence || !t) continue;
+    if (t.startsWith('# ') && !h1Title) {
+      h1Title = cleanInlinePlain(t.slice(2));
+      continue;
+    }
+    if (/^#{2,6}\s/.test(t) || /^<!--/.test(t) || /^---+$/.test(t) || /^<details|^<\/details>|^<summary/i.test(t)) continue;
+    if (/^\[阅读目录\]/.test(t) || /^故事编号\s+LC-\d+$/i.test(t) || /^\|/.test(t)) continue;
+    if (/^[-*]\s+\*\*(?:related_|parent_|scenarios|design_docs|depends_on|所属|编号|状态)/i.test(t)) continue;
+    if (/^>\s*\[!(?:NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*$/i.test(t)) continue;
+    const stripped = cleanInlinePlain(t.replace(/^>\s*/, '').replace(/^[-*]\s+/, ''));
+    if (stripped.length >= 10 && !/^[A-Za-z0-9_.:/-]+$/.test(stripped)) {
+      proseSnippets.push(stripped);
+      if (proseSnippets.join(' ').length >= 110) break;
+    }
+  }
+
+  const fileFallback = path ? String(path).split('/').pop().replace(/\.[^.]+$/, '') : '';
+  const rawTitle = cleanInlinePlain(fmParsed.title || h1Title || fallbackTitle || code || fileFallback || '未命名制品');
+  const title = rawTitle || cleanInlinePlain(code || fileFallback || '未命名制品');
+
+  let summary = cleanInlinePlain(fmParsed.summary || fmParsed.description || fmParsed.purpose || '');
+  if (summary.length < 10) {
+    summary = cleanInlinePlain(proseSnippets.join(' '));
+  }
+  if (summary.length < 10) {
+    summary = `查看${typeLabel ? `「${typeLabel}」` : '制品'}「${title}」的业务范围、边界约定与验收细则。`;
+  }
+  if (summary.length > 105) {
+    const cutWindow = summary.slice(48, 104);
+    const punctOffset = Math.max(cutWindow.lastIndexOf('。'), cutWindow.lastIndexOf('；'), cutWindow.lastIndexOf('！'));
+    summary = punctOffset >= 0 ? summary.slice(0, 48 + punctOffset + 1) : `${summary.slice(0, 98).trim()}…`;
+  }
+
+  return { title, summary };
+}
+
+function renderDocHeroHtml({ title, summary, code, typeLabel, path, status, frontmatter } = {}) {
+  const badges = [];
+  if (typeLabel) badges.push(`<span class="st-badge st-badge-indigo">${escapeHtml(typeLabel)}</span>`);
+  if (code) badges.push(`<span class="st-badge st-badge-zinc">${escapeHtml(code)}</span>`);
+  const stVal = status || frontmatter?.status;
+  if (stVal) badges.push(`<span class="st-badge st-badge-emerald">状态：${escapeHtml(String(stVal))}</span>`);
+  const extraKeys = [];
+  if (frontmatter && typeof frontmatter === 'object') {
+    for (const [fk, fv] of Object.entries(frontmatter)) {
+      if (['id', 'title', 'summary', 'description', 'status', '__proto__', 'constructor', 'prototype'].includes(fk)) continue;
+      if (Array.isArray(fv) && fv.length > 0) extraKeys.push(`${fk}: ${fv.slice(0, 3).join(', ')}${fv.length > 3 ? ` +${fv.length - 3}` : ''}`);
+      else if ((typeof fv === 'string' || typeof fv === 'number') && String(fv).trim()) extraKeys.push(`${fk}: ${fv}`);
+    }
+  }
+  const metaChips = extraKeys.slice(0, 4).map(m => `<span class="st-doc-meta-chip">${escapeHtml(m)}</span>`).join('');
+  return [
+    '<header class="st-doc-hero">',
+    `<div class="st-doc-hero-top"><div class="st-graph-controls">${badges.join('')}</div>${path ? `<span class="st-doc-path-chip">${escapeHtml(path)}</span>` : ''}</div>`,
+    `<h1 class="st-doc-hero-title">${escapeHtml(title || '制品文档')}</h1>`,
+    summary ? `<p class="st-doc-hero-lead">${escapeHtml(summary)}</p>` : '',
+    metaChips ? `<div class="st-doc-hero-meta">${metaChips}</div>` : '',
+    '</header>',
+  ].join('');
+}
+
 function renderInlineMarkdown(text) {
   let out = escapeHtml(text);
   out = out.replace(/`([^`]+)`/g, '<code class="st-inline-code">$1</code>');
@@ -208,13 +315,21 @@ export function renderMermaidOffline(rawLines) {
   return `<div class="st-mermaid-card"><div class="st-mermaid-head"><span class="st-badge st-badge-indigo">Mermaid ${escapeHtml(kindLabel)}（离线可视化图）</span><span class="st-muted-xs">${steps.length ? `共 ${nodeOrder.length} 个节点 · ${steps.length} 条流转边` : '源码预览'}</span></div>${svgHtml}${steps.length ? `<details class="st-mermaid-raw"><summary class="st-muted-xs">展开关系明细与 Mermaid 源码</summary>${stepsHtml}${codeHtml}</details>` : codeHtml}</div>`;
 }
 
-export function renderMarkdownToHtml(markdown, { idPrefix = 'sec', stripNavLine = false } = {}) {
+export function renderMarkdownToHtml(markdown, { idPrefix = 'sec', stripNavLine = false, heroMeta = null } = {}) {
   const lines = String(markdown ?? '').replace(/\r\n/g, '\n').split('\n');
   const headings = [];
   const blocks = [];
   let i = 0;
   let seq = 0;
   let title = '';
+
+  const CALLOUT_LABELS = {
+    NOTE: ['note', '💡 备注说明'],
+    TIP: ['tip', '✨ 实用建议'],
+    IMPORTANT: ['important', '📌 核心要求'],
+    WARNING: ['warning', '⚠️ 边界预警'],
+    CAUTION: ['caution', '🚨 风险红线'],
+  };
 
   while (i < lines.length) {
     const trimmed = lines[i].trim();
@@ -264,7 +379,8 @@ export function renderMarkdownToHtml(markdown, { idPrefix = 'sec', stripNavLine 
       const plain = rawTitle.replace(/[*`]/g, '').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').trim();
       const id = hMatch[3] || `${idPrefix}-${seq}`;
       headings.push({ id, level, title: plain });
-      blocks.push(`<h${level} id="${escapeHtml(id)}" class="st-prose-heading">${renderInlineMarkdown(rawTitle)}<button type="button" class="st-heading-anchor" data-anchor-id="${escapeHtml(id)}">#章节批注</button></h${level}>`);
+      const hCls = level === 2 ? 'st-prose-heading st-prose-h2' : 'st-prose-heading st-prose-h3';
+      blocks.push(`<h${level} id="${escapeHtml(id)}" class="${hCls}">${renderInlineMarkdown(rawTitle)}<button type="button" class="st-heading-anchor" data-anchor-id="${escapeHtml(id)}">#章节批注</button></h${level}>`);
       i++;
       continue;
     }
@@ -280,19 +396,36 @@ export function renderMarkdownToHtml(markdown, { idPrefix = 'sec', stripNavLine 
     if (trimmed.startsWith('>')) {
       const q = [];
       while (i < lines.length && lines[i].trim().startsWith('>')) { q.push(lines[i].trim().replace(/^>\s?/, '')); i++; }
-      blocks.push(`<blockquote><p>${renderInlineMarkdown(q.join(' '))}</p></blockquote>`);
+      const firstLine = q[0] || '';
+      const alertMatch = /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*(.*)$/i.exec(firstLine);
+      if (alertMatch) {
+        const [kindCls, badgeLabel] = CALLOUT_LABELS[alertMatch[1].toUpperCase()] || ['note', '💡 提示'];
+        const rest = [alertMatch[2], ...q.slice(1)].filter(Boolean).join(' ');
+        blocks.push(`<div class="st-callout st-callout-${kindCls}"><div class="st-callout-title">${badgeLabel}</div><div class="st-callout-body"><p>${renderInlineMarkdown(rest || '说明')}</p></div></div>`);
+      } else {
+        blocks.push(`<blockquote class="st-callout st-callout-quote"><p>${renderInlineMarkdown(q.join(' '))}</p></blockquote>`);
+      }
       continue;
     }
     if (/^[-*]\s+/.test(trimmed)) {
       const items = [];
-      while (i < lines.length && /^[-*]\s+/.test(lines[i].trim())) { items.push(`<li>${renderInlineMarkdown(lines[i].trim().replace(/^[-*]\s+/, ''))}</li>`); i++; }
-      blocks.push(`<ul>${items.join('')}</ul>`);
+      while (i < lines.length && /^[-*]\s+/.test(lines[i].trim())) {
+        const lineBody = lines[i].trim().replace(/^[-*]\s+/, '');
+        const kvMatch = /^\*\*([^*：:]{1,28})\*\*\s*[：:]\s*(.+)$/.exec(lineBody);
+        if (kvMatch) {
+          items.push(`<li class="st-kv-item"><span class="st-kv-key">${escapeHtml(kvMatch[1].trim())}</span><span class="st-kv-val">${renderInlineMarkdown(kvMatch[2].trim())}</span></li>`);
+        } else {
+          items.push(`<li>${renderInlineMarkdown(lineBody)}</li>`);
+        }
+        i++;
+      }
+      blocks.push(`<ul class="st-prose-list">${items.join('')}</ul>`);
       continue;
     }
     if (/^\d+\.\s+/.test(trimmed)) {
       const items = [];
       while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) { items.push(`<li>${renderInlineMarkdown(lines[i].trim().replace(/^\d+\.\s+/, ''))}</li>`); i++; }
-      blocks.push(`<ol>${items.join('')}</ol>`);
+      blocks.push(`<ol class="st-prose-list">${items.join('')}</ol>`);
       continue;
     }
     const p = [];
@@ -300,7 +433,25 @@ export function renderMarkdownToHtml(markdown, { idPrefix = 'sec', stripNavLine 
       p.push(lines[i].trim());
       i++;
     }
-    blocks.push(`<p>${renderInlineMarkdown(p.join(' '))}</p>`);
+    const paraText = p.join(' ');
+    if (/^(?:\*\*)?(?:作为|作为一名)[^。]{2,}(?:我希望|我想|需要)[^。]+/.test(paraText)) {
+      blocks.push(`<div class="st-story-card"><span class="st-story-pill">👤 用户故事诉求</span><p>${renderInlineMarkdown(paraText)}</p></div>`);
+    } else if (/^(?:\*\*)?(?:前提条件|触发动作|预期结果|验收标准|场景[一二三四五六七八九十0-9]+)[：:\s\*]/.test(paraText)) {
+      blocks.push(`<div class="st-scenario-step"><p>${renderInlineMarkdown(paraText)}</p></div>`);
+    } else {
+      blocks.push(`<p>${renderInlineMarkdown(paraText)}</p>`);
+    }
   }
-  return { title, headings, html: blocks.join('\n') };
+  const heroHtml = heroMeta
+    ? renderDocHeroHtml({
+      title: heroMeta.title || title,
+      summary: heroMeta.summary,
+      code: heroMeta.code,
+      typeLabel: heroMeta.typeLabel,
+      path: heroMeta.path,
+      status: heroMeta.status,
+      frontmatter: heroMeta.frontmatter,
+    })
+    : '';
+  return { title, headings, html: heroHtml + blocks.join('\n') };
 }

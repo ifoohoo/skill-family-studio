@@ -3,7 +3,7 @@
 
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { lstat, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
   VERSION_LOCK_PATH,
@@ -13,10 +13,10 @@ import {
   matchesConfiguredArtifactPath,
   scanArtifacts,
 } from 'artifact-graph';
-import { readFileContained, resolveContained } from 'skill-family-harness-node';
+import { readFileContained, resolveContained, writeFileAtomic } from 'skill-family-harness-node';
 import { parse as parseYaml } from 'yaml';
 import { DEFAULT_LAYERS } from './graph-layout.mjs';
-import { escapeHtml, renderMarkdownToHtml, sanitizePublicText } from './markdown-render.mjs';
+import { cleanInlinePlain, escapeHtml, extractArtifactBrief, renderMarkdownToHtml, sanitizePublicText } from './markdown-render.mjs';
 import { sortItemsForGuidedReview } from './review-state.mjs';
 
 const SKIP_DIRS = new Set([
@@ -223,34 +223,34 @@ export async function resolveStudioScanRoots(workspaceRoot, explicitScanRoots, e
 
 async function resolveEffectiveCollections(repoReal, studioCfg = null) {
   const cfg = studioCfg ?? await loadStudioWorkspaceConfig(repoReal);
-  if (Array.isArray(cfg.collections) && cfg.collections.length > 0) {
-    return cfg.collections;
-  }
-  const auto = [];
-  for (const candidate of [
-    {
+  const configured = Array.isArray(cfg.collections) ? [...cfg.collections] : [];
+  const hasStories = configured.some(c => c.kind === 'lifecycle-story-pack');
+  const hasArchify = configured.some(c => c.kind === 'archify-model-scenes');
+
+  if (!hasStories) {
+    const candidate = {
       id: 'standard-stories-pack',
       kind: 'lifecycle-story-pack',
       storiesJson: 'artifacts/stories/stories.json',
       explanationsDir: 'artifacts/stories/explanations',
       comparisonMarkdown: 'artifacts/stories/replacement-comparison.md',
-    },
-  ]) {
+    };
     if (await exists(join(repoReal, candidate.storiesJson)) || await exists(join(repoReal, candidate.explanationsDir))) {
-      auto.push(candidate);
-      break;
+      configured.push(candidate);
     }
   }
-  for (const manifestJson of [
-    'artifact-reading/business/inputs/model-and-scenes.json',
-    'artifacts/diagrams/model-and-scenes.json',
-  ]) {
-    if (await exists(join(repoReal, manifestJson))) {
-      auto.push({ id: 'archify-scenes', kind: 'archify-model-scenes', manifestJson });
-      break;
+  if (!hasArchify) {
+    for (const manifestJson of [
+      'artifact-reading/business/inputs/model-and-scenes.json',
+      'artifacts/diagrams/model-and-scenes.json',
+    ]) {
+      if (await exists(join(repoReal, manifestJson))) {
+        configured.push({ id: 'archify-scenes', kind: 'archify-model-scenes', manifestJson });
+        break;
+      }
     }
   }
-  return auto;
+  return configured;
 }
 
 function extractLockEndpointKey(endpoint) {
@@ -320,18 +320,203 @@ async function countConfiguredArtifactFiles(repoReal) {
   }
 }
 
+export const STUDIO_WORKSPACE_PROJECTS_PATH = '.skill-family-studio/workspace-projects.json';
+
+async function loadWorkspaceProjectOverrides(workspaceRoot) {
+  let rootReal;
+  try { rootReal = await realpath(resolve(workspaceRoot)); } catch { return { storagePath: STUDIO_WORKSPACE_PROJECTS_PATH, extraRepos: [], excludedRepos: [], repoMeta: {} }; }
+  const hasWsJson = await exists(join(rootReal, '.studio-workspace.json'));
+  const storagePath = hasWsJson ? '.studio-workspace.json' : STUDIO_WORKSPACE_PROJECTS_PATH;
+  const wsDoc = hasWsJson ? await readJsonSafeContained(rootReal, '.studio-workspace.json') : null;
+  const localDoc = await readJsonSafeContained(rootReal, STUDIO_WORKSPACE_PROJECTS_PATH);
+
+  const rawExtra = [
+    ...(Array.isArray(wsDoc?.extraRepos) ? wsDoc.extraRepos : []),
+    ...(Array.isArray(localDoc?.extraRepos) ? localDoc.extraRepos : []),
+  ];
+  const rawExcl = [
+    ...(Array.isArray(wsDoc?.excludedRepos) ? wsDoc.excludedRepos : []),
+    ...(Array.isArray(localDoc?.excludedRepos) ? localDoc.excludedRepos : []),
+  ];
+  const repoMeta = {};
+  for (const src of [localDoc?.repoMeta, wsDoc?.repoMeta]) {
+    if (src && typeof src === 'object' && !Array.isArray(src)) {
+      for (const [k, v] of Object.entries(src)) {
+        if (['__proto__', 'constructor', 'prototype'].includes(k) || !v || typeof v !== 'object') continue;
+        repoMeta[k] = v;
+      }
+    }
+  }
+  return {
+    rootReal,
+    storagePath,
+    extraRepos: [...new Set(rawExtra.map(s => String(s ?? '').trim()).filter(Boolean))],
+    excludedRepos: [...new Set(rawExcl.map(s => String(s ?? '').trim()).filter(Boolean))],
+    repoMeta,
+  };
+}
+
+async function mutateWorkspaceProjectOverrides(workspaceRoot, mutator) {
+  const rootReal = await realpath(resolve(workspaceRoot));
+  const hasWsJson = await exists(join(rootReal, '.studio-workspace.json'));
+  const relPath = hasWsJson ? '.studio-workspace.json' : STUDIO_WORKSPACE_PROJECTS_PATH;
+  const existing = await readJsonSafeContained(rootReal, relPath)
+    || (hasWsJson ? {} : { schemaVersion: 1, extraRepos: [], excludedRepos: [], repoMeta: {} });
+  if (!Array.isArray(existing.extraRepos)) existing.extraRepos = [];
+  if (!Array.isArray(existing.excludedRepos)) existing.excludedRepos = [];
+  if (!existing.repoMeta || typeof existing.repoMeta !== 'object' || Array.isArray(existing.repoMeta)) {
+    existing.repoMeta = {};
+  }
+  await mutator(existing, rootReal, relPath);
+  existing.updatedAt = new Date().toISOString();
+  const absTarget = await resolveContained(rootReal, relPath);
+  await mkdir(dirname(absTarget), { recursive: true });
+  await writeFileAtomic(rootReal, relPath, `${JSON.stringify(existing, null, 2)}\n`);
+  return { storagePath: relPath, doc: existing };
+}
+
+function portableRepoRef(rootReal, targetReal) {
+  const rel = relative(rootReal, targetReal).split('\\').join('/');
+  if (!rel) return '.';
+  if (!rel.startsWith('..') || /^(\.\.\/){1,2}[^/]/.test(rel)) return rel;
+  return targetReal;
+}
+
+export async function registerStudioRepo(workspaceRoot, input = {}) {
+  const rawPath = String(input.repoPath ?? '').trim();
+  if (!rawPath || rawPath.includes('\0')) {
+    throw Object.assign(new Error('请提供有效的本地仓库目录路径。'), { statusCode: 400 });
+  }
+  const rootReal = await realpath(resolve(workspaceRoot));
+  const candidateAbs = isAbsolute(rawPath) ? resolve(rawPath) : resolve(rootReal, rawPath);
+  let targetReal;
+  try {
+    const st = await lstat(candidateAbs);
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      throw new Error('目标不是普通目录');
+    }
+    targetReal = await realpath(candidateAbs);
+  } catch (err) {
+    throw Object.assign(new Error(`未找到可读取的本地目录：${sanitizePublicText(rawPath)}（${err.message}）`), { statusCode: 400 });
+  }
+  if (!(await exists(join(targetReal, 'artifact-graph.config.yaml')))) {
+    throw Object.assign(new Error('目标目录缺少 artifact-graph.config.yaml；请确认路径指向技能族或受管制品仓库根目录。'), { statusCode: 400 });
+  }
+
+  const ref = portableRepoRef(rootReal, targetReal);
+  const title = typeof input.title === 'string' ? input.title.trim().slice(0, 120) : '';
+  const groupLabel = typeof input.groupLabel === 'string' ? input.groupLabel.trim().slice(0, 80) : '';
+  const description = typeof input.description === 'string' ? input.description.trim().slice(0, 400) : '';
+
+  const saved = await mutateWorkspaceProjectOverrides(workspaceRoot, async doc => {
+    doc.excludedRepos = doc.excludedRepos.filter(x => {
+      try { return resolve(rootReal, x) !== targetReal && x !== targetReal && x !== ref; } catch { return true; }
+    });
+    const alreadyInExtra = doc.extraRepos.some(x => {
+      try { return resolve(rootReal, x) === targetReal || x === targetReal || x === ref; } catch { return false; }
+    });
+    if (!alreadyInExtra) doc.extraRepos.push(ref);
+    if (title || groupLabel || description) {
+      const prev = doc.repoMeta[ref] || {};
+      doc.repoMeta[ref] = {
+        ...prev,
+        ...(title ? { title } : {}),
+        ...(groupLabel ? { groupLabel } : {}),
+        ...(description ? { description } : {}),
+      };
+    }
+  });
+  return { ok: true, repoPath: sanitizePublicText(ref), realPath: targetReal, storagePath: saved.storagePath };
+}
+
+export async function unregisterStudioRepo(workspaceRoot, input = {}, catalog = null) {
+  const repoId = String(typeof input === 'string' ? input : (input.repoId ?? '')).trim();
+  if (!repoId) throw Object.assign(new Error('请指定要移除的 repoId。'), { statusCode: 400 });
+  const rec = catalog?.byId?.get(repoId);
+  if (!rec) throw Object.assign(new Error(`未找到指定的项目仓库：${repoId}`), { statusCode: 404 });
+  if (catalog.count <= 1) {
+    throw Object.assign(new Error('当前仅剩最后 1 个受管仓库，不可全部清空；如需切换请先添加其他项目。'), { statusCode: 400 });
+  }
+  const rootReal = await realpath(resolve(workspaceRoot));
+  const ref = portableRepoRef(rootReal, rec.realPath);
+
+  const saved = await mutateWorkspaceProjectOverrides(workspaceRoot, async doc => {
+    const matchesTarget = x => {
+      if (x === repoId || x === ref || x === rec.realPath) return true;
+      try { return resolve(rootReal, x) === rec.realPath; } catch { return false; }
+    };
+    const wasExtra = doc.extraRepos.some(matchesTarget);
+    doc.extraRepos = doc.extraRepos.filter(x => !matchesTarget(x));
+    if (!wasExtra && !doc.excludedRepos.some(matchesTarget)) {
+      doc.excludedRepos.push(ref);
+    }
+  });
+  return { ok: true, removedRepoId: repoId, storagePath: saved.storagePath };
+}
+
+export async function updateStudioRepoMeta(workspaceRoot, input = {}, catalog = null) {
+  const repoId = String(input.repoId ?? '').trim();
+  if (!repoId) throw Object.assign(new Error('请指定要编辑的 repoId。'), { statusCode: 400 });
+  const rec = catalog?.byId?.get(repoId);
+  if (!rec) throw Object.assign(new Error(`未找到指定的项目仓库：${repoId}`), { statusCode: 404 });
+
+  const rootReal = await realpath(resolve(workspaceRoot));
+  const ref = portableRepoRef(rootReal, rec.realPath);
+  const title = typeof input.title === 'string' ? input.title.trim().slice(0, 120) : undefined;
+  const groupLabel = typeof input.groupLabel === 'string' ? input.groupLabel.trim().slice(0, 80) : undefined;
+  const description = typeof input.description === 'string' ? input.description.trim().slice(0, 400) : undefined;
+
+  const saved = await mutateWorkspaceProjectOverrides(workspaceRoot, async doc => {
+    const key = Object.hasOwn(doc.repoMeta, ref) ? ref : (Object.hasOwn(doc.repoMeta, repoId) ? repoId : ref);
+    const nextMeta = { ...(doc.repoMeta[key] || {}) };
+    if (title !== undefined) {
+      if (title) nextMeta.title = title;
+      else delete nextMeta.title;
+    }
+    if (groupLabel !== undefined) {
+      if (groupLabel) nextMeta.groupLabel = groupLabel;
+      else delete nextMeta.groupLabel;
+    }
+    if (description !== undefined) {
+      if (description) nextMeta.description = description;
+      else delete nextMeta.description;
+    }
+    if (Object.keys(nextMeta).length > 0) doc.repoMeta[key] = nextMeta;
+    else delete doc.repoMeta[key];
+  });
+  return { ok: true, repoId, storagePath: saved.storagePath };
+}
+
 export async function readQuickRepoMeta(repoReal) {
   let pkgName = basename(repoReal);
   let description = '';
   let version = '';
+  const metaSources = [];
+  let pkgDescPresent = false;
   try {
     const pkg = JSON.parse(await readFileContained(repoReal, 'package.json', { encoding: 'utf8' }));
     if (typeof pkg.name === 'string' && pkg.name) pkgName = pkg.name;
-    if (typeof pkg.description === 'string') description = sanitizePublicText(pkg.description);
+    if (typeof pkg.description === 'string' && pkg.description.trim()) {
+      description = sanitizePublicText(pkg.description.trim());
+      pkgDescPresent = true;
+      metaSources.push({ field: '项目说明', sourceFile: 'package.json#description', active: true });
+    }
     if (typeof pkg.version === 'string') version = pkg.version;
   } catch {}
 
+  let readmeDesc = '';
+  try {
+    const rmMd = await readFileContained(repoReal, 'README.md', { encoding: 'utf8' });
+    const brief = extractArtifactBrief({ rawText: rmMd, fallbackTitle: pkgName, path: 'README.md' });
+    if (brief.summary && !brief.summary.startsWith('查看')) {
+      readmeDesc = brief.summary;
+      metaSources.push({ field: '项目说明候选', sourceFile: 'README.md 首段', active: !pkgDescPresent });
+      if (!description) description = readmeDesc;
+    }
+  } catch {}
+
   const studioCfg = await loadStudioWorkspaceConfig(repoReal);
+  if (studioCfg.title) metaSources.push({ field: '工作区标题', sourceFile: '.studio-workspace.json / studio.title', active: true });
   const hasPortfolio = await exists(join(repoReal, 'artifacts/portfolio-allocations.json'));
   const hasUpstream = await exists(join(repoReal, 'artifacts/upstream-bindings.json'));
   const repoRole = (hasPortfolio || studioCfg.role === 'portfolio')
@@ -398,6 +583,8 @@ export async function readQuickRepoMeta(repoReal) {
   return {
     pkgName,
     description,
+    readmeDesc,
+    metaSources,
     version,
     studioCfg,
     repoRole,
@@ -412,27 +599,46 @@ export async function readQuickRepoMeta(repoReal) {
 }
 export async function discoverStudioRepos(workspaceRoot, { scanRoots, env } = {}) {
   const roots = await resolveStudioScanRoots(workspaceRoot, scanRoots, env);
+  const overrides = await loadWorkspaceProjectOverrides(workspaceRoot);
   let primaryReal = null;
   try {
     const r = await realpath(resolve(workspaceRoot));
     if (await exists(join(r, 'artifact-graph.config.yaml'))) primaryReal = r;
   } catch {}
-  if (!roots.length && !primaryReal) {
+  if (!roots.length && !primaryReal && !overrides.extraRepos.length) {
     return { available: false, count: 0, primaryRepoId: null, repos: [], byId: new Map(), groupLabels: {} };
   }
 
+  const excludedAbsSet = new Set();
+  for (const ex of overrides.excludedRepos) {
+    try {
+      const absEx = isAbsolute(ex) ? resolve(ex) : resolve(overrides.rootReal, ex);
+      excludedAbsSet.add(await realpath(absEx).catch(() => absEx));
+    } catch {}
+  }
+  const excludedIdSet = new Set(overrides.excludedRepos);
+
   const found = [];
   const seen = new Set();
-  const tryAdd = async dir => {
+  const extraSet = new Set();
+  const tryAdd = async (dir, { isExtra = false } = {}) => {
     if (!(await exists(join(dir, 'artifact-graph.config.yaml')))) return false;
     let real;
     try { real = await realpath(dir); } catch { return false; }
+    if (!isExtra && excludedAbsSet.has(real)) return false;
+    if (isExtra) extraSet.add(real);
     if (seen.has(real)) return true;
     seen.add(real);
     found.push(real);
     return true;
   };
   if (primaryReal) await tryAdd(primaryReal);
+  for (const ex of overrides.extraRepos) {
+    try {
+      const cand = isAbsolute(ex) ? resolve(ex) : resolve(overrides.rootReal, ex);
+      await tryAdd(cand, { isExtra: true });
+    } catch {}
+  }
 
   for (const sr of roots) {
     let srReal;
@@ -477,14 +683,38 @@ export async function discoverStudioRepos(workspaceRoot, { scanRoots, env } = {}
       id = `${id}-${n}`;
     }
     usedIds.add(id);
+    if (!extraSet.has(realPath) && excludedIdSet.has(id)) continue;
+
+    const pRef = portableRepoRef(overrides.rootReal, realPath);
+    const metaOverride = overrides.repoMeta[pRef] || overrides.repoMeta[id] || overrides.repoMeta[realPath] || {};
+    const naturalGroupLabel = resolveGroupLabel(group, mergedGroupLabels);
+    const originalTitle = meta.studioCfg?.title || name;
+    const displayName = metaOverride.title ? sanitizePublicText(metaOverride.title) : originalTitle;
+    const description = metaOverride.description
+      ? sanitizePublicText(metaOverride.description)
+      : (meta.description || `${meta.repoRoleLabel}，含 ${meta.estimatedNodeCount} 个受管制品`);
+    const groupLabel = metaOverride.groupLabel ? sanitizePublicText(metaOverride.groupLabel) : naturalGroupLabel;
+    const sources = [...meta.metaSources];
+    if (metaOverride.title || metaOverride.description || metaOverride.groupLabel) {
+      sources.unshift({ field: '自定义覆写说明', sourceFile: overrides.storagePath, active: true });
+    }
+
     records.push({
       id,
       name,
+      displayName,
+      originalName: originalTitle,
       packageName: meta.pkgName,
       group,
-      groupLabel: resolveGroupLabel(group, mergedGroupLabels),
+      groupLabel,
+      originalGroupLabel: naturalGroupLabel,
       version: meta.version,
-      description: meta.description,
+      description,
+      originalDescription: meta.description,
+      metaSources: sources,
+      hasCustomMeta: Boolean(metaOverride.title || metaOverride.description || metaOverride.groupLabel),
+      isExtraRepo: extraSet.has(realPath),
+      overrideStoragePath: overrides.storagePath,
       repoRole: meta.repoRole,
       repoRoleLabel: meta.repoRoleLabel,
       hasStudioConfig: Boolean(meta.studioCfg?.hasConfig),
@@ -524,7 +754,25 @@ async function loadArchifyCollection(repoReal, manifestRel, extraItems, archifyD
     if (doc.markdown && typeof doc.markdown === 'string') {
       try {
         const mdRaw = sanitizePublicText(await readFileContained(repoReal, doc.markdown, { encoding: 'utf8' }));
-        const rendered = renderMarkdownToHtml(mdRaw, { idPrefix: `art-${doc.pageId || 'doc'}` });
+        const code = String(doc.pageId || basename(doc.markdown, '.md')).toUpperCase();
+        const brief = extractArtifactBrief({
+          rawText: mdRaw,
+          fallbackTitle: doc.title,
+          code,
+          typeLabel: '业务专题文稿',
+          path: doc.markdown,
+        });
+        const rendered = renderMarkdownToHtml(mdRaw, {
+          idPrefix: `art-${doc.pageId || 'doc'}`,
+          heroMeta: {
+            title: sanitizePublicText(doc.title || brief.title),
+            summary: doc.summary ? cleanInlinePlain(doc.summary) : brief.summary,
+            code,
+            typeLabel: '业务专题文稿',
+            path: doc.markdown,
+            status: 'active',
+          },
+        });
         extraItems.push({
           uid: `business_article:${doc.pageId || basename(doc.markdown, '.md')}`,
           target: `business_article:${doc.pageId || basename(doc.markdown, '.md')}`,
@@ -534,14 +782,15 @@ async function loadArchifyCollection(repoReal, manifestRel, extraItems, archifyD
           layer: 'domain',
           layerOrder: 2,
           layerLabel: '领域与决策',
-          code: String(doc.pageId || basename(doc.markdown, '.md')).toUpperCase(),
-          title: sanitizePublicText(doc.title || rendered.title || basename(doc.markdown)),
+          code,
+          title: sanitizePublicText(doc.title || rendered.title || brief.title || basename(doc.markdown)),
+          summary: cleanInlinePlain(doc.summary || brief.summary),
           path: doc.markdown,
           status: 'active',
           isDesignNode: true,
           inDegree: 0,
           outDegree: (doc.figures ?? []).length,
-          inlineDoc: { title: doc.title || rendered.title, headings: rendered.headings, html: rendered.html },
+          inlineDoc: { title: doc.title || rendered.title, summary: cleanInlinePlain(doc.summary || brief.summary), headings: rendered.headings, html: rendered.html },
         });
       } catch {}
     }
@@ -552,6 +801,7 @@ async function loadArchifyCollection(repoReal, manifestRel, extraItems, archifyD
       archifyDiagrams.push({
         id: fig.id,
         title: sanitizePublicText(fig.title || fig.id),
+        summary: cleanInlinePlain(fig.summary || fig.subtitle || doc.summary || `${sanitizePublicText(fig.title || fig.id)}交互式架构说明图`),
         docPageId: doc.pageId ? String(doc.pageId) : null,
         docTitle: sanitizePublicText(doc.title || ''),
         htmlPath: cleanHtml,
@@ -602,8 +852,20 @@ async function loadLifecycleStoryPack(repoReal, col) {
         const relFile = `${col.explanationsDir.replace(/\/$/, '')}/${fileName}`;
         const md = sanitizePublicText(await readFileContained(repoReal, relFile, { encoding: 'utf8' }));
         const lcId = (/故事编号\s+(LC-\d+)/i.exec(md)?.[1] || `LC-${num}`).toUpperCase();
-        const rendered = renderMarkdownToHtml(md, { idPrefix: `lc-${num}`, stripNavLine: true });
-        const cleanTitle = (rendered.title || lcId).replace(/^\d+\s*·\s*/, '').trim();
+        const brief = extractArtifactBrief({ rawText: md, fallbackTitle: lcId, code: lcId, typeLabel: '生命周期讲解', path: relFile });
+        const cleanTitle = (brief.title || lcId).replace(/^\d+\s*·\s*/, '').trim();
+        const rendered = renderMarkdownToHtml(md, {
+          idPrefix: `lc-${num}`,
+          stripNavLine: true,
+          heroMeta: {
+            title: cleanTitle,
+            summary: brief.summary,
+            code: lcId,
+            typeLabel: '生命周期讲解',
+            path: relFile,
+            status: 'active',
+          },
+        });
         items.push({
           uid: `lifecycle:${lcId}`,
           target: `lifecycle:${lcId}`,
@@ -615,12 +877,13 @@ async function loadLifecycleStoryPack(repoReal, col) {
           layerLabel: '产品与故事',
           code: lcId,
           title: cleanTitle,
+          summary: brief.summary,
           path: relFile,
           status: 'active',
           isDesignNode: true,
           inDegree: 0,
           outDegree: 0,
-          inlineDoc: { title: `${lcId} · ${cleanTitle}`, headings: rendered.headings, html: rendered.html },
+          inlineDoc: { title: `${lcId} · ${cleanTitle}`, summary: brief.summary, headings: rendered.headings, html: rendered.html },
         });
       }
     } catch {}
@@ -638,7 +901,20 @@ async function loadLifecycleStoryPack(repoReal, col) {
     if (gapBody) {
       mdLines.push('', '## 新旧承接对照说明', '', gapBody);
     }
-    const rendered = renderMarkdownToHtml(sanitizePublicText(mdLines.join('\n')), { idPrefix: `us-${st.id.toLowerCase()}` });
+    const rawStoryLead = cleanInlinePlain(fields['价值'] || fields['目标'] || fields['以便'] || Object.values(fields)[0] || '');
+    const storySummary = rawStoryLead.length > 105 ? `${rawStoryLead.slice(0, 99).replace(/[，、；：,\s]+$/, '')}…` : (rawStoryLead || `${groups[st.group] ?? '核心流程'}相关用户故事`);
+    const rendered = renderMarkdownToHtml(sanitizePublicText(mdLines.join('\n')), {
+      idPrefix: `us-${st.id.toLowerCase()}`,
+      heroMeta: {
+        title: sanitizePublicText(st.title),
+        summary: storySummary,
+        code: st.id,
+        typeLabel: gapBody ? '差异对照故事' : '原始需求故事',
+        path: `${storiesRel}#${st.id}`,
+        status: gapBody ? 'accepted' : 'active',
+        frontmatter: { 能力分组: groups[st.group] ?? st.group ?? '默认分组' },
+      },
+    });
     items.push({
       uid: `lifecycle_story:${st.id}`,
       target: `lifecycle_story:${st.id}`,
@@ -650,12 +926,13 @@ async function loadLifecycleStoryPack(repoReal, col) {
       layerLabel: '产品与故事',
       code: st.id,
       title: sanitizePublicText(st.title),
+      summary: storySummary,
       path: `${storiesRel}#${st.id}`,
       status: gapBody ? 'accepted' : 'active',
       isDesignNode: true,
       inDegree: 0,
       outDegree: 0,
-      inlineDoc: { title: `${st.id} · ${st.title}`, headings: rendered.headings, html: rendered.html },
+      inlineDoc: { title: `${st.id} · ${st.title}`, summary: storySummary, headings: rendered.headings, html: rendered.html },
     });
   }
   return items;
@@ -723,6 +1000,36 @@ async function loadRepoSchemaSafe(repoReal) {
   }
 }
 
+function extractContractBrief(rawContent, fallbackTitle, typeLabel, rel, parsedObj = null) {
+  let obj = parsedObj;
+  if (obj === null && rawContent) {
+    try {
+      const ext = extname(String(rel || '')).toLowerCase();
+      obj = ext === '.json' ? JSON.parse(rawContent) : parseYaml(rawContent);
+    } catch {}
+  }
+  const title = cleanInlinePlain((obj && !Array.isArray(obj) ? (obj.title || obj.name) : '') || fallbackTitle || basename(String(rel || '契约')));
+  let summary = obj && typeof obj === 'object' && !Array.isArray(obj)
+    ? cleanInlinePlain(obj.summary || obj.description || obj.purpose || '')
+    : '';
+  if (summary.length < 10) {
+    if (Array.isArray(obj)) {
+      summary = `结构化列表契约，共收录 ${obj.length} 条记录，供自动化门禁与脚本读取。`;
+    } else if (obj && typeof obj === 'object') {
+      const keys = Object.keys(obj).filter(k => !['__proto__', 'constructor', 'prototype'].includes(k));
+      summary = keys.length
+        ? `包含 ${keys.length} 项结构化字段（如 ${keys.slice(0, 3).join('、')}）的${typeLabel || '机器数据契约'}。`
+        : `${typeLabel || '结构化数据契约'}，供脚本校验与工程同步读取。`;
+    } else {
+      summary = `${typeLabel || '结构化数据契约'}，供脚本校验与工程同步读取。`;
+    }
+  }
+  return {
+    title,
+    summary: summary.length > 105 ? `${summary.slice(0, 99).replace(/[，、；：,\s]+$/, '')}…` : summary,
+  };
+}
+
 export async function inspectProjectRepo(record, emptyScanDir) {
   const { schema, configStatus, configMessage } = await loadRepoSchemaSafe(record.realPath);
   const prefixes = new Set();
@@ -782,17 +1089,37 @@ export async function inspectProjectRepo(record, emptyScanDir) {
       ? (fileFormat === 'yaml' ? 'YAML 数据契约' : 'JSON 数据契约')
       : (isCode ? '代码与验证文件' : 'Markdown 阅读稿');
     const category = classifyReviewCategory(nd.type, ld.id, isMachineContract);
+    const typeLabel = tc.displayName || TYPE_LABELS[nd.type] || nd.type;
+    const rawContent = contents.get(nd.path) || '';
+    let localRaw = rawContent;
+    if (rawContent && nd.line && nd.line > 1 && !isMachineContract && !isCode) {
+      const sliced = rawContent.split('\n').slice(Math.max(0, nd.line - 1), nd.line + 40).join('\n');
+      if (sliced.trim().length > 20) localRaw = sliced;
+    }
+    const brief = isMachineContract
+      ? extractContractBrief(rawContent, nd.title || nd.code, typeLabel, nd.path)
+      : extractArtifactBrief({
+        rawText: localRaw || rawContent,
+        fallbackTitle: nd.title || nd.code,
+        code: nd.code,
+        typeLabel,
+        path: nd.path,
+      });
+    const cleanNodeTitle = nd.title && !/^[-*#|]/.test(String(nd.title).trim())
+      ? cleanInlinePlain(nd.title)
+      : brief.title;
     return {
       uid: nd.uid,
       target: nd.uid,
       type: nd.type,
-      typeLabel: tc.displayName || TYPE_LABELS[nd.type] || nd.type,
+      typeLabel,
       category,
       layer: ld.id,
       layerOrder: ld.order,
       layerLabel: ld.label,
       code: nd.code,
-      title: sanitizePublicText(nd.title || nd.code),
+      title: sanitizePublicText(cleanNodeTitle || nd.code),
+      summary: brief.summary,
       path: nd.path,
       line: nd.line,
       status: nd.status ?? null,
@@ -834,19 +1161,22 @@ export async function inspectProjectRepo(record, emptyScanDir) {
     const metaObj = parsedMeta && typeof parsedMeta === 'object' && !Array.isArray(parsedMeta) ? parsedMeta : null;
     const code = String(metaObj?.id || metaObj?.code || stemCode);
     const title = String(metaObj?.title || metaObj?.name || basename(rel));
+    const typeLabel = matchedDef?.displayName || TYPE_LABELS[matchedType] || matchedType;
+    const contractBrief = extractContractBrief(rawContent, title, typeLabel, rel, metaObj);
     const fileFormat = ext === '.json' ? 'json' : 'yaml';
     const uid = `${matchedType}:${code}:${rel}`;
     graphNodes.push({
       uid,
       target: uid,
       type: matchedType,
-      typeLabel: matchedDef?.displayName || TYPE_LABELS[matchedType] || matchedType,
+      typeLabel,
       category: 'contracts',
       layer: ld.id,
       layerOrder: ld.order,
       layerLabel: ld.label,
       code,
       title: sanitizePublicText(title),
+      summary: contractBrief.summary,
       path: rel,
       line: 1,
       status: metaObj?.status ? String(metaObj.status) : null,
@@ -981,7 +1311,13 @@ export async function inspectProjectRepo(record, emptyScanDir) {
           const st = await lstat(candAbs);
           if (!st.isFile() || st.isSymbolicLink()) continue;
           const mdRaw = await readFileContained(record.realPath, candRel, { encoding: 'utf8' });
-          const mdTitle = extractMdTitle(mdRaw, `${cItem.code || basename(candRel, '.md')} 人读说明`);
+          const mdBrief = extractArtifactBrief({
+            rawText: mdRaw,
+            fallbackTitle: `${cItem.code || basename(candRel, '.md')} 人读说明`,
+            code: cItem.code || basename(candRel, '.md'),
+            typeLabel: `${cItem.typeLabel || TYPE_LABELS[cItem.type] || cItem.type} · 人读文稿`,
+            path: candRel,
+          });
           const safeUid = `companion:${cItem.type}:${candRel.replace(/[^A-Za-z0-9_.:/#-]+/g, '_')}`;
           const peerItem = {
             uid: safeUid,
@@ -993,7 +1329,8 @@ export async function inspectProjectRepo(record, emptyScanDir) {
             layerOrder: cItem.layerOrder,
             layerLabel: cItem.layerLabel,
             code: cItem.code || basename(candRel, '.md'),
-            title: sanitizePublicText(mdTitle),
+            title: sanitizePublicText(mdBrief.title),
+            summary: mdBrief.summary,
             path: candRel,
             line: 1,
             status: cItem.status ?? null,
@@ -1144,6 +1481,10 @@ function buildStructuredContractHtml(parsed, cleanPath) {
 }
 
 export async function readRepoDocument(record, cachedEntry, { path: rawPath, uid: rawUid } = {}) {
+  const normRawPath = String(rawPath ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '').split('#')[0];
+  const matchedMeta = (rawUid ? cachedEntry.publicSnapshot.reviewItems?.find(i => i.uid === rawUid || i.target === rawUid) : null)
+    || cachedEntry.publicSnapshot.reviewItems?.find(i => i.path === normRawPath)
+    || cachedEntry.publicSnapshot.nodes?.find(n => n.path === normRawPath);
   if (rawUid && cachedEntry.inlineDocs.has(rawUid)) {
     const inline = cachedEntry.inlineDocs.get(rawUid);
     return {
@@ -1154,6 +1495,7 @@ export async function readRepoDocument(record, cachedEntry, { path: rawPath, uid
       format: 'markdown',
       isMachineContract: false,
       title: inline.title,
+      summary: inline.summary || matchedMeta?.summary || '',
       frontmatter: {},
       headings: inline.headings,
       html: inline.html,
@@ -1193,14 +1535,35 @@ export async function readRepoDocument(record, cachedEntry, { path: rawPath, uid
       } catch {}
       body = fm[2];
     }
-    const rendered = renderMarkdownToHtml(body, { idPrefix: 'doc-sec' });
+    const brief = extractArtifactBrief({
+      rawText: body,
+      frontmatter,
+      fallbackTitle: String(frontmatter.title || matchedMeta?.title || basename(cleanPath)),
+      code: String(matchedMeta?.code || frontmatter.id || ''),
+      typeLabel: matchedMeta?.typeLabel || '',
+      path: cleanPath,
+    });
+    const finalTitle = brief.title || String(frontmatter.title ?? basename(cleanPath));
+    const rendered = renderMarkdownToHtml(body, {
+      idPrefix: 'doc-sec',
+      heroMeta: {
+        title: finalTitle,
+        summary: matchedMeta?.summary || brief.summary,
+        code: String(matchedMeta?.code || frontmatter.id || ''),
+        typeLabel: matchedMeta?.typeLabel || '受管制品说明',
+        path: cleanPath,
+        status: String(frontmatter.status || matchedMeta?.status || ''),
+        frontmatter,
+      },
+    });
     return {
       ok: true,
       repoId: record.id,
       path: cleanPath,
       format: 'markdown',
       isMachineContract: false,
-      title: rendered.title || String(frontmatter.title ?? basename(cleanPath)),
+      title: rendered.title || finalTitle,
+      summary: matchedMeta?.summary || brief.summary,
       frontmatter,
       headings: rendered.headings,
       html: rendered.html,

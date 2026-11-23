@@ -21,7 +21,7 @@ import {
   writeFileAtomic,
   writeSnapshot,
 } from 'skill-family-harness-node';
-import { sanitizePublicText } from './markdown-render.mjs';
+import { cleanInlinePlain, extractArtifactBrief, sanitizePublicText } from './markdown-render.mjs';
 
 export const STUDIO_RUNTIME_REGISTRY_PATH = '.skill-family-studio/runtime-registry.json';
 export const FOUNDATION_RUNTIME_REGISTRY_PATH = '.artifacts/runtime-monitor/registry.json';
@@ -1229,6 +1229,7 @@ export async function collectStudioRuntimeView({
   const cleanTargets = sanitizeDeep(inspected);
   const currentRepoTargets = selectedRepoId ? cleanTargets.filter(t => t.repoId === selectedRepoId || t.isSandbox) : cleanTargets;
   const ecosystemActiveTargets = cleanTargets.filter(t => t.activeLockCount > 0 || t.processCount > 0 || t.eventCount > 0 || t.taskSummary.total > 0);
+  const plans = await discoverExecutionPlans(base, catalog, inspected);
 
   return {
     schemaVersion: 1,
@@ -1239,8 +1240,142 @@ export async function collectStudioRuntimeView({
     hasActiveSandboxLock: Boolean(hasActiveSandboxLock),
     kpi,
     targets: cleanTargets,
+    plans,
     currentRepoTargets,
     currentRepoHasRuntime: currentRepoTargets.length > 0,
     ecosystemActiveTargets,
   };
+}
+
+async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHistorical = 20) {
+  const repoNameById = new Map();
+  if (catalog?.byId) {
+    for (const r of catalog.byId.values()) repoNameById.set(r.id, r.displayName || r.name);
+  }
+
+  const plans = [];
+  const seenPlanRealPaths = new Set();
+
+  for (const t of liveInspected) {
+    if (!t.planPath && !(t.taskSummary?.total > 0)) continue;
+    let rp = t.planPath || '';
+    if (rp) {
+      try { rp = await realpath(rp); } catch {}
+      seenPlanRealPaths.add(rp);
+    }
+    const ts = t.taskSummary || { total: 0, done: 0, running: 0, blocked: 0, todo: 0, percent: 0, tree: [], tasks: [] };
+    let status = 'pending';
+    if (ts.total > 0 && ts.done === ts.total && ts.running === 0 && ts.blocked === 0) status = 'completed';
+    else if (ts.running > 0 || ts.done > 0 || ts.blocked > 0 || t.activeLockCount > 0) status = 'in_progress';
+    let summary = ts.focusBanner?.detail || '';
+    if (!summary && t.planPath) {
+      try {
+        const raw = await readFile(t.planPath, 'utf8');
+        summary = extractArtifactBrief({ rawText: raw, fallbackTitle: t.title, typeLabel: '活跃执行计划', path: t.planPath }).summary;
+      } catch {}
+    }
+    if (!summary) summary = `${t.badge || '运行计划'}：共 ${ts.total} 步，已完成 ${ts.done} 步（${ts.percent}%）。`;
+    const st = t.planPath ? await safeLstat(t.planPath) : null;
+    plans.push(sanitizeDeep({
+      id: `live:${t.id}`,
+      targetId: t.id,
+      title: cleanInlinePlain(t.title || t.id),
+      summary: cleanInlinePlain(summary),
+      status,
+      statusLabel: status === 'completed' ? '已完成' : (status === 'in_progress' ? '进行中' : '待启动'),
+      repoId: t.repoId || null,
+      repoName: repoNameById.get(t.repoId) || (t.isSandbox ? '隔离沙箱演练' : '当前工作区'),
+      badge: t.isSandbox ? '实时沙箱' : (t.isUserRegistered ? '手动挂载' : '活跃运行计划'),
+      updatedAt: st?.mtime ? new Date(st.mtime).toISOString() : new Date().toISOString(),
+      isHistorical: false,
+      isSandbox: Boolean(t.isSandbox),
+      planPath: shortDisplayPath(t.planPath || ''),
+      completedSteps: ts.done,
+      totalSteps: ts.total,
+      percent: ts.percent,
+      taskSummary: ts,
+      target: t,
+    }));
+  }
+
+  const candidateFiles = [];
+  const seenCandAbs = new Set();
+  const addCandidate = async (absPath, repoId, repoName, badge) => {
+    if (!absPath || hasSensitiveSegment(absPath) || seenCandAbs.has(absPath)) return;
+    const st = await safeLstat(absPath);
+    if (!st?.isFile()) return;
+    let rp = absPath;
+    try { rp = await realpath(absPath); } catch {}
+    if (seenPlanRealPaths.has(rp) || seenCandAbs.has(rp)) return;
+    seenCandAbs.add(absPath);
+    seenCandAbs.add(rp);
+    candidateFiles.push({ abs: rp, mtimeMs: st.mtimeMs || 0, repoId, repoName, badge });
+  };
+
+  const repoDirs = catalog?.byId ? [...catalog.byId.values()] : [{ id: null, name: basename(base), displayName: basename(base), realPath: base }];
+  for (const r of repoDirs) {
+    const rName = r.displayName || r.name;
+    for (const rootFile of ['PLAN.md', 'execution-plan.md']) {
+      await addCandidate(join(r.realPath, rootFile), r.id, rName, '仓库执行计划');
+    }
+    for (const sub of ['.runs', '.artifacts', 'docs/plans', 'artifacts/plans']) {
+      const files = await walkBounded(join(r.realPath, sub), 2, n => /\.(md|json)$/i.test(n) && /(plan|spec|roadmap|execution)/i.test(n));
+      for (const f of files) await addCandidate(f, r.id, rName, '历史运行/规划');
+    }
+  }
+
+  for (const plannerCand of [join(base, '..', '..', 'planner', 'plans'), join(base, '..', 'planner', 'plans')]) {
+    const pst = await safeLstat(plannerCand);
+    if (!pst?.isDirectory()) continue;
+    let ents = [];
+    try { ents = await readdir(plannerCand, { withFileTypes: true }); } catch { ents = []; }
+    for (const ent of ents) {
+      if (!ent.isFile() || !ent.name.endsWith('.md')) continue;
+      if (!/(spec|roadmap|plan|wave)/i.test(ent.name)) continue;
+      await addCandidate(join(plannerCand, ent.name), null, '生态总规 (planner)', '历史规格计划');
+    }
+  }
+
+  candidateFiles.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  let histCount = 0;
+  for (const cand of candidateFiles) {
+    if (histCount >= maxHistorical) break;
+    let raw = '';
+    try { raw = await readFile(cand.abs, 'utf8'); } catch { continue; }
+    const ext = extname(cand.abs).toLowerCase();
+    const stem = basename(cand.abs, ext);
+    const ts = parsePlanSummary(raw, ext, stem);
+    const brief = extractArtifactBrief({ rawText: raw, fallbackTitle: stem, code: stem, typeLabel: cand.badge, path: cand.abs });
+    let status = 'completed';
+    if (ts.total > 0) {
+      if (ts.done === ts.total && ts.running === 0 && ts.blocked === 0) status = 'completed';
+      else if (ts.running > 0 || ts.done > 0 || ts.blocked > 0) status = 'in_progress';
+      else status = 'pending';
+    } else if (/status\s*:\s*(active|draft|in_progress|running)|进行中|待实施/i.test(raw.slice(0, 1200))) {
+      status = 'in_progress';
+    }
+    const percent = ts.total > 0 ? ts.percent : (status === 'completed' ? 100 : 0);
+    histCount += 1;
+    plans.push(sanitizeDeep({
+      id: `hist:${cand.repoName}:${basename(cand.abs)}`.replace(/[^A-Za-z0-9_.:/-]+/g, '_'),
+      targetId: null,
+      title: cleanInlinePlain(brief.title || stem),
+      summary: cleanInlinePlain(brief.summary),
+      status,
+      statusLabel: status === 'completed' ? '已完成' : (status === 'in_progress' ? '进行中' : '待启动'),
+      repoId: cand.repoId,
+      repoName: cand.repoName,
+      badge: cand.badge,
+      updatedAt: cand.mtimeMs ? new Date(cand.mtimeMs).toISOString() : null,
+      isHistorical: true,
+      isSandbox: false,
+      planPath: shortDisplayPath(cand.abs),
+      completedSteps: ts.done,
+      totalSteps: ts.total,
+      percent,
+      taskSummary: ts,
+      target: null,
+    }));
+  }
+  return plans;
 }

@@ -418,7 +418,7 @@ export function summarizeRepoReviewProgress(repoId, reviewableRawTargets = [], s
   return counts;
 }
 
-export function buildStudioReviewSummary(store, { repos = [], generatedAt = new Date().toISOString() } = {}) {
+export function buildStudioReviewSummary(store, { repos = [], generatedAt = new Date().toISOString(), itemMetaByTarget = null } = {}) {
   const allTargets = new Set();
   for (const k of Object.keys(store?.decisions ?? {})) allTargets.add(k);
   for (const ann of Array.isArray(store?.annotations) ? store.annotations : []) {
@@ -465,9 +465,15 @@ export function buildStudioReviewSummary(store, { repos = [], generatedAt = new 
     else if (eff === 'deferred') counts.deferred += 1;
 
     const { repoId, rawTarget } = splitQualifiedTargetId(qTarget);
+    const itemMeta = itemMetaByTarget instanceof Map
+      ? (itemMetaByTarget.get(qTarget) || itemMetaByTarget.get(rawTarget) || null)
+      : (itemMetaByTarget && typeof itemMetaByTarget === 'object' ? (itemMetaByTarget[qTarget] || itemMetaByTarget[rawTarget] || null) : null);
     ensureBucket(repoId).items.push({
       target: qTarget,
       rawTarget,
+      title: itemMeta?.title || '',
+      summary: itemMeta?.summary || '',
+      typeLabel: itemMeta?.typeLabel || '',
       effectiveStatus: eff,
       statusLabel: REVIEW_STATUS_META[eff]?.label ?? eff,
       dispositionIntent: dec?.dispositionIntent || '',
@@ -503,12 +509,16 @@ export function buildStudioReviewSummary(store, { repos = [], generatedAt = new 
     for (const bucket of groupedRepos) {
       md.push(`## ${bucket.groupLabel} · ${bucket.repoName} (\`${bucket.repoId}\`)`, '');
       for (const item of bucket.items) {
+        const displayHead = item.title
+          ? `${item.title} (\`${item.rawTarget}\`)`
+          : `\`${item.rawTarget}\``;
         const extra = [
+          item.summary ? `简介：${item.summary}` : '',
           item.unresolvedCount > 0 ? `待解决批注 ${item.unresolvedCount} 条` : '',
           item.dispositionIntent ? `处置意向：${item.dispositionIntent}` : '',
           item.note ? `结论说明：${item.note}` : '',
         ].filter(Boolean).join('；');
-        md.push(`- **[${item.statusLabel}]** \`${item.rawTarget}\`${extra ? ` — ${extra}` : ''}`);
+        md.push(`- **[${item.statusLabel}]** ${displayHead}${extra ? ` — ${extra}` : ''}`);
       }
       md.push('');
     }

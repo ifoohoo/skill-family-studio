@@ -2,10 +2,70 @@
 
 import { createHash } from 'node:crypto';
 import { lstat, readdir, realpath } from 'node:fs/promises';
-import { join, relative, resolve } from 'node:path';
+import { basename, extname, join, relative, resolve } from 'node:path';
 import { VERSION_LOCK_PATH } from 'artifact-graph';
 import { readFileContained, resolveContained } from 'skill-family-harness-node';
 import { parse as parseYaml } from 'yaml';
+import { cleanInlinePlain, extractArtifactBrief, sanitizePublicText } from './markdown-render.mjs';
+
+const UID_TYPE_LABELS = Object.freeze({
+  story: '用户故事',
+  lifecycle_story: '需求故事',
+  lifecycle: '生命周期讲解',
+  requirement: '需求总纲',
+  feature: '详细设计',
+  scenario: '验收场景',
+  domain_model: '领域模型',
+  design_doc: '架构设计',
+  adr: '架构决策',
+  implementation: '源码实现',
+  test: '测试验证',
+});
+
+function inferCodeFromUid(uid, relPath) {
+  const s = String(uid ?? '').trim();
+  if (s.includes(':')) {
+    const tail = s.split(':').slice(1).join(':').trim();
+    if (tail && !tail.includes('/')) return tail;
+  }
+  const stem = relPath ? basename(String(relPath), extname(String(relPath))) : '';
+  return stem || s || '';
+}
+
+function inferTypeLabelFromUid(uid, fallback = '受管制品') {
+  const prefix = String(uid ?? '').split(':')[0];
+  return UID_TYPE_LABELS[prefix] || fallback;
+}
+
+async function resolveEntityBriefContained(repoReal, relPath, { uid = '', fallbackTitle = '', defaultTypeLabel = '' } = {}, cache = new Map()) {
+  const cleanRel = String(relPath ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '');
+  const code = inferCodeFromUid(uid, cleanRel);
+  const typeLabel = inferTypeLabelFromUid(uid, defaultTypeLabel || '受管制品');
+  const cacheKey = `${repoReal || ''}::${cleanRel}::${uid || ''}`;
+  if (cache.has(cacheKey)) return cache.get(cacheKey);
+  let rawText = '';
+  if (repoReal && cleanRel && !cleanRel.startsWith('/') && !cleanRel.split('/').includes('..')) {
+    try {
+      rawText = await readFileContained(repoReal, cleanRel, { encoding: 'utf8' });
+    } catch {}
+  }
+  const brief = extractArtifactBrief({
+    rawText,
+    fallbackTitle: fallbackTitle || code || (cleanRel ? basename(cleanRel) : ''),
+    code,
+    typeLabel,
+    path: cleanRel,
+  });
+  const res = {
+    title: sanitizePublicText(brief.title || fallbackTitle || code || '未命名制品'),
+    summary: brief.summary,
+    code,
+    typeLabel,
+    path: cleanRel,
+  };
+  cache.set(cacheKey, res);
+  return res;
+}
 
 const SKIP_SCAN_DIRS = new Set([
   '.git', 'node_modules', 'dist', '.artifact-graph', '.artifacts', '.runs',
@@ -249,6 +309,31 @@ export async function inspectInternalCodeLocks(repoReal) {
     unclaimedEntries = matchedEntries.filter(f => !claimedSources.has(f));
   }
 
+  const briefCache = new Map();
+  const unclaimedEntryDetails = [];
+  for (const rel of unclaimedEntries) {
+    const brief = await resolveEntityBriefContained(repoReal, rel, { defaultTypeLabel: '源码入口' }, briefCache);
+    unclaimedEntryDetails.push({
+      path: rel,
+      code: basename(rel),
+      title: sanitizePublicText(brief.title || basename(rel)),
+      summary: brief.summary.startsWith('查看')
+        ? `属于实现边界清单内的受管源码入口（${rel}），当前尚未建立版本锁绑定。`
+        : brief.summary,
+      typeLabel: '源码入口',
+    });
+  }
+  const driftDetails = [];
+  for (const d of drifts) {
+    const brief = await resolveEntityBriefContained(repoReal, d.path, { defaultTypeLabel: d.code === 'artifact_changed' ? '受管制品' : '源码实现' }, briefCache);
+    driftDetails.push({
+      ...d,
+      title: sanitizePublicText(brief.title || basename(String(d.path || ''))),
+      summary: brief.summary,
+      typeLabel: d.code === 'artifact_changed' ? '制品原文已修订' : '源码已演进',
+    });
+  }
+
   const missingRequiredCodeLocks = implSurface.requireCodeLocks && locks.length === 0;
   const healthy = !missingRequiredCodeLocks && unclaimedEntries.length === 0 && drifts.length === 0;
 
@@ -262,7 +347,9 @@ export async function inspectInternalCodeLocks(repoReal) {
     verifiesCount: verifiesLocks.length,
     relationLocksCount: relLocks.length,
     unclaimedEntries,
+    unclaimedEntryDetails,
     drifts,
+    driftDetails,
     missingRequiredCodeLocks,
     healthy,
   };
@@ -287,6 +374,7 @@ export async function inspectPortfolioAllocations(repoReal, catalog) {
   if (!doc) return { present: false, portfolioId: null, title: null, items: [], summary: null };
 
   const rawItems = Array.isArray(doc.items) ? doc.items : [];
+  const briefCache = new Map();
   const items = [];
   const summary = {
     total: rawItems.length,
@@ -303,6 +391,12 @@ export async function inspectPortfolioAllocations(repoReal, catalog) {
     const disposition = String(raw?.disposition || 'allocated');
     const remainingScope = Array.isArray(raw?.remainingScope) ? raw.remainingScope.map(String) : [];
     const allocsRaw = Array.isArray(raw?.allocations) ? raw.allocations : [];
+    const srcBrief = await resolveEntityBriefContained(
+      repoReal,
+      raw?.sourcePath,
+      { uid: raw?.sourceUid, fallbackTitle: raw?.title || raw?.sourceUid, defaultTypeLabel: '高阶规划项' },
+      briefCache,
+    );
     const currentSourceDigest = raw?.sourcePath ? await sha256FilePrefixed(repoReal, raw.sourcePath) : null;
     const itemIssues = [];
 
@@ -319,6 +413,20 @@ export async function inspectPortfolioAllocations(repoReal, catalog) {
       let currentTargetDigest = null;
       let reciprocalBinding = null;
       let lockCheck = { fresh: false, hasCodeLocks: false, mode: 'missing' };
+      const targetBrief = targetMeta
+        ? await resolveEntityBriefContained(
+          targetMeta.realPath,
+          a?.targetPath,
+          { uid: a?.targetUid, fallbackTitle: a?.targetTitle || a?.targetUid, defaultTypeLabel: '详设制品' },
+          briefCache,
+        )
+        : {
+          title: sanitizePublicText(a?.targetTitle || inferCodeFromUid(a?.targetUid, a?.targetPath) || '未定位详设'),
+          summary: `目标仓库尚未注册或无法解析（${a?.targetRepo || '未知路径'}）。`,
+          code: inferCodeFromUid(a?.targetUid, a?.targetPath),
+          typeLabel: inferTypeLabelFromUid(a?.targetUid, '详设制品'),
+          path: a?.targetPath || '',
+        };
 
       if (!targetMeta) {
         allocIssues.push({ code: 'TARGET_MISSING', message: `未找到下游承接仓库：${a?.targetRepo || ''}` });
@@ -363,6 +471,10 @@ export async function inspectPortfolioAllocations(repoReal, catalog) {
         targetRepoName: targetMeta?.name || String(a?.targetRepo || '').split('/').pop(),
         targetUid: a?.targetUid || '',
         targetPath: a?.targetPath || '',
+        targetTitle: targetBrief.title,
+        targetSummary: targetBrief.summary,
+        targetCode: targetBrief.code,
+        targetTypeLabel: targetBrief.typeLabel,
         coverageRole: a?.coverageRole || 'primary',
         readonlyTarget: Boolean(a?.readonlyTarget),
         verifiedReceiptPath: a?.verifiedReceiptPath || null,
@@ -419,10 +531,16 @@ export async function inspectPortfolioAllocations(repoReal, catalog) {
       health = { code: 'IN_PROGRESS', label: '🔵 摘要对齐·实施验证中', tone: 'indigo' };
     }
 
+    const itemDisplayTitle = raw?.title && raw.title !== raw?.sourceUid
+      ? cleanInlinePlain(raw.title)
+      : srcBrief.title;
     items.push({
       sourceUid: raw?.sourceUid || '',
       sourcePath: raw?.sourcePath || '',
-      title: raw?.title || raw?.sourceUid || '',
+      sourceCode: srcBrief.code,
+      sourceTypeLabel: srcBrief.typeLabel,
+      title: sanitizePublicText(itemDisplayTitle || srcBrief.title),
+      sourceSummary: srcBrief.summary,
       disposition,
       dispositionLabel: DISPOSITION_LABELS[disposition] || disposition,
       dispositionNote: raw?.dispositionNote || '',
@@ -456,9 +574,30 @@ export async function inspectUpstreamBindings(repoReal, catalog) {
   const upItems = Array.isArray(upstreamPortfolioDoc?.items) ? upstreamPortfolioDoc.items : [];
 
   const bindings = [];
+  const briefCache = new Map();
   let driftCount = 0;
 
   for (const b of Array.isArray(doc.bindings) ? doc.bindings : []) {
+    const localBrief = await resolveEntityBriefContained(
+      repoReal,
+      b?.localPath,
+      { uid: b?.localUid, fallbackTitle: b?.localTitle || b?.localUid, defaultTypeLabel: '本仓详设' },
+      briefCache,
+    );
+    const upBrief = upstreamMeta
+      ? await resolveEntityBriefContained(
+        upstreamMeta.realPath,
+        b?.upstreamPath,
+        { uid: b?.upstreamUid, fallbackTitle: b?.upstreamTitle || b?.upstreamUid, defaultTypeLabel: '上游高阶' },
+        briefCache,
+      )
+      : {
+        title: sanitizePublicText(b?.upstreamTitle || inferCodeFromUid(b?.upstreamUid, b?.upstreamPath) || '上游高阶条目'),
+        summary: `来源自高阶规划仓 ${String(doc.upstreamPortfolio || '').split('/').pop() || ''} 的承接需求条目。`,
+        code: inferCodeFromUid(b?.upstreamUid, b?.upstreamPath),
+        typeLabel: inferTypeLabelFromUid(b?.upstreamUid, '上游高阶'),
+        path: b?.upstreamPath || '',
+      };
     const curLocalDigest = b?.localPath ? await sha256FilePrefixed(repoReal, b.localPath) : null;
     const curUpstreamDigest = (upstreamMeta && b?.upstreamPath)
       ? await sha256FilePrefixed(upstreamMeta.realPath, b.upstreamPath)
@@ -500,9 +639,16 @@ export async function inspectUpstreamBindings(repoReal, catalog) {
     bindings.push({
       localUid: b?.localUid || '',
       localPath: b?.localPath || '',
+      localCode: localBrief.code,
+      localTitle: localBrief.title,
+      localSummary: localBrief.summary,
+      localTypeLabel: localBrief.typeLabel,
       upstreamUid: b?.upstreamUid || '',
       upstreamPath: b?.upstreamPath || '',
-      upstreamTitle: matchedUpItem?.title || b?.upstreamUid || '',
+      upstreamCode: upBrief.code,
+      upstreamTitle: cleanInlinePlain(matchedUpItem?.title || upBrief.title || b?.upstreamUid || ''),
+      upstreamSummary: upBrief.summary,
+      upstreamTypeLabel: upBrief.typeLabel,
       upstreamRepoId: upstreamMeta?.repoId || null,
       upstreamRepoName: upstreamMeta?.name || String(doc.upstreamPortfolio || '').split('/').pop(),
       health,

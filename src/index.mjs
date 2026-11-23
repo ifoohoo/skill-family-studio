@@ -41,8 +41,11 @@ export {
   loadStudioWorkspaceConfig,
   readRepoArchifyAsset,
   readRepoDocument,
+  registerStudioRepo,
   resolveGroupLabel,
   resolveStudioScanRoots,
+  unregisterStudioRepo,
+  updateStudioRepoMeta,
 } from './ecosystem.mjs';
 
 export {

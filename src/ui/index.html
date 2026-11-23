@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Skill Family Studio · 制品图谱审阅与运行监控控制台</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🧭</text></svg>" />
   <link rel="stylesheet" href="/assets/studio.css" />
 </head>
 <body>
@@ -17,7 +18,10 @@
             <span aria-hidden="true">▾</span>
           </button>
           <div id="st-repo-popover" class="st-repo-popover" hidden>
-            <input type="search" id="st-repo-search" class="st-input" placeholder="输入仓库名或关键字过滤…" aria-label="过滤项目仓库" />
+            <div class="st-repo-pop-top">
+              <input type="search" id="st-repo-search" class="st-input" placeholder="输入仓库名、分组或说明过滤…" aria-label="过滤项目仓库" />
+              <button type="button" id="st-add-repo-btn" class="st-btn st-btn-primary">＋ 添加本地项目</button>
+            </div>
             <div id="st-repo-groups"></div>
           </div>
         </div>
@@ -29,6 +33,7 @@
           <span id="st-repo-lock-badge" class="st-badge st-badge-zinc">核验中</span>
           <span id="st-lock-info-slot"></span>
         </span>
+        <button type="button" id="st-edit-repo-meta-btn" class="st-btn st-btn-xs" title="查看项目名称与说明的文件来源并支持自定义覆写" hidden>✎ 说明与来源</button>
       </div>
 
       <nav class="st-topbar-center" aria-label="控制台主模块导航">

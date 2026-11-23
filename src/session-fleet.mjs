@@ -6,7 +6,7 @@ import { lstat, readdir, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { createInterface } from 'node:readline';
-import { sanitizePublicText } from './markdown-render.mjs';
+import { cleanInlinePlain, sanitizePublicText } from './markdown-render.mjs';
 
 const SENSITIVE_PATH_RE = /(?:^|[\\/])(?:\.ssh|\.gnupg|\.aws|\.kube|\.docker|\.netrc|\.npmrc|\.pypirc|\.git-credentials|keychains|\.env(?:\.[^\\/]+)?)(?:$|[\\/])/i;
 const SECRET_TOKEN_RE = /(?:sk-(?:proj|ant|svcacct)-[A-Za-z0-9_-]{16,}|sk-(?=[A-Za-z0-9_-]*(?:\d|[A-Z]|_))[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9]{16,}|npm_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|AIza[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{12,}|Bearer\s+[A-Za-z0-9._~+/=-]{12,})/g;
@@ -1215,6 +1215,33 @@ export async function collectSessionFleet({
     pushFam(fam);
   }
   selected.sort(compareFamily);
+
+  const HOST_ZH = { sandbox: '沙箱演练', antigravity: 'Antigravity', claude: 'Claude Code', codex: 'Codex', local: '本地快照' };
+  const enrichSummaryText = (raw, fallback) => {
+    const cleaned = cleanInlinePlain(
+      String(raw ?? '')
+        .replace(/<\/?(?:CONTEXT_SUMMARY|subagent_reminder|user_rules|messaging|artifacts|guidelines|instructions|system|task)[^>]*>/gi, ' ')
+        .replace(/^(?:RESUMING MY OWN TASK IN PROGRESS\.?|The user requests above[^.]*\.)/i, ' ')
+        .replace(/\[(?:Message|truncated[^\]]*)\]/gi, ' '),
+    );
+    if (cleaned.length >= 16) {
+      return cleaned.length > 96 ? `${cleaned.slice(0, 92).replace(/[，、；：,\s]+$/, '')}…` : cleaned;
+    }
+    return fallback;
+  };
+  for (const fam of selected) {
+    const coord = (fam.agents || []).find(a => !a.parentId) || fam.agents?.[0];
+    const cleanTitle = enrichSummaryText(fam.title, `${HOST_ZH[fam.host] || fam.host} 会话编队`);
+    fam.title = cleanTitle.length > 56 ? `${cleanTitle.slice(0, 52)}…` : cleanTitle;
+    const totalTok = fam.summary?.totalTokens || 0;
+    const delCnt = fam.summary?.totalDelegations ?? (fam.delegations?.length || 0);
+    const fallbackBrief = `${HOST_ZH[fam.host] || fam.host} 多智能体协作编队，含 ${fam.agents?.length || 0} 个会话、${delCnt} 次委派，累计消耗 ${totalTok.toLocaleString()} Tokens。`;
+    fam.briefSummary = enrichSummaryText(coord?.prompt || coord?.duty || fam.title, fallbackBrief);
+    for (const a of fam.agents || []) {
+      const aFallback = `${a.executionMode || '会话节点'} · ${a.duty || a.name}`;
+      a.briefSummary = enrichSummaryText(a.prompt || a.duty, aFallback);
+    }
+  }
 
   const result = {
     schemaVersion: 1,
