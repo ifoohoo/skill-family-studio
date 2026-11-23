@@ -25,7 +25,7 @@ export const GLOSSARY = Object.freeze({
   },
   progressCapsule: {
     title: '审阅进度与零侵入台账',
-    meaning: '统计当前仓库的已通过、审阅中与需修改条目数，点击可复制或下载 Markdown 验收单。',
+    meaning: '统计当前仓库的已通过、审阅中、需修改与暂缓条目数，点击可复制或下载全部受管仓库的 Markdown 验收单。',
     rule: '所有批注与结论仅写入启动根目录的 .skill-family-studio/reviews.json，绝不修改受审仓受 Git 跟踪的文件。',
   },
 

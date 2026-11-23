@@ -2029,8 +2029,11 @@ function renderReviewPanel() {
       b.type = 'button';
       b.dataset.uid = item.uid;
       const r1 = el('div', null, 'st-repo-opt-head');
+      const contractExt = item.isMachineContract
+        ? (/\.ya?ml$/i.test(String(item.path || '')) ? ' · .yaml' : ' · .json')
+        : '';
       r1.append(
-        el('span', `${item.code} · ${item.typeLabel}${item.isMachineContract ? ' · .json' : ''}`, 'st-muted-xs'),
+        el('span', `${item.code} · ${item.typeLabel}${contractExt}`, 'st-muted-xs'),
         el('span', `${sm.dot} ${sm.label}`, sm.badge),
       );
       b.append(r1, el('div', item.title));
