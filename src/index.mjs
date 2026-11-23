@@ -90,6 +90,7 @@ export {
   loadMergedMonitorTargets,
   parsePlanSummary,
   registerMonitorTarget,
+  removeMonitorTarget,
   runSandboxExercise,
 } from './runtime-bridge.mjs';
 

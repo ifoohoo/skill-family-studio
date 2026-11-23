@@ -662,30 +662,7 @@ async function inspectSingleLockFile(fullPath, { lockWarnMs = DEFAULT_LOCK_WARN_
   const name = basename(fullPath);
 
   if (name === 'traceability-version-lock.json') {
-    const parsed = await safeJson(fullPath);
-    if (!parsed.ok) return null;
-    const relCount = Array.isArray(parsed.value?.artifactRelations) ? parsed.value.artifactRelations.length : 0;
-    const codeLocksCount = Array.isArray(parsed.value?.locks) ? parsed.value.locks.length : 0;
-    const uniqueFiles = new Set();
-    for (const edge of parsed.value?.artifactRelations ?? []) {
-      if (edge?.source?.path) uniqueFiles.add(edge.source.path);
-      if (edge?.target?.path) uniqueFiles.add(edge.target.path);
-    }
-    return {
-      id: `vlock:${fullPath}`,
-      targetId,
-      name,
-      path: fullPath,
-      displayPath: shortDisplayPath(fullPath),
-      lockKind: 'version-lock',
-      owner: 'artifact-graph',
-      acquiredAt: new Date(fileStat.mtimeMs).toISOString(),
-      ageMs: Math.max(0, nowMs - fileStat.mtimeMs),
-      isActive: false,
-      isStaleWarning: false,
-      status: 'ANCHORED',
-      summary: `${relCount} 条制品关系锁 · ${codeLocksCount} 项代码/测试锁 · ${uniqueFiles.size} 个制品文件`,
-    };
+    return null;
   }
 
   if (name === 'writer.lock' || name === 'writer-mutation.lock' || name === 'writer-recovery.lock') {
@@ -764,13 +741,14 @@ async function inspectSingleLockFile(fullPath, { lockWarnMs = DEFAULT_LOCK_WARN_
 async function scanLocksReadOnly(resolvedTarget, { lockWarnMs = DEFAULT_LOCK_WARN_MS, nowMs = Date.now() } = {}) {
   const candidates = new Set();
   for (const d of [resolvedTarget.stateDir, resolvedTarget.runsDir].filter(Boolean)) {
-    for (const f of await walkBounded(d, 3, n => n.endsWith('.lock') || n === 'traceability-version-lock.json')) candidates.add(f);
+    for (const f of await walkBounded(d, 3, n => n.endsWith('.lock'))) candidates.add(f);
   }
   for (const p of resolvedTarget.lockPaths ?? []) {
+    if (basename(p) === 'traceability-version-lock.json') continue;
     const st = await safeLstat(p);
     if (st?.isFile()) candidates.add(p);
     else if (st?.isDirectory()) {
-      for (const f of await walkBounded(p, 2, n => n.endsWith('.lock') || n === 'traceability-version-lock.json')) candidates.add(f);
+      for (const f of await walkBounded(p, 2, n => n.endsWith('.lock'))) candidates.add(f);
     }
   }
   const locks = [];
@@ -865,15 +843,19 @@ export async function loadMergedMonitorTargets(root = '.', { registryPath = STUD
     FOUNDATION_RUNTIME_REGISTRY_PATH,
     LEGACY_RUNTIME_REGISTRY_PATH,
   ])];
+  const primaryCustomPath = registryPath || STUDIO_RUNTIME_REGISTRY_PATH;
   const merged = [];
   const seenIds = new Set();
   for (const cand of candidatePaths) {
     try {
       const reg = await loadMonitorRegistry(base, cand, { allowedRoots });
+      const isUserReg = cand === primaryCustomPath
+        && cand !== FOUNDATION_RUNTIME_REGISTRY_PATH
+        && cand !== LEGACY_RUNTIME_REGISTRY_PATH;
       for (const t of reg.targets ?? []) {
         if (!t?.id || seenIds.has(t.id)) continue;
         seenIds.add(t.id);
-        merged.push(t);
+        merged.push({ ...t, ...(isUserReg ? { isUserRegistered: true } : {}) });
       }
     } catch {}
   }
@@ -910,10 +892,11 @@ export async function registerMonitorTarget(root = '.', input = {}, registryPath
     ...(rawPlanPath ? { planPath: rawPlanPath } : {}),
     ...(rawRunsDir ? { runsDir: rawRunsDir } : {}),
     ...(lockPaths.length ? { lockPaths } : {}),
+    isUserRegistered: true,
     registeredAt: now,
   };
   const idx = current.targets.findIndex(t => t.id === id);
-  if (idx >= 0) current.targets[idx] = { ...current.targets[idx], ...entry };
+  if (idx >= 0) current.targets[idx] = { ...entry, registeredAt: current.targets[idx].registeredAt ?? now, updatedAt: now };
   else current.targets.unshift(entry);
 
   const payload = { schemaVersion: 1, updatedAt: now, targets: current.targets };
@@ -927,6 +910,33 @@ export async function registerMonitorTarget(root = '.', input = {}, registryPath
     await writeFileAtomic(base, registryPath, `${JSON.stringify(payload, null, 2)}\n`);
   }
   return { entry, registry: payload };
+}
+
+export async function removeMonitorTarget(root = '.', inputOrId = '', registryPath = STUDIO_RUNTIME_REGISTRY_PATH, { allowedRoots = [] } = {}) {
+  const base = resolve(root);
+  const rawId = typeof inputOrId === 'string' ? inputOrId : inputOrId?.id;
+  const id = String(rawId ?? '').trim();
+  if (!id || FORBIDDEN_KEYS.has(id) || !/^[A-Za-z0-9_.:-]+$/.test(id)) {
+    throw Object.assign(new Error('监控目标 id 须为合法字符且不得使用保留原型属性名。'), { statusCode: 400 });
+  }
+  const current = await loadMonitorRegistry(base, registryPath, { allowedRoots });
+  const idx = current.targets.findIndex(t => t.id === id);
+  if (idx < 0) {
+    throw Object.assign(new Error(`未在自定义挂载清单找到运行源：${id}（仅支持移除用户手动挂载的运行源）`), { statusCode: 404 });
+  }
+  const remaining = current.targets.filter(t => t.id !== id);
+  const now = new Date().toISOString();
+  const payload = { schemaVersion: 1, updatedAt: now, targets: remaining };
+  if (isAbsolute(registryPath)) {
+    const safeRegAbs = resolveRuntimeTargetPath(base, registryPath, { allowedRoots, strict: true });
+    await mkdir(dirname(safeRegAbs), { recursive: true });
+    await writeFile(safeRegAbs, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+  } else {
+    const absReg = await resolveContained(base, registryPath);
+    await mkdir(dirname(absReg), { recursive: true });
+    await writeFileAtomic(base, registryPath, `${JSON.stringify(payload, null, 2)}\n`);
+  }
+  return { removedId: id, registry: payload };
 }
 
 export async function runSandboxExercise({ holdLock = true, simulateTimeout = true } = {}) {
@@ -1071,8 +1081,6 @@ export async function collectStudioRuntimeView({
         registryPath: FOUNDATION_RUNTIME_REGISTRY_PATH,
         allowedRoots: [rec.realPath, tmpdir(), ...allowedRoots],
       });
-      const vlockPath = join(rec.realPath, 'artifacts/traceability-version-lock.json');
-      const hasVlock = Boolean(await safeLstat(vlockPath));
       for (const stItem of siblingRegs) {
         if (rec.isPrimary) continue;
         const relToAbs = p => (p && !isAbsolute(p) ? join(rec.realPath, p) : p);
@@ -1084,7 +1092,7 @@ export async function collectStudioRuntimeView({
           stateDir: relToAbs(stItem.stateDir),
           planPath: relToAbs(stItem.planPath),
           runsDir: relToAbs(stItem.runsDir),
-          lockPaths: [...(stItem.lockPaths ?? []).map(relToAbs).filter(Boolean), ...(hasVlock ? [vlockPath] : [])],
+          lockPaths: (stItem.lockPaths ?? []).map(relToAbs).filter(Boolean),
         });
       }
       const runsDir = join(rec.realPath, '.runs');
@@ -1105,7 +1113,7 @@ export async function collectStudioRuntimeView({
           runsDir: (await safeLstat(runsDir)) ? runsDir : undefined,
           stateDir,
           planPath: autoPlanPath,
-          lockPaths: hasVlock ? [vlockPath] : [],
+          lockPaths: [],
         });
       }
     }
@@ -1118,6 +1126,13 @@ export async function collectStudioRuntimeView({
     return true;
   });
 
+  const relField = p => {
+    if (!p) return '';
+    if (!isAbsolute(p)) return p;
+    const rel = p.startsWith(`${base}/`) ? p.slice(base.length + 1) : '';
+    return rel;
+  };
+
   const inspected = await Promise.all(rawList.map(async raw => {
     const resolved = {
       id: raw.id,
@@ -1125,6 +1140,15 @@ export async function collectStudioRuntimeView({
       title: raw.title || raw.id,
       badge: raw.badge || '运行源',
       isSandbox: Boolean(raw.isSandbox),
+      isUserRegistered: Boolean(raw.isUserRegistered),
+      editConfig: raw.isUserRegistered ? {
+        id: raw.id,
+        title: raw.title || raw.id,
+        stateDir: relField(raw.stateDir),
+        planPath: relField(raw.planPath),
+        runsDir: relField(raw.runsDir),
+        lockPaths: (raw.lockPaths ?? []).map(relField).filter(Boolean),
+      } : null,
       stateDir: resolveRuntimeTargetPath(base, raw.stateDir, { allowedRoots: effectiveRoots }),
       planPath: resolveRuntimeTargetPath(base, raw.planPath, { allowedRoots: effectiveRoots }),
       runsDir: resolveRuntimeTargetPath(base, raw.runsDir, { allowedRoots: effectiveRoots }),

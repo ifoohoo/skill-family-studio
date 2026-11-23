@@ -6,7 +6,7 @@ export const GLOSSARY = Object.freeze({
   'role:portfolio': {
     title: '高阶规划仓',
     meaning: '负责总体业务需求拆解、跨仓分配清单（portfolio-allocations.json）与业务全景闭环图的规划仓库。',
-    rule: '在「📝 逐项审阅」中提供需求进展与双向对齐总览表，可一键跨仓跳入子项目详设。',
+    rule: '在「📝 审阅与对齐」第 ① 步提供需求进展与双向对齐总览表，可一键跨仓跳入子项目详设。',
   },
   'role:subproject': {
     title: '详设子仓',
@@ -41,8 +41,6 @@ export const GLOSSARY = Object.freeze({
   'layer:architecture': { title: '第 4 层 · 架构与契约', meaning: '系统总体架构、模块职责边界以及接口/数据/状态机契约。' },
   'layer:scenarios': { title: '第 5 层 · 场景剧本', meaning: '采用“前提条件 → 触发动作 → 预期结果”描述的可直接验收场景剧本。' },
   'layer:verification': { title: '第 6 层 · 测试与验证', meaning: '测试规划、黄金用例以及追溯到源码和自动化测试文件的验证记录。' },
-  fitWidth: { title: '适应屏宽', meaning: '自动按当前浏览器视口宽度缩放和排布各分层，消除 1920px / 2560px / 3440px 大屏下的左右空白或横向滚动条。' },
-  wrapGrid: { title: '自动折行排布', meaning: '当某一层节点过多时自动折成多行网格展示，确保节点卡片字号始终 >= 11px 清晰可读。' },
   subgraphOnly: { title: '仅看上下游关联子图', meaning: '临时过滤掉与当前选中节点无直接/两跳依赖关系的节点，专注核对一条需求链路。' },
   'edge:implements': { title: '代码实现边 (implements)', meaning: '表示源码或 SKILL.md 入口文件通过追溯注解认领并实现了某个设计特性或场景。' },
   'edge:verifies': { title: '测试验证边 (verifies)', meaning: '表示自动化测试文件覆盖并验证了某个功能特性或验收场景。' },
@@ -89,13 +87,15 @@ export const GLOSSARY = Object.freeze({
   'lockCard:unclaimed': { title: '未认领入口与锁漂移', meaning: '若 >0 表示有新代码/技能尚未绑定设计，或改完代码/文档后尚未运行 version-lock refresh。' },
 
   // 逐篇阅读与状态
-  'catGroup:primary': { title: '首要阅读分组', meaning: '面向产品与需求审阅者的核心阅读顺序：用户故事（懂诉求）→ 需求总纲（看边界）→ 场景剧本（对动作与结果）。' },
-  'catGroup:supporting': { title: '关联依据分组', meaning: '领域模型、架构设计、规格说明与测试追溯文档，可在理解诉求后按需对照查阅。' },
-  'catGroup:contracts': { title: '结构化数据契约 (.json/.yaml)', meaning: '供脚本、状态机检查与自动化门禁读取的数据文件，已与人读 Markdown 分离，避免打断审阅主流程。' },
+  'catGroup:primary1': { title: '第 1 顺位：先看诉求（用户故事）', meaning: '建议优先阅读：理解业务痛点、角色诉求与差异承接背景，建立完整上下文。' },
+  'catGroup:primary2': { title: '第 2 顺位：核对边界（需求与场景）', meaning: '理解诉求后核对需求总纲的范围边界与可验证的场景剧本动作期望。' },
+  'catGroup:primary': { title: '首要阅读分组', meaning: '面向产品与需求审阅者的核心阅读顺序：用户故事（懂诉求）→ 需求总纲与场景剧本（核边界）。' },
+  'catGroup:supporting': { title: '备查依据分组', meaning: '领域模型、架构设计、规格说明与测试追溯文档，可在理解诉求后按需对照查阅。' },
+  'catGroup:contracts': { title: '附：机器契约 (.json/.yaml)', meaning: '供脚本、状态机检查与自动化门禁读取的数据文件，已与人读 Markdown 分离，「▶ 跳至下一项待审条目 →」会自动跳过它们。' },
   'docFmt:markdown': { title: 'Markdown 阅读稿', meaning: '面向人类读者的自然中文说明文档，支持章节锚点批注与内嵌流程图。' },
   'docFmt:json': { title: 'JSON / YAML 数据契约', meaning: '面向程序校验的结构化数据契约，默认展开结构化可读表格，顶部可切回源码或同名 Markdown 文档。' },
   'status:pending': { title: '⚪ 待审阅 (pending)', meaning: '未下终态结论且没有任何未解决批注；清空或解决全部批注后也会自动回退至此状态。' },
-  'status:reviewing': { title: '🔵 审阅中 (reviewing)', meaning: '只要添加第 1 条未解决批注就会自动点亮；也可主动标为审阅中，代表正在梳理意见尚未定稿。' },
+  'status:reviewing': { title: '🔵 审阅中 (reviewing)', meaning: '阅读书签/正在梳理意见（只要添加第 1 条未解决批注也会自动点亮；全部解决且未给终态结论时自动退回待审）。' },
   'status:changes_requested': { title: '🟠 需修改 (changes_requested)', meaning: '明确退回要求作者根据批注整改，在验收单中会被汇总进待处理项。' },
   'status:approved': { title: '🟢 已通过 (approved)', meaning: '审阅确认符合要求并签收；引导队列在跳到下一项时会自动跳过已通过条目。' },
   'status:deferred': { title: '🟣 暂缓 (deferred)', meaning: '本轮不做阻断或推迟到后续波次处理。' },
@@ -103,11 +103,11 @@ export const GLOSSARY = Object.freeze({
   // 运行监控
   'rt:scope': { title: '监控范围切换', meaning: '「聚焦当前项目」只展示顶栏当前所选仓库及沙箱运行源；「全工作区监控源聚合」汇总所有已发现仓库中的活跃任务与锁告警。' },
   'rt:view:tasks': { title: '🌳 任务推进树', meaning: '默认首屏：把波次 → 阶段/父任务 → 子步骤及 blockedBy 前置依赖收成可折叠树，顶部直接亮出当前执行焦点。' },
-  'rt:view:fleet': { title: '🛰️ 会话与子会话编队', meaning: '汇总本机真实多智能体日志或沙箱演练编队，左侧展示父子会话树，右上画跨会话委派/回报泳道，下方检查每次委派简报。' },
-  'rt:view:diag': { title: '🩺 底层排障与健康诊断', meaning: '按需排障页：平时无需关注，仅在任务卡住、报写锁超时或子进程异常退出时打开核查。' },
+  'rt:view:fleet': { title: '🛰️ 智能体会话编队', meaning: '汇总本机真实多智能体日志或沙箱演练编队，左侧展示父子会话树，右上画跨会话委派/回报泳道，下方检查每次委派简报。' },
+  'rt:view:diag': { title: '🩺 异常排障', meaning: '按需排障页：标签亮出「🟢 无卡死」时平时无需打开；仅在出现「⚠️ 告警」、任务停滞或怀疑排他锁超时时点击排查。' },
   'rt:taskStatus': { title: '任务节点状态', meaning: '🟢 已完成 · 🔵 进行中 · 🔴 异常阻断（含前置依赖 blockedBy）· ⚪ 待推进；父节点自动按子节点汇总百分比。' },
   'rt:sessionRole': { title: '会话编队角色', meaning: '「主控」负责拆解协调、「子体」并行落地具体任务、「审阅」负责只读独立复核。' },
-  'rt:tokenLock': { title: 'token-lock 排他文件锁', meaning: 'Foundation 写集保护锁，防止多个并行智能体同时覆写同一批文件；超过阈值（默认 30 秒）自动琥珀色预警，沙箱锁可在此一键释放。' },
+  'rt:tokenLock': { title: 'token-lock 排他文件锁', meaning: 'Foundation 写集保护锁，防止多个并行智能体同时覆写同一批文件；超过阈值（默认 30 秒）自动琥珀色预警，沙箱演练锁可在运行监控右上角一键释放。' },
   'rt:stateStore': { title: 'state-store 事件哈希链 & Fencing', meaning: '每一步状态变迁均以 SHA-256 链接到前序摘要并递增 Fencing 纪元，保证长任务断点续跑防脑裂；VALID 表示校验完整无篡改。' },
   'rt:processStatus': { title: '受管子进程状态 (EXITED / TIMED_OUT)', meaning: 'supervise-process 对子进程的看门狗记录：RUNNING 运行中、EXITED 正常退出、TIMED_OUT 触发超时代杀保护（SIGTERM/SIGKILL）。' },
 });

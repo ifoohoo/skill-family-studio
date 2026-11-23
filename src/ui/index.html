@@ -33,9 +33,8 @@
 
       <nav class="st-topbar-center" aria-label="控制台主模块导航">
         <div class="st-primary-tabs" role="tablist">
-          <button type="button" role="tab" class="st-tab-btn" data-tab="guide" aria-selected="false">📖 使用说明</button>
+          <button type="button" role="tab" class="st-tab-btn" data-tab="review" aria-selected="false">📝 审阅与对齐</button>
           <button type="button" role="tab" class="st-tab-btn" data-tab="graph" aria-selected="false">🕸️ 制品图谱</button>
-          <button type="button" role="tab" class="st-tab-btn" data-tab="review" aria-selected="false">📝 逐项审阅</button>
           <button type="button" role="tab" class="st-tab-btn" data-tab="runtime" aria-selected="false">⚡ 运行监控</button>
         </div>
       </nav>
@@ -48,13 +47,13 @@
           </button>
           <span id="st-progress-info-slot"></span>
         </span>
+        <button type="button" id="st-manual-btn" role="tab" class="st-tab-btn st-tab-aux" data-tab="guide" aria-selected="false" title="按需查阅操作手册与图例说明">📖 手册</button>
         <button type="button" id="st-theme-btn" class="st-btn" title="切换浅色 / 深色外观">🌓 外观</button>
       </div>
     </header>
 
     <main id="st-main-canvas" class="studio-canvas wb-canvas" role="main">
       <div id="st-readonly-bar" class="st-readonly-bar" hidden></div>
-      <div id="st-welcome-bar" class="st-welcome-bar" hidden></div>
       <div id="st-toast-host" class="st-toast-host" aria-live="polite"></div>
       <section id="st-panel-guide" data-panel="guide" hidden></section>
       <section id="st-panel-graph" data-panel="graph" hidden></section>

@@ -35,12 +35,9 @@ const state = {
   reviewCategory: 'all',
   reviewStatusFilter: 'all',
   reviewQuery: '',
-  proseWidth: typeof localStorage !== 'undefined' && localStorage.getItem('st-prose-width') === 'full' ? 'full' : 'comfort',
   docViewMode: 'summary', // 'summary' | 'raw'
   graphMode: 'dag',
   archifyIdx: 0,
-  fitWidth: true,
-  wrapGrid: true,
   focusSubgraph: false,
   zoom: 1,
   panX: 0,
@@ -49,6 +46,7 @@ const state = {
   selectedAnchor: null,
   archifySelectedNode: null,
   docCache: new Map(),
+  drafts: new Map(),
   writable: true,
   rtScope: 'repo', // 'repo' | 'workspace'
   rtSelectedTargetId: '__all__',
@@ -56,7 +54,6 @@ const state = {
   rtTaskFilter: 'all', // 'all' | 'incomplete' | 'focus'
   rtTaskQuery: '',
   rtCollapsedTreeIds: new Set(),
-  rtLockFilter: 'all',
   rtFleetFamilyId: null,
   rtFleetSelectedAgent: null,
   rtFleetSelectedEventId: null,
@@ -199,57 +196,13 @@ function showStudioToast(message, { tone = 'emerald', actionLabel = null, onActi
 
 function renderTopContextBars() {
   const roBar = document.getElementById('st-readonly-bar');
-  if (roBar) {
-    if (!state.writable) {
-      roBar.replaceChildren(el('span', '🔒 当前工作台处于只读浏览模式（--readonly）：审批签收、批注写入与挂载运行源操作已禁用，可正常浏览图谱、检索与查看汇总。'));
-      roBar.hidden = false;
-    } else {
-      roBar.hidden = true;
-    }
+  if (!roBar) return;
+  if (!state.writable) {
+    roBar.replaceChildren(el('span', '🔒 当前工作台处于只读浏览模式（--readonly）：审批签收、批注写入与挂载运行源操作已禁用，可正常浏览图谱、检索与查看汇总。'));
+    roBar.hidden = false;
+  } else {
+    roBar.hidden = true;
   }
-  const wbBar = document.getElementById('st-welcome-bar');
-  if (!wbBar) return;
-  const dismissed = typeof localStorage !== 'undefined' && localStorage.getItem('st-welcome-dismissed') === '1';
-  if (dismissed || state.tab === 'guide') {
-    wbBar.hidden = true;
-    return;
-  }
-  const curRepo = state.repos.find(r => r.id === state.repoId) || null;
-  const modeTxt = state.repos.length > 1 ? `业务域多仓套组 (${state.repos.length} 仓)` : (state.repos.length === 1 ? '单仓纯净聚焦' : '空工作区');
-  const role = curRepo?.repoRole || 'standalone';
-  const recLabel = !curRepo
-    ? '📖 查看操作手册 →'
-    : ((role === 'portfolio' || role === 'subproject') ? '📋 查看需求进展与双向对齐总览 →' : '▶ 开始按推荐顺序审阅 →');
-  wbBar.replaceChildren();
-  const left = el('div', null, 'st-graph-controls');
-  left.append(
-    el('span', modeTxt, 'st-badge st-badge-indigo'),
-    el('span', curRepo ? `当前定位：${curRepo.name}（${curRepo.repoRoleLabel || '单项目仓'}）` : '当前目录下未发现包含 artifact-graph.config.yaml 的受管仓库'),
-  );
-  const right = el('div', null, 'st-graph-controls');
-  const recBtn = el('button', recLabel, 'st-btn st-btn-primary');
-  recBtn.type = 'button';
-  recBtn.style.height = '28px';
-  recBtn.addEventListener('click', () => {
-    if (!curRepo) switchTab('guide');
-    else if (role === 'portfolio' || role === 'subproject') { state.reviewMode = 'alignment'; switchTab('review'); }
-    else startGuidedReview();
-  });
-  const guideBtn = el('button', '📖 查看操作手册', 'st-btn');
-  guideBtn.type = 'button';
-  guideBtn.style.height = '28px';
-  guideBtn.addEventListener('click', () => switchTab('guide'));
-  const dismissBtn = el('button', '✕', 'st-btn');
-  dismissBtn.type = 'button';
-  dismissBtn.style.height = '28px';
-  dismissBtn.title = '不再显示引导条';
-  dismissBtn.addEventListener('click', () => {
-    try { localStorage.setItem('st-welcome-dismissed', '1'); } catch {}
-    wbBar.hidden = true;
-  });
-  right.append(recBtn, guideBtn, dismissBtn);
-  wbBar.append(left, right);
-  wbBar.hidden = false;
 }
 
 function updateTopbarSummary() {
@@ -350,6 +303,7 @@ function normalizeUiTab(raw) {
 }
 
 let lockTickTimer = null;
+let graphAbortCtrl = null;
 function stopLockTicker() {
   if (lockTickTimer) {
     clearInterval(lockTickTimer);
@@ -357,10 +311,23 @@ function stopLockTicker() {
   }
 }
 
+function getDraftKey(uid, repoId = state.repoId) {
+  return uid ? `${repoId || ''}::${uid}` : '';
+}
+
+function hasSavedDraft(uid, repoId = state.repoId) {
+  const d = state.drafts.get(getDraftKey(uid, repoId));
+  return Boolean(d && (d.ann?.trim() || d.note?.trim()));
+}
+
 function switchTab(nextTab) {
   nextTab = normalizeUiTab(nextTab);
   closeRepoPopover();
   if (nextTab !== 'runtime') stopLockTicker();
+  if (nextTab !== 'graph' && graphAbortCtrl) {
+    graphAbortCtrl.abort();
+    graphAbortCtrl = null;
+  }
   state.tab = nextTab;
   const u = new URL(location.href);
   u.searchParams.set('tab', nextTab);
@@ -471,6 +438,14 @@ async function submitDecision(rawTarget, status, note, andAdvance = false, undoC
       body: JSON.stringify(payload),
     });
     state.decisions = res.decisions || {};
+    if (undoContext?.prevUid) {
+      const dk = getDraftKey(undoContext.prevUid);
+      const prevD = state.drafts.get(dk);
+      if (prevD) {
+        if (prevD.ann?.trim() || prevD.anchor) state.drafts.set(dk, { ...prevD, note: '' });
+        else state.drafts.delete(dk);
+      }
+    }
     let finishedAll = false;
     if (andAdvance) {
       const { item: nextItem, allCompleted } = findNextPendingHumanItem(state.selectedUid);
@@ -480,11 +455,20 @@ async function submitDecision(rawTarget, status, note, andAdvance = false, undoC
     updateTopbarSummary();
     renderActiveTab();
     restoreReviewScroll(scrollSnap);
-    if (andAdvance && undoContext) {
-      const suffix = finishedAll ? ' · 🎉 当前仓库人读审阅项已全部签收完成' : '';
-      showStudioToast(`✓ 已将「${undoContext.code}」标为已通过${suffix}`, {
+
+    const unresolvedCount = getTargetAnnotations(rawTarget).filter(a => !a.resolved).length;
+    if (status === 'pending' && unresolvedCount > 0) {
+      showStudioToast(`已清除终态结论；因当前仍有 ${unresolvedCount} 条未解决批注，状态保持为「🔵 审阅中」`, {
+        tone: 'warn',
+        durationMs: 5500,
+      });
+    } else if (undoContext) {
+      const stLbl = (STATUS_META[status] || STATUS_META.pending).label;
+      const suffix = andAdvance && finishedAll ? ' · 🎉 当前仓库人读审阅项已全部签收完成，可点「③ 导出验收结论」' : '';
+      showStudioToast(`✓ 已将「${undoContext.code}」更新为「${stLbl}」${suffix}`, {
         tone: 'emerald',
-        actionLabel: '撤销并回到该篇',
+        durationMs: 5500,
+        actionLabel: andAdvance ? '撤销并回到该篇' : '撤销刚才操作',
         onAction: async () => {
           await apiJson('/api/studio/decisions', {
             method: 'POST',
@@ -496,7 +480,7 @@ async function submitDecision(rawTarget, status, note, andAdvance = false, undoC
               note: undoContext.prevNote,
             }),
           });
-          await jumpToRepoAndItem(undoContext.repoId, undoContext.prevUid, 'review', 'reader');
+          await jumpToRepoAndItem(undoContext.repoId, undoContext.prevUid, state.tab === 'graph' ? 'graph' : 'review', 'reader');
           const fresh = await apiJson('/api/studio/state');
           state.decisions = fresh.decisions || {};
           updateTopbarSummary();
@@ -579,16 +563,6 @@ async function mountDocumentReader(container, item, options = {}) {
   approveNextBtn.disabled = !state.writable;
 
   rightBtns.append(approveNextBtn);
-  if (!options.inGraphInspector) {
-    const widthToggle = el('button', state.proseWidth === 'full' ? '恢复舒适行宽' : '放宽行宽', 'st-btn');
-    widthToggle.type = 'button';
-    widthToggle.addEventListener('click', () => {
-      state.proseWidth = state.proseWidth === 'full' ? 'comfort' : 'full';
-      localStorage.setItem('st-prose-width', state.proseWidth);
-      mountDocumentReader(container, item, options);
-    });
-    rightBtns.append(widthToggle);
-  }
   actionBar.append(leftInfo, rightBtns);
   container.append(actionBar);
 
@@ -665,7 +639,7 @@ async function mountDocumentReader(container, item, options = {}) {
         if (!targetItem) return;
         state.selectedUid = targetItem.uid;
         state.selectedAnchor = b.anchor || null;
-        mountDocumentReader(container, targetItem, { anchorId: state.selectedAnchor, archifyContext });
+        mountDocumentReader(container, targetItem, { ...options, anchorId: state.selectedAnchor, archifyContext });
       });
       bindBar.append(chipBtn);
     }
@@ -676,7 +650,9 @@ async function mountDocumentReader(container, item, options = {}) {
   const mainCol = el('div', null, 'st-reader-main');
   const dockCol = el('div', null, 'st-reader-dock');
 
-  let pendingAnchorId = null;
+  const draftKey = getDraftKey(item.uid);
+  const savedDraft = state.drafts.get(draftKey) || null;
+  let pendingAnchorId = savedDraft?.anchor ?? null;
   const anchorPillBtn = el('button', '', 'st-anchor-pill');
   anchorPillBtn.type = 'button';
   anchorPillBtn.hidden = true;
@@ -688,7 +664,7 @@ async function mountDocumentReader(container, item, options = {}) {
       anchorPillBtn.hidden = true;
     }
   };
-  anchorPillBtn.addEventListener('click', () => { pendingAnchorId = null; syncAnchorPill(); });
+  syncAnchorPill();
 
   const guardErrEl = el('div', '', 'st-guard-error');
   guardErrEl.hidden = true;
@@ -702,7 +678,7 @@ async function mountDocumentReader(container, item, options = {}) {
   const noteInput = el('input', null, 'st-input');
   noteInput.style.maxWidth = '320px';
   noteInput.placeholder = '审阅结论备注（可选，回车或点状态保存）…';
-  noteInput.value = curDec.note || '';
+  noteInput.value = savedDraft?.note !== undefined ? savedDraft.note : (curDec.note || '');
   noteInput.disabled = !state.writable;
 
   const annBox = el('div', null, 'st-ann-box');
@@ -710,7 +686,43 @@ async function mountDocumentReader(container, item, options = {}) {
   const annInput = el('textarea', null, 'st-textarea');
   annInput.style.marginTop = '8px';
   annInput.placeholder = '记录本篇具体修改意见或疑问，点击下方「＋ 添加批注（自动转入审阅中）」立即落盘…';
+  annInput.value = savedDraft?.ann || '';
   annInput.disabled = !state.writable;
+
+  const syncDraftStore = () => {
+    if (!draftKey) return;
+    const annVal = annInput.value;
+    const noteVal = noteInput.value;
+    const noteModified = noteVal !== (curDec.note || '');
+    if (annVal.trim() || pendingAnchorId || noteModified) {
+      state.drafts.set(draftKey, {
+        ann: annVal,
+        note: noteModified ? noteVal : undefined,
+        anchor: pendingAnchorId,
+      });
+    } else {
+      state.drafts.delete(draftKey);
+    }
+    const curBtn = document.querySelector(`#st-panel-review .st-review-item-btn[data-uid="${CSS.escape(item.uid)}"]`);
+    if (curBtn) {
+      let badge = curBtn.querySelector('.st-draft-tag');
+      const hasD = Boolean(annVal.trim() || (noteModified && noteVal.trim()));
+      if (hasD && !badge) {
+        badge = el('span', '📝 草稿', 'st-draft-tag');
+        curBtn.querySelector('.st-repo-opt-head')?.append(badge);
+      } else if (!hasD && badge) {
+        badge.remove();
+      }
+    }
+  };
+
+  anchorPillBtn.addEventListener('click', () => {
+    pendingAnchorId = null;
+    syncAnchorPill();
+    syncDraftStore();
+  });
+  annInput.addEventListener('input', syncDraftStore);
+  noteInput.addEventListener('input', syncDraftStore);
 
   const flushPendingDraftIfNeeded = async () => {
     const draft = annInput.value.trim();
@@ -723,6 +735,7 @@ async function mountDocumentReader(container, item, options = {}) {
       annInput.value = '';
       pendingAnchorId = null;
       syncAnchorPill();
+      syncDraftStore();
       showStudioToast('已自动保存未提交的批注草稿并更新状态', { tone: 'emerald' });
     }
     return saved;
@@ -743,33 +756,35 @@ async function mountDocumentReader(container, item, options = {}) {
       }
     }
     await flushPendingDraftIfNeeded();
-    if (stKey === 'pending') {
-      noteInput.value = '';
-      await submitDecision(rawTarget, 'pending', '', false, null);
-      return;
-    }
-    const undoContext = andAdvance ? {
+    const undoContext = {
       repoId: state.repoId,
       prevUid: item.uid,
       prevRawTarget: rawTarget,
       prevStatus: curDec.status || 'pending',
       prevNote: curDec.note || '',
       code: item.code || item.uid,
-    } : null;
+    };
+    if (stKey === 'pending') {
+      noteInput.value = '';
+      state.drafts.delete(draftKey);
+      await submitDecision(rawTarget, 'pending', '', false, undoContext);
+      return;
+    }
     await submitDecision(rawTarget, stKey, noteInput.value, andAdvance, undoContext);
   };
 
   approveNextBtn.addEventListener('click', () => handleStatusCommit('approved', true));
 
-  for (const [stKey, label] of [
-    ['approved', '🟢 标为已通过'],
-    ['reviewing', '🔵 标为审阅中'],
-    ['changes_requested', '🟠 需修改'],
-    ['deferred', '🟣 暂缓'],
-    ['pending', '⚪ 重置待审'],
+  for (const [stKey, label, btnTitle] of [
+    ['approved', '🟢 标为已通过', '确认内容准确并签收通过'],
+    ['reviewing', '🔵 标为审阅中', '作为阅读书签暂时搁置或标为正在梳理意见（写批注也会自动点亮）'],
+    ['changes_requested', '🟠 需修改', '退回作者根据批注整改（需填写批注或说明）'],
+    ['deferred', '🟣 暂缓', '本轮不阻断，留待后续波次处理'],
+    ['pending', '⚪ 重置待审', '清除终态结论与备注，重置回待审状态'],
   ]) {
     const b = el('button', label, `st-btn${eff === stKey ? ' is-active' : ''}`);
     b.type = 'button';
+    b.title = btnTitle;
     b.disabled = !state.writable;
     b.addEventListener('click', () => handleStatusCommit(stKey, false));
     statusGroup.append(b, infoTrigger(`status:${stKey}`, document));
@@ -786,7 +801,6 @@ async function mountDocumentReader(container, item, options = {}) {
   jumpDockBar.append(el('span', '正在长文阅读模式', 'st-muted-xs'), jumpDockBtn);
 
   const proseWrap = el('article', null, 'st-prose-container');
-  proseWrap.dataset.proseWidth = state.proseWidth;
   proseWrap.append(el('p', '正在加载制品正文…', 'st-muted-xs'));
 
   const addAnnBtn = el('button', '＋ 添加批注（自动转入审阅中）', 'st-btn st-btn-primary');
@@ -807,7 +821,12 @@ async function mountDocumentReader(container, item, options = {}) {
       body: val,
       ...(pendingAnchorId ? { anchor: pendingAnchorId } : {}),
     });
-    if (ok) { pendingAnchorId = null; syncAnchorPill(); }
+    if (ok) {
+      annInput.value = '';
+      pendingAnchorId = null;
+      syncAnchorPill();
+      syncDraftStore();
+    }
   });
   annBox.append(anchorPillBtn, annInput, guardErrEl, addAnnBtn);
 
@@ -894,6 +913,7 @@ async function mountDocumentReader(container, item, options = {}) {
       if (anc) {
         pendingAnchorId = anc.dataset.anchorId || null;
         syncAnchorPill();
+        syncDraftStore();
         annInput.focus();
       }
     });
@@ -945,17 +965,27 @@ function renderGuidePanel() {
   const g = state.guide;
   if (!g) return;
 
+  const noRepos = state.repos.length === 0;
+  const repoActionIds = new Set(['open-repo-switcher', 'go-tab-graph', 'go-tab-alignment', 'start-guided-review', 'go-tab-cross-doc', 'go-tab-review', 'open-export-drawer']);
+
   const banner = el('div', null, 'st-guided-banner');
   const bLeft = el('div');
   bLeft.append(el('h1', g.title, ''), el('p', g.subtitle, 'st-muted-xs'));
   bLeft.firstChild.style.margin = '0 0 4px 0';
   bLeft.lastChild.style.margin = '0';
+  if (noRepos) {
+    bLeft.append(el('p', '提示：当前工作区尚未发现受管仓库，涉及具体仓库审阅与图谱的直达按钮已置灰；你仍可前往「⚡ 运行监控」查看本机智能体会话或运行沙箱演练。', 'st-guard-error'));
+  }
   const bRight = el('div', null, 'st-graph-controls');
   const alignQuickBtn = el('button', '📋 查看需求进展与双向对齐总览', 'st-btn');
   alignQuickBtn.type = 'button';
+  alignQuickBtn.disabled = noRepos;
+  if (noRepos) alignQuickBtn.title = '当前工作区未发现受管仓库';
   alignQuickBtn.addEventListener('click', () => triggerGuideAction('go-tab-alignment'));
   const startBtn = el('button', '▶ 开始按推荐顺序审阅（故事 → 需求 → 场景）', 'st-btn st-btn-primary');
   startBtn.type = 'button';
+  startBtn.disabled = noRepos;
+  if (noRepos) startBtn.title = '当前工作区未发现受管仓库';
   startBtn.addEventListener('click', startGuidedReview);
   bRight.append(alignQuickBtn, startBtn);
   banner.append(bLeft, bRight);
@@ -1029,6 +1059,10 @@ function renderGuidePanel() {
         top.querySelector('h4').style.margin = '6px 0 4px 0';
         const act = el('button', s.actionLabel, 'st-btn st-btn-primary');
         act.type = 'button';
+        if (noRepos && repoActionIds.has(s.actionId)) {
+          act.disabled = true;
+          act.title = '当前工作区未发现受管仓库';
+        }
         act.addEventListener('click', () => triggerGuideAction(s.actionId));
         card.append(top, act);
         stepGrid.append(card);
@@ -1061,6 +1095,10 @@ function renderGuidePanel() {
         goBtn.type = 'button';
         goBtn.style.alignSelf = 'flex-start';
         goBtn.style.marginTop = '8px';
+        if (noRepos && repoActionIds.has(page.actionId)) {
+          goBtn.disabled = true;
+          goBtn.title = '当前工作区未发现受管仓库';
+        }
         goBtn.addEventListener('click', () => triggerGuideAction(page.actionId));
         box.append(goBtn);
       }
@@ -1210,6 +1248,7 @@ let graphResizeRafId = 0;
 function renderGraphPanel() {
   const host = document.getElementById('st-panel-graph');
   host.replaceChildren();
+  if (graphAbortCtrl) { graphAbortCtrl.abort(); graphAbortCtrl = null; }
   if (graphResizeRafId) { cancelAnimationFrame(graphResizeRafId); graphResizeRafId = 0; }
   if (graphResizeObserver) { graphResizeObserver.disconnect(); graphResizeObserver = null; }
   if (state.repos.length === 0) {
@@ -1350,16 +1389,6 @@ function renderGraphPanel() {
       if (zoomBadgeBtn) zoomBadgeBtn.textContent = `${Math.round(state.zoom * 100)}%`;
     };
 
-    const fitBtn = mkCtrl('适应屏宽', state.fitWidth, () => {
-      state.fitWidth = !state.fitWidth;
-      fitBtn.classList.toggle('is-active', state.fitWidth);
-      paintSvgCanvas();
-    });
-    const wrapBtn = mkCtrl('自动折行排布', state.wrapGrid, () => {
-      state.wrapGrid = !state.wrapGrid;
-      wrapBtn.classList.toggle('is-active', state.wrapGrid);
-      paintSvgCanvas();
-    });
     const subBtn = mkCtrl('仅看上下游关联子图', state.focusSubgraph, () => {
       state.focusSubgraph = !state.focusSubgraph;
       subBtn.classList.toggle('is-active', state.focusSubgraph);
@@ -1370,18 +1399,13 @@ function renderGraphPanel() {
       state.zoom = Math.max(0.4, Number((state.zoom - 0.15).toFixed(2)));
       applyZoomInPlace();
     });
-    zoomBadgeBtn = mkCtrl(`${Math.round(state.zoom * 100)}%`, false, () => {
-      state.zoom = 1;
-      applyZoomInPlace();
-    });
+    zoomBadgeBtn = el('span', `${Math.round(state.zoom * 100)}%`, 'st-zoom-readout');
     const zoomInBtn = mkCtrl('＋', false, () => {
       state.zoom = Math.min(2.4, Number((state.zoom + 0.15).toFixed(2)));
       applyZoomInPlace();
     });
-    const resetBtn = mkCtrl('重置视图', false, () => {
-      state.zoom = 1; state.panX = 0; state.panY = 0; state.fitWidth = true; state.wrapGrid = true; state.focusSubgraph = false;
-      fitBtn.classList.add('is-active');
-      wrapBtn.classList.add('is-active');
+    const resetBtn = mkCtrl('重置视角', false, () => {
+      state.zoom = 1; state.panX = 0; state.panY = 0; state.focusSubgraph = false;
       subBtn.classList.remove('is-active');
       applyZoomInPlace();
       updateLocatorBar();
@@ -1395,8 +1419,6 @@ function renderGraphPanel() {
       updateLocatorBar();
     });
     canvasControls.append(
-      fitBtn, infoTrigger('fitWidth', document),
-      wrapBtn, infoTrigger('wrapGrid', document),
       subBtn, infoTrigger('subgraphOnly', document),
       zoomOutBtn, zoomBadgeBtn, zoomInBtn, resetBtn, fsBtnRef,
     );
@@ -1412,23 +1434,19 @@ function renderGraphPanel() {
         syncArchifyDefaultDoc(state.snap.archifyDiagrams[state.archifyIdx]);
         renderGraphPanel();
       });
-      canvasControls.append(prevArch);
-    }
-    const sel = el('select', null, 'st-select');
-    sel.style.width = 'auto';
-    state.snap.archifyDiagrams.forEach((d, idx) => {
-      const opt = el('option', `${idx + 1}. ${d.title}`);
-      opt.value = String(idx);
-      if (idx === state.archifyIdx) opt.selected = true;
-      sel.append(opt);
-    });
-    sel.addEventListener('change', () => {
-      state.archifyIdx = Number(sel.value) || 0;
-      syncArchifyDefaultDoc(state.snap.archifyDiagrams[state.archifyIdx]);
-      renderGraphPanel();
-    });
-    canvasControls.append(sel);
-    if (totalArch > 1) {
+      const sel = el('select', null, 'st-select');
+      sel.style.width = 'auto';
+      state.snap.archifyDiagrams.forEach((d, idx) => {
+        const opt = el('option', `${idx + 1}. ${d.title}`);
+        opt.value = String(idx);
+        if (idx === state.archifyIdx) opt.selected = true;
+        sel.append(opt);
+      });
+      sel.addEventListener('change', () => {
+        state.archifyIdx = Number(sel.value) || 0;
+        syncArchifyDefaultDoc(state.snap.archifyDiagrams[state.archifyIdx]);
+        renderGraphPanel();
+      });
       const nextArch = el('button', '下一张 ▶', 'st-btn');
       nextArch.type = 'button';
       nextArch.addEventListener('click', () => {
@@ -1436,7 +1454,9 @@ function renderGraphPanel() {
         syncArchifyDefaultDoc(state.snap.archifyDiagrams[state.archifyIdx]);
         renderGraphPanel();
       });
-      canvasControls.append(nextArch);
+      canvasControls.append(prevArch, sel, nextArch);
+    } else if (curFig) {
+      canvasControls.append(el('span', `当前业务图：${curFig.title}`, 'st-badge st-badge-indigo'));
     }
     if (docMatch) {
       canvasControls.append(el('span', `关联正文：${docMatch.code || docMatch.title}`, 'st-badge st-badge-zinc'));
@@ -1463,7 +1483,7 @@ function renderGraphPanel() {
     const stage = el('div', null, 'st-archify-stage');
     const iframe = el('iframe', null, 'st-archify-frame');
     iframe.title = fig.title;
-    iframe.src = `/api/studio/archify/${encodeURIComponent(state.repoId)}/${fig.htmlPath}?theme=${encodeURIComponent(curTheme)}&present=1`;
+    iframe.src = `/api/studio/archify/${encodeURIComponent(state.repoId)}/${fig.htmlPath}?theme=${encodeURIComponent(curTheme)}&embed=1`;
 
     const bindArchifyNodeSelection = (nodeId, nodeLabel) => {
       if (!nodeId) return;
@@ -1471,7 +1491,10 @@ function renderGraphPanel() {
       const matched = allBindings.filter(b => b.nodeId === nodeId);
       const primary = matched.find(b => b.pageId === fig.docPageId) || matched[0] || (fig.docPageId ? { pageId: fig.docPageId, anchor: null } : null);
       const targetItem = resolveStudioItemByPageId(primary?.pageId || fig.docPageId);
-      if (!targetItem) return;
+      if (!targetItem) {
+        showStudioToast(`图节点「${nodeLabel || nodeId}」暂无绑定的正文文档`, { tone: 'warn', durationMs: 3500 });
+        return;
+      }
       state.archifySelectedNode = { nodeId, label: nodeLabel || nodeId, bindings: matched };
       state.selectedUid = targetItem.uid;
       state.selectedAnchor = primary?.anchor || null;
@@ -1513,6 +1536,14 @@ function renderGraphPanel() {
           const label = nodeEl?.getAttribute('data-node-label') || outlineEl?.textContent?.trim() || nodeId;
           bindArchifyNodeSelection(nodeId, label);
         }, true);
+        doc.addEventListener('keydown', ev => {
+          if (ev.key === 'Escape' && state.fullscreenGraph) {
+            state.fullscreenGraph = false;
+            split.classList.remove('is-fullscreen');
+            if (fsBtnRef) { fsBtnRef.classList.remove('is-active'); fsBtnRef.textContent = '全屏画布'; }
+            floatBar.hidden = true;
+          }
+        }, true);
       } catch {}
     });
 
@@ -1548,8 +1579,8 @@ function renderGraphPanel() {
       const cw = Math.max(640, viewport.clientWidth || window.innerWidth - (state.fullscreenGraph ? 60 : 540));
       const layout = computeAdaptiveGraphLayout(state.snap, {
         containerWidth: cw,
-        fitWidth: state.fitWidth,
-        wrapGrid: state.wrapGrid,
+        fitWidth: true,
+        wrapGrid: true,
         focusMode: state.focusSubgraph ? 'subgraph' : 'all',
         selectedUid: state.selectedUid,
       });
@@ -1624,6 +1655,7 @@ function renderGraphPanel() {
     }, { passive: false });
 
     let dragging = false, sx = 0, sy = 0;
+    graphAbortCtrl = new AbortController();
     viewport.addEventListener('mousedown', ev => {
       if (ev.target.closest('.st-node-group')) return;
       dragging = true; sx = ev.clientX - state.panX; sy = ev.clientY - state.panY;
@@ -1633,8 +1665,11 @@ function renderGraphPanel() {
       if (!dragging) return;
       state.panX = ev.clientX - sx; state.panY = ev.clientY - sy;
       svg.style.transform = `translate(${state.panX}px, ${state.panY}px)`;
-    });
-    window.addEventListener('mouseup', () => { dragging = false; viewport.classList.remove('is-panning'); });
+    }, { signal: graphAbortCtrl.signal });
+    window.addEventListener('mouseup', () => {
+      dragging = false;
+      viewport.classList.remove('is-panning');
+    }, { signal: graphAbortCtrl.signal });
 
     graphResizeObserver = new ResizeObserver(() => {
       if (graphResizeRafId) cancelAnimationFrame(graphResizeRafId);
@@ -1683,6 +1718,9 @@ function renderAlignmentOverview(host) {
     leftTitle.lastChild.style.margin = '0';
 
     const filterGroup = el('div', null, 'st-graph-controls');
+    const stepNextBtn = el('button', '下一步：开始逐篇审阅正文 →', 'st-btn st-btn-primary');
+    stepNextBtn.type = 'button';
+    stepNextBtn.addEventListener('click', startGuidedReview);
     const alertTotal = (sum.driftCount ?? 0) + (sum.missingCount ?? 0) + (sum.unallocated ?? 0);
     for (const [fKey, fLabel] of [
       ['all', `全部 (${sum.total ?? 0})`],
@@ -1696,6 +1734,7 @@ function renderAlignmentOverview(host) {
       b.addEventListener('click', () => { state.alignFilter = fKey; renderReviewPanel(); });
       filterGroup.append(b);
     }
+    filterGroup.append(stepNextBtn);
     const qInp = el('input', null, 'st-input');
     qInp.type = 'search';
     qInp.style.width = '220px';
@@ -1731,8 +1770,19 @@ function renderAlignmentOverview(host) {
       });
       if (!rows.length) {
         const emptyTr = el('tr');
-        const td = el('td', '当前筛选条件下无匹配的高阶需求记录。', 'st-muted-xs');
+        const td = el('td');
         td.colSpan = 4;
+        const emptyBox = el('div', null, 'st-empty-actions');
+        emptyBox.style.marginTop = '0';
+        const clrBtn = el('button', '🔄 清空筛选条件', 'st-btn');
+        clrBtn.type = 'button';
+        clrBtn.addEventListener('click', () => {
+          state.alignFilter = 'all';
+          state.alignQuery = '';
+          renderReviewPanel();
+        });
+        emptyBox.append(el('span', '当前筛选条件下无匹配的高阶需求记录。', 'st-muted-xs'), clrBtn);
+        td.append(emptyBox);
         emptyTr.append(td);
         tbody.append(emptyTr);
         return;
@@ -1858,7 +1908,17 @@ function renderAlignmentOverview(host) {
 
   const ic = al.internalCodeLocks || {};
   const codeCard = el('div', null, 'st-card st-guide-section');
-  codeCard.append(el('h2', '单仓内部「详设 ↔ 代码与测试」双向互锁体检', ''));
+  const codeHead = el('div', null, 'st-repo-opt-head');
+  codeHead.style.marginBottom = '10px';
+  codeHead.append(el('h2', '单仓内部「详设 ↔ 代码与测试」双向互锁体检', ''));
+  codeHead.firstChild.style.margin = '0';
+  if (!al.portfolio?.present) {
+    const stepNextBtn = el('button', '下一步：开始逐篇审阅正文 →', 'st-btn st-btn-primary');
+    stepNextBtn.type = 'button';
+    stepNextBtn.addEventListener('click', startGuidedReview);
+    codeHead.append(stepNextBtn);
+  }
+  codeCard.append(codeHead);
   const kpiRow = el('div', null, 'st-kpi-grid');
   const mkBox = (lbl, val, tone, tipKey) => {
     const c = el('div', null, 'st-card st-kpi-card');
@@ -1911,17 +1971,22 @@ function renderReviewPanel() {
   if (!state.snap) { host.append(el('p', '正在加载审阅清单…', 'st-muted-xs')); return; }
 
   const totalAlerts = state.alignment?.totalAlerts ?? 0;
+  const curRepo = state.repos.find(r => r.id === state.repoId) || null;
+  const prog = curRepo ? countRepoProgress(curRepo) : { decided: 0, total: state.snap.reviewItems?.length || 0 };
   const banner = el('div', null, 'st-guided-banner');
   const leftControls = el('div', null, 'st-graph-controls');
-  const viewSwitch = el('div', null, 'st-view-switch');
-  const alignTabBtn = el('button', `📋 需求进展与双向对齐总览${totalAlerts > 0 ? ` (${totalAlerts} 告警)` : ''}`, `st-btn${state.reviewMode === 'alignment' ? ' is-active' : ''}`);
-  alignTabBtn.type = 'button';
-  alignTabBtn.addEventListener('click', () => { state.reviewMode = 'alignment'; renderReviewPanel(); });
-  const readerTabBtn = el('button', '📖 按阅读任务逐篇审阅', `st-btn${state.reviewMode === 'reader' ? ' is-active' : ''}`);
-  readerTabBtn.type = 'button';
-  readerTabBtn.addEventListener('click', () => { state.reviewMode = 'reader'; renderReviewPanel(); });
-  viewSwitch.append(alignTabBtn, readerTabBtn);
-  leftControls.append(viewSwitch, el('span', '推荐动线：用户故事 → 需求进展总览 → 场景剧本 → 领域与架构依据', 'st-muted-xs'));
+  const stepFlow = el('div', null, 'st-step-flow');
+  const step1Btn = el('button', `① 核对需求与代码对齐${totalAlerts > 0 ? ` (${totalAlerts} 告警)` : ''}`, `st-step-btn${state.reviewMode === 'alignment' ? ' is-active' : ''}`);
+  step1Btn.type = 'button';
+  step1Btn.addEventListener('click', () => { state.reviewMode = 'alignment'; renderReviewPanel(); });
+  const step2Btn = el('button', `② 按顺序逐篇审阅 (已审 ${prog.decided}/${prog.total})`, `st-step-btn${state.reviewMode === 'reader' ? ' is-active' : ''}`);
+  step2Btn.type = 'button';
+  step2Btn.addEventListener('click', () => { state.reviewMode = 'reader'; renderReviewPanel(); });
+  const step3Btn = el('button', '③ 导出验收结论', 'st-step-btn');
+  step3Btn.type = 'button';
+  step3Btn.addEventListener('click', openExportDrawer);
+  stepFlow.append(step1Btn, el('span', '──▶', 'st-step-arrow'), step2Btn, el('span', '──▶', 'st-step-arrow'), step3Btn);
+  leftControls.append(stepFlow);
 
   const nextBtn = el('button', '▶ 跳至下一项待审条目 →', 'st-btn st-btn-primary');
   nextBtn.type = 'button';
@@ -1933,7 +1998,11 @@ function renderReviewPanel() {
       state.reviewMode = 'reader';
       renderReviewPanel();
     } else if (allCompleted) {
-      showStudioToast('🎉 当前仓库人读审阅项已全部签收完成', { tone: 'emerald' });
+      showStudioToast('🎉 当前仓库人读审阅项已全部签收完成，请点击「③ 导出验收结论」生成验收单', {
+        tone: 'emerald',
+        actionLabel: '打开 ③ 导出验收结论',
+        onAction: openExportDrawer,
+      });
     }
   });
   banner.append(leftControls, nextBtn);
@@ -1967,8 +2036,8 @@ function renderReviewPanel() {
     bAll.addEventListener('click', () => { state.reviewCategory = 'all'; renderReviewPanel(); });
     catRow.append(bAll);
   }
-  const addCatGroup = (grpId, titleTxt, tipKey) => {
-    const grpCats = cats.filter(c => c.group === grpId);
+  const addCatGroup = (pred, titleTxt, tipKey) => {
+    const grpCats = cats.filter(pred);
     if (!grpCats.length) return;
     const hdr = el('div', null, 'st-cat-group-label');
     hdr.append(el('span', titleTxt), infoTrigger(tipKey, document));
@@ -1980,9 +2049,11 @@ function renderReviewPanel() {
       catRow.append(b);
     }
   };
-  addCatGroup('primary', '首要阅读（从诉求到进展与行为）', 'catGroup:primary');
-  addCatGroup('supporting', '关联依据（领域、架构与测试追溯）', 'catGroup:supporting');
-  addCatGroup('contracts', '结构化数据契约 (.json/.yaml · 供脚本校验)', 'catGroup:contracts');
+  const STORY_CAT_IDS = new Set(['stories', 'lc_explanations', 'us_stories', 'gap_resolutions']);
+  addCatGroup(c => c.group === 'primary' && STORY_CAT_IDS.has(c.id), '第 1 顺位：先看诉求（用户故事）', 'catGroup:primary1');
+  addCatGroup(c => c.group === 'primary' && !STORY_CAT_IDS.has(c.id), '第 2 顺位：核对边界（需求与场景）', 'catGroup:primary2');
+  addCatGroup(c => c.group === 'supporting', '备查依据（领域、架构与测试）', 'catGroup:supporting');
+  addCatGroup(c => c.group === 'contracts', '附：机器契约（默认自动跳过）', 'catGroup:contracts');
   sidebar.append(catRow);
 
   const statusSel = el('select', null, 'st-select');
@@ -1999,7 +2070,11 @@ function renderReviewPanel() {
     if (state.reviewStatusFilter === val) o.selected = true;
     statusSel.append(o);
   }
-  statusSel.addEventListener('change', () => { state.reviewStatusFilter = statusSel.value; paintList(); });
+  statusSel.addEventListener('change', () => {
+    state.reviewStatusFilter = statusSel.value;
+    const filtered = paintList();
+    syncReaderToFiltered(filtered);
+  });
   sidebar.append(statusSel);
 
   const listWrap = el('div');
@@ -2007,6 +2082,33 @@ function renderReviewPanel() {
   listWrap.style.flexDirection = 'column';
   listWrap.style.gap = '6px';
   sidebar.append(listWrap);
+
+  const resetReviewFilters = () => {
+    state.reviewCategory = 'all';
+    state.reviewStatusFilter = 'all';
+    state.reviewQuery = '';
+    renderReviewPanel();
+  };
+
+  const syncReaderToFiltered = filteredItems => {
+    if (!filteredItems.length) {
+      readerCard.replaceChildren();
+      const emptyWrap = el('div', null, 'st-prose-container');
+      emptyWrap.append(el('p', '当前筛选或搜索条件下暂无匹配的可审阅条目。', 'st-muted-xs'));
+      const clrRightBtn = el('button', '🔄 清空筛选条件', 'st-btn');
+      clrRightBtn.type = 'button';
+      clrRightBtn.addEventListener('click', resetReviewFilters);
+      emptyWrap.append(clrRightBtn);
+      readerCard.append(emptyWrap);
+      return;
+    }
+    const targetItem = filteredItems.find(i => i.uid === state.selectedUid) || filteredItems[0];
+    if (targetItem.uid !== state.selectedUid) {
+      state.selectedUid = targetItem.uid;
+      state.selectedAnchor = null;
+    }
+    mountDocumentReader(readerCard, targetItem);
+  };
 
   const paintList = () => {
     listWrap.replaceChildren();
@@ -2020,7 +2122,11 @@ function renderReviewPanel() {
     });
     if (!items.length) {
       listWrap.append(el('p', '当前筛选条件下暂无匹配项。', 'st-muted-xs'));
-      return;
+      const clrBtn = el('button', '🔄 清空筛选条件', 'st-btn');
+      clrBtn.type = 'button';
+      clrBtn.addEventListener('click', resetReviewFilters);
+      listWrap.append(clrBtn);
+      return items;
     }
     for (const item of items) {
       const eff = getEffectiveStatus(item.target || item.uid);
@@ -2032,9 +2138,12 @@ function renderReviewPanel() {
       const contractExt = item.isMachineContract
         ? (/\.ya?ml$/i.test(String(item.path || '')) ? ' · .yaml' : ' · .json')
         : '';
+      const r1Right = el('div', null, 'st-graph-controls');
+      if (hasSavedDraft(item.uid)) r1Right.append(el('span', '📝 草稿', 'st-draft-tag'));
+      r1Right.append(el('span', `${sm.dot} ${sm.label}`, sm.badge));
       r1.append(
         el('span', `${item.code} · ${item.typeLabel}${contractExt}`, 'st-muted-xs'),
-        el('span', `${sm.dot} ${sm.label}`, sm.badge),
+        r1Right,
       );
       b.append(r1, el('div', item.title));
       b.addEventListener('click', () => {
@@ -2048,29 +2157,38 @@ function renderReviewPanel() {
       });
       listWrap.append(b);
     }
+    return items;
   };
-  paintList();
-
-  const activeItem = (state.snap.reviewItems || []).find(i => i.uid === state.selectedUid)
-    || (state.snap.reviewItems || [])[0] || null;
-  mountDocumentReader(readerCard, activeItem);
+  searchInp.addEventListener('input', () => {
+    state.reviewQuery = searchInp.value;
+    const filtered = paintList();
+    if (!filtered.length || !filtered.some(i => i.uid === state.selectedUid)) {
+      syncReaderToFiltered(filtered);
+    }
+  });
+  const initialItems = paintList();
+  syncReaderToFiltered(initialItems);
 
   split.append(sidebar, readerCard);
   host.append(split);
   if (prevSidebarTop > 0) requestAnimationFrame(() => { sidebar.scrollTop = prevSidebarTop; });
 }
 
-export function buildRuntimeTargetsTable(targetsToShow = [], doc = document) {
+export function buildRuntimeTargetsTable(targetsToShow = [], doc = document, options = {}) {
   const mk = (tag, text, cls) => {
     const node = doc.createElement(tag);
     if (text !== undefined && text !== null) node.textContent = String(text);
     if (cls) node.className = cls;
     return node;
   };
+  const showActions = typeof options.onEdit === 'function' || typeof options.onRemove === 'function';
   const tbl = mk('table', null, 'st-prose-table');
   const thead = mk('thead');
   const htr = mk('tr');
-  for (const h of ['监控目标', '计划进度', '活跃令牌锁', '事件哈希链', '受管子进程']) htr.append(mk('th', h));
+  const cols = showActions
+    ? ['监控目标', '计划进度', '活跃令牌锁', '事件哈希链', '受管子进程', '操作']
+    : ['监控目标', '计划进度', '活跃令牌锁', '事件哈希链', '受管子进程'];
+  for (const h of cols) htr.append(mk('th', h));
   thead.append(htr);
   const tbody = mk('tbody');
   for (const t of targetsToShow) {
@@ -2083,15 +2201,42 @@ export function buildRuntimeTargetsTable(targetsToShow = [], doc = document) {
     tdChain.append(mk('code', t.chainIntegrity ?? 'NONE'), doc.createTextNode(` (${t.eventCount ?? 0} 条)`));
     const tdProc = mk('td', `${t.processCount ?? 0} 条记录`);
     tr.append(tdTitle, tdProg, tdLock, tdChain, tdProc);
+    if (showActions) {
+      const tdOp = mk('td');
+      if (t.isUserRegistered) {
+        const g = mk('div', null, 'st-graph-controls');
+        if (typeof options.onEdit === 'function') {
+          const edBtn = mk('button', '✏️ 编辑', 'st-btn');
+          edBtn.type = 'button';
+          edBtn.disabled = options.writable === false;
+          edBtn.addEventListener('click', () => options.onEdit(t));
+          g.append(edBtn);
+        }
+        if (typeof options.onRemove === 'function') {
+          const rmBtn = mk('button', '🗑️ 移除', 'st-btn');
+          rmBtn.type = 'button';
+          rmBtn.disabled = options.writable === false;
+          rmBtn.addEventListener('click', () => options.onRemove(t));
+          g.append(rmBtn);
+        }
+        tdOp.append(g);
+      } else {
+        tdOp.append(mk('span', t.isSandbox ? '沙箱演练' : '自动发现', 'st-muted-xs'));
+      }
+      tr.append(tdOp);
+    }
     tbody.append(tr);
   }
   tbl.append(thead, tbody);
   return tbl;
 }
 
-function openRegisterRuntimeModal(onRegistered) {
+function openRegisterRuntimeModal(onRegistered, editTarget = null) {
   const existing = document.getElementById('st-rt-reg-modal');
   if (existing) existing.remove();
+
+  const isEdit = Boolean(editTarget);
+  const cfg = editTarget?.editConfig || editTarget || {};
 
   const backdrop = el('div', null, 'st-modal-backdrop');
   backdrop.id = 'st-rt-reg-modal';
@@ -2100,31 +2245,34 @@ function openRegisterRuntimeModal(onRegistered) {
   modal.setAttribute('aria-modal', 'true');
 
   const head = el('div', null, 'st-repo-opt-head');
-  head.append(el('h3', '+ 挂载 Foundation 运行监控源', ''));
+  head.append(el('h3', isEdit ? '✏️ 编辑已挂载运行源' : '+ 挂载 Foundation 运行监控源', ''));
   head.firstChild.style.margin = '0';
   const closeBtn = el('button', '✕', 'st-btn');
   closeBtn.type = 'button';
   closeBtn.addEventListener('click', () => backdrop.remove());
   head.append(closeBtn);
 
-  const mkField = (id, label, placeholder, req = false) => {
+  const mkField = (id, label, placeholder, req = false, val = '') => {
     const wrap = el('div', null, 'st-form-field');
     const lbl = el('label', label);
     lbl.htmlFor = id;
     const inp = el('input', null, 'st-input');
     inp.id = id;
     inp.placeholder = placeholder;
+    if (val) inp.value = val;
     if (req) inp.required = true;
     wrap.append(lbl, inp);
     return { wrap, inp };
   };
 
-  const fId = mkField('st-reg-id', '目标 ID（字母/数字/短横线）*', '如 task-wave10-verify', true);
-  const fTitle = mkField('st-reg-title', '显示标题', '如 全量门禁执行器');
-  const fState = mkField('st-reg-state', 'state-store 状态目录（可选）', '.artifacts/state-store 或绝对路径');
-  const fPlan = mkField('st-reg-plan', '执行计划路径（.md / .json / .csv，可选）', 'PLAN.md');
-  const fRuns = mkField('st-reg-runs', '子进程监督目录 runsDir（可选）', '.runs');
-  const fLocks = mkField('st-reg-locks', '锁路径 lockPaths（逗号分隔，可选）', '.artifacts/locks, artifacts/traceability-version-lock.json');
+  const fId = mkField('st-reg-id', '目标 ID（字母/数字/短横线）*', '如 task-wave10-verify', true, cfg.id || '');
+  if (isEdit) fId.inp.readOnly = true;
+  const fTitle = mkField('st-reg-title', '显示标题', '如 全量门禁执行器', false, cfg.title || '');
+  const fState = mkField('st-reg-state', 'state-store 状态目录（可选）', '.artifacts/state-store 或绝对路径', false, cfg.stateDir || '');
+  const fPlan = mkField('st-reg-plan', '执行计划路径（.md / .json / .csv，可选）', 'PLAN.md', false, cfg.planPath || '');
+  const fRuns = mkField('st-reg-runs', '子进程监督目录 runsDir（可选）', '.runs', false, cfg.runsDir || '');
+  const lockInit = Array.isArray(cfg.lockPaths) ? cfg.lockPaths.join(', ') : '';
+  const fLocks = mkField('st-reg-locks', '排他写锁路径 lockPaths（逗号分隔，可选）', '.artifacts/locks, .artifacts/state-store/writer.lock', false, lockInit);
 
   const errLine = el('div', '', 'st-muted-xs');
   errLine.style.color = 'var(--st-rose-fg)';
@@ -2134,7 +2282,7 @@ function openRegisterRuntimeModal(onRegistered) {
   const cancelBtn = el('button', '取消', 'st-btn');
   cancelBtn.type = 'button';
   cancelBtn.addEventListener('click', () => backdrop.remove());
-  const submitBtn = el('button', '确认挂载并落盘', 'st-btn st-btn-primary');
+  const submitBtn = el('button', isEdit ? '保存修改' : '确认挂载并落盘', 'st-btn st-btn-primary');
   submitBtn.type = 'button';
   submitBtn.addEventListener('click', async () => {
     errLine.textContent = '';
@@ -2155,9 +2303,10 @@ function openRegisterRuntimeModal(onRegistered) {
         }),
       });
       backdrop.remove();
+      showStudioToast(isEdit ? `✓ 已更新自定义运行源「${idVal}」` : `✓ 已挂载自定义运行源「${idVal}」`, { tone: 'emerald' });
       onRegistered?.();
     } catch (err) {
-      errLine.textContent = err.message || '挂载失败';
+      errLine.textContent = err.message || (isEdit ? '保存失败' : '挂载失败');
       submitBtn.disabled = false;
     }
   });
@@ -2167,10 +2316,10 @@ function openRegisterRuntimeModal(onRegistered) {
   backdrop.append(modal);
   backdrop.addEventListener('click', ev => { if (ev.target === backdrop) backdrop.remove(); });
   document.body.append(backdrop);
-  fId.inp.focus();
+  (isEdit ? fTitle.inp : fId.inp).focus();
 }
 
-function renderTaskTreeView(host, scopedTargets) {
+function renderTaskTreeView(host, scopedTargets, { fleetFamCount = 0, onGoFleet = null, onRunSandbox = null, onMountSource = null } = {}) {
   const bannerNote = el('div', '什么时候看这里：当你发起一个跨波次长程任务时，默认看本页确认总体进度、正在执行哪一步以及哪一环被前置依赖阻塞。', 'st-scenario-banner');
   host.append(bannerNote);
 
@@ -2211,7 +2360,28 @@ function renderTaskTreeView(host, scopedTargets) {
 
   const card = el('div', null, 'st-card st-guide-section');
   if (total === 0) {
-    card.append(el('p', '当前范围内暂无可执行计划（支持含多级标题/缩进复选框的 .md、嵌套 .json 或 .csv）。可点击上方「▶ 运行隔离沙箱演练」体验 3 层任务树，或「+ 挂载运行源」接入现有计划文件。', 'st-muted-xs'));
+    card.append(
+      el('h3', '当前范围内暂无活跃执行计划文件', ''),
+      el('p', '支持多级标题/缩进复选框的 .md、嵌套 .json 或 .csv；若你正在观测本机已运行的多智能体协作会话，可直接点下方按钮切换编队视图，或一键体验沙箱演练 / 挂载计划文件。', 'st-muted-xs'),
+    );
+    card.firstChild.style.marginTop = '0';
+    const actRow = el('div', null, 'st-empty-actions');
+    if (fleetFamCount > 0 && typeof onGoFleet === 'function') {
+      const fleetBtn = el('button', `🛰️ 查看本机 ${fleetFamCount} 组智能体会话 →`, 'st-btn st-btn-primary');
+      fleetBtn.type = 'button';
+      fleetBtn.addEventListener('click', onGoFleet);
+      actRow.append(fleetBtn);
+    }
+    const sbxEmptyBtn = el('button', '▶ 运行隔离沙箱演练', `st-btn${fleetFamCount > 0 ? '' : ' st-btn-primary'}`);
+    sbxEmptyBtn.type = 'button';
+    sbxEmptyBtn.disabled = !state.writable;
+    sbxEmptyBtn.addEventListener('click', () => onRunSandbox?.(sbxEmptyBtn));
+    const mntEmptyBtn = el('button', '+ 挂载运行源', 'st-btn');
+    mntEmptyBtn.type = 'button';
+    mntEmptyBtn.disabled = !state.writable;
+    mntEmptyBtn.addEventListener('click', () => onMountSource?.());
+    actRow.append(sbxEmptyBtn, mntEmptyBtn);
+    card.append(actRow);
     host.append(card);
     return;
   }
@@ -2254,7 +2424,8 @@ function renderTaskTreeView(host, scopedTargets) {
     if (!matchesNodeFilter(node, q)) return null;
     const hasKids = Array.isArray(node.children) && node.children.length > 0;
     const key = `${targetId}::${node.id}`;
-    const isCollapsed = state.rtCollapsedTreeIds.has(key);
+    // 关键词搜索时自动穿透已折叠分支，防止命中叶子步骤被隐藏
+    const isCollapsed = !q && state.rtCollapsedTreeIds.has(key);
     const box = el('div', null, 'st-tree-node');
 
     const row = el('div', null, `st-tree-row${!hasKids && node.status === 'running' ? ' is-active-leaf' : ''}`);
@@ -2317,7 +2488,19 @@ function renderTaskTreeView(host, scopedTargets) {
         const elNode = renderNodeBranch(rootNode, pt.id, q);
         if (elNode) { treeMount.append(elNode); renderedCount += 1; }
       }
-      if (renderedCount === 0) treeMount.append(el('p', '该计划在当前筛选下无匹配项。', 'st-muted-xs'));
+      if (renderedCount === 0) {
+        const emptyRow = el('div', null, 'st-empty-actions');
+        const clrTreeBtn = el('button', '🔄 清空筛选条件', 'st-btn');
+        clrTreeBtn.type = 'button';
+        clrTreeBtn.addEventListener('click', () => {
+          state.rtTaskFilter = 'all';
+          state.rtTaskQuery = '';
+          qInp.value = '';
+          paintTree();
+        });
+        emptyRow.append(el('span', '该计划在当前筛选下无匹配项。', 'st-muted-xs'), clrTreeBtn);
+        treeMount.append(emptyRow);
+      }
     }
   };
   qInp.addEventListener('input', () => { state.rtTaskQuery = qInp.value; paintTree(); });
@@ -2341,7 +2524,7 @@ function collectUniqueScopedLocks(scopedTargets) {
   return [...byKey.values()];
 }
 
-function renderLockRadarSubpanel(host, scopedTargets, lockWarnMs, { hasActiveSandboxLock = false, onReleaseSandbox = null } = {}) {
+function renderLockRadarSubpanel(host, scopedTargets, lockWarnMs) {
   const card = el('div', null, 'st-card st-guide-section');
   const allLocks = collectUniqueScopedLocks(scopedTargets);
   const activeCount = allLocks.filter(l => l.isActive).length;
@@ -2349,42 +2532,27 @@ function renderLockRadarSubpanel(host, scopedTargets, lockWarnMs, { hasActiveSan
   const head = el('div', null, 'st-graph-toolbar');
   head.style.padding = '0 0 10px 0';
   const left = el('div', null, 'st-graph-controls');
-  left.append(el('h3', '文件锁与并发写集雷达', ''), infoTrigger('rt:tokenLock', document), el('span', `活跃排他锁 ${activeCount} 把 · 总锁记录 ${allLocks.length} 项`, 'st-badge st-badge-indigo'));
+  left.append(el('h3', '活跃排他文件锁雷达', ''), infoTrigger('rt:tokenLock', document), el('span', `活跃排他锁 ${activeCount} 把`, 'st-badge st-badge-indigo'));
   left.firstChild.style.margin = '0';
-  const filterBtns = el('div', null, 'st-graph-controls');
-  for (const [fk, fl] of [['all', '全部锁（含版本锁）'], ['active', '仅看活跃排他锁']]) {
-    const b = el('button', fl, `st-btn${state.rtLockFilter === fk ? ' is-active' : ''}`);
-    b.type = 'button';
-    b.addEventListener('click', () => { state.rtLockFilter = fk; renderRuntimePanel(); });
-    filterBtns.append(b);
-  }
-  if (hasActiveSandboxLock && typeof onReleaseSandbox === 'function') {
-    const relInlineBtn = el('button', '🔓 释放沙箱锁', 'st-btn st-btn-amber');
-    relInlineBtn.type = 'button';
-    relInlineBtn.disabled = !state.writable;
-    relInlineBtn.addEventListener('click', () => onReleaseSandbox(relInlineBtn));
-    filterBtns.append(relInlineBtn);
-  }
-  head.append(left, filterBtns);
+  head.append(left);
   card.append(head);
-  card.append(el('p', '说明：演练产生的模拟排他锁可直接点击「🔓 释放沙箱锁」解除；真实项目磁盘写锁仅供只读监测预警，避免误拆并行智能体的写保护。', 'st-muted-xs'));
+  card.append(el('p', '说明：本雷达仅观测运行时并发写集排他锁（静态 traceability-version-lock.json 请见「📝 审阅与对齐」）。演练沙箱锁可在右上角释放，真实项目磁盘锁仅供只读监测预警。', 'st-muted-xs'));
 
-  const visibleLocks = state.rtLockFilter === 'active' ? allLocks.filter(l => l.isActive) : allLocks;
-  if (!visibleLocks.length) {
-    card.append(el('p', '当前筛选条件下无文件锁或静态追溯锁记录。', 'st-muted-xs'));
+  if (!allLocks.length) {
+    card.append(el('p', '当前范围内暂无活跃排他文件锁，说明没有并发智能体写锁阻塞。', 'st-muted-xs'));
     host.append(card);
     return;
   }
 
   const grid = el('div', null, 'st-lock-grid');
-  for (const lk of visibleLocks) {
+  for (const lk of allLocks) {
     const isWarn = lk.isActive && lk.isStaleWarning;
     const lc = el('div', null, `st-lock-card${lk.isActive ? ' is-active' : ''}${isWarn ? ' is-warn' : ''}`);
     const top = el('div', null, 'st-repo-opt-head');
     top.append(el('strong', lk.name || 'lock'), el('span', lk.lockKind || 'lock', 'st-badge st-badge-zinc'));
     const statusBadge = isWarn
       ? el('span', '⚠️ 持锁超时预警', 'st-badge st-badge-amber')
-      : (lk.isActive ? el('span', '🔒 活跃持锁中', 'st-badge st-badge-indigo') : el('span', '📌 静态版本锁', 'st-badge st-badge-emerald'));
+      : el('span', '🔒 活跃持锁中', 'st-badge st-badge-indigo');
 
     const metaRow = el('div', null, 'st-repo-opt-head');
     metaRow.append(el('span', `持有者：${lk.owner || 'unknown'}`, 'st-muted-xs'), statusBadge);
@@ -2517,7 +2685,7 @@ function renderProcessSubpanel(host, scopedTargets) {
   host.append(card);
 }
 
-function renderDiagnosticsView(host, scopedTargets, lockWarnMs, { hasActiveSandboxLock = false, onReleaseSandbox = null } = {}) {
+function renderDiagnosticsView(host, scopedTargets, lockWarnMs, { onEditTarget = null, onRemoveTarget = null } = {}) {
   const scenarioBanner = el('div', '什么时候看这里：日常看进度与会话协作无需打开本页；仅当任务长时间卡住不动、报排他写锁超时或子进程异常强杀时点开排障。', 'st-scenario-banner');
   host.append(scenarioBanner);
 
@@ -2536,7 +2704,7 @@ function renderDiagnosticsView(host, scopedTargets, lockWarnMs, { hasActiveSandb
   );
   host.append(healthBar);
 
-  renderLockRadarSubpanel(host, scopedTargets, lockWarnMs, { hasActiveSandboxLock, onReleaseSandbox });
+  renderLockRadarSubpanel(host, scopedTargets, lockWarnMs);
   renderEventChainSubpanel(host, scopedTargets);
   renderProcessSubpanel(host, scopedTargets);
 
@@ -2546,12 +2714,16 @@ function renderDiagnosticsView(host, scopedTargets, lockWarnMs, { hasActiveSandb
   if (!scopedTargets.length) {
     secCard.append(el('p', '当前范围暂无运行源。', 'st-muted-xs'));
   } else {
-    secCard.append(buildRuntimeTargetsTable(scopedTargets, document));
+    secCard.append(buildRuntimeTargetsTable(scopedTargets, document, {
+      writable: state.writable,
+      onEdit: onEditTarget,
+      onRemove: onRemoveTarget,
+    }));
   }
   host.append(secCard);
 }
 
-function renderRuntimeScopeToolbar(targetHost, { curRepo, repoTargets, allTargets, scopeBaseTargets }) {
+function renderRuntimeScopeToolbar(targetHost, { curRepo, repoTargets, allTargets, scopeBaseTargets, onEditTarget, onRemoveTarget }) {
   const bar = el('div', null, 'st-card st-rt-toolbar');
   const leftBar = el('div', null, 'st-graph-controls');
   const scopeSwitch = el('div', null, 'st-view-switch');
@@ -2586,6 +2758,29 @@ function renderRuntimeScopeToolbar(targetHost, { curRepo, repoTargets, allTarget
 
   bar.append(leftBar, rightBar);
   targetHost.append(bar);
+
+  const customTargets = allTargets.filter(t => t.isUserRegistered);
+  if (customTargets.length > 0) {
+    const customBar = el('div', null, 'st-upstream-capsule-bar');
+    const customList = el('div', null, 'st-graph-controls');
+    customList.append(el('span', `已挂载自定义运行源 (${customTargets.length})：`, 'st-muted-xs'));
+    for (const ct of customTargets) {
+      customList.append(el('span', `${ct.title} (${ct.id})`, 'st-badge st-badge-zinc'));
+      const edBtn = el('button', '✏️ 编辑', 'st-btn');
+      edBtn.type = 'button';
+      edBtn.style.height = '26px';
+      edBtn.disabled = !state.writable;
+      edBtn.addEventListener('click', () => onEditTarget?.(ct));
+      const rmBtn = el('button', '🗑️ 移除', 'st-btn');
+      rmBtn.type = 'button';
+      rmBtn.style.height = '26px';
+      rmBtn.disabled = !state.writable;
+      rmBtn.addEventListener('click', () => onRemoveTarget?.(ct));
+      customList.append(edBtn, rmBtn);
+    }
+    customBar.append(customList);
+    targetHost.append(customBar);
+  }
 }
 
 async function renderRuntimePanel() {
@@ -2627,6 +2822,7 @@ async function renderRuntimePanel() {
     if (triggerBtn) { triggerBtn.disabled = true; triggerBtn.textContent = '演练中…'; }
     try {
       await apiJson('/api/studio/runtime/sandbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      showStudioToast('✓ 已生成隔离沙箱演练数据（含 3 层任务树、6 节点编队与排他写锁）', { tone: 'emerald' });
       renderRuntimePanel();
     } catch (err) {
       showStudioToast(`启动沙箱演练失败：${err.message}`, { tone: 'error' });
@@ -2648,13 +2844,40 @@ async function renderRuntimePanel() {
     }
   };
 
+  const handleEditTarget = target => {
+    if (!state.writable) {
+      showStudioToast('当前处于只读模式（--readonly），无法编辑挂载运行源。', { tone: 'warn' });
+      return;
+    }
+    openRegisterRuntimeModal(() => renderRuntimePanel(), target);
+  };
+
+  const handleRemoveTarget = async target => {
+    if (!state.writable) {
+      showStudioToast('当前处于只读模式（--readonly），无法移除运行源。', { tone: 'warn' });
+      return;
+    }
+    try {
+      await apiJson('/api/studio/runtime/unregister', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: target.id }),
+      });
+      if (state.rtSelectedTargetId === target.id) state.rtSelectedTargetId = '__all__';
+      showStudioToast(`✓ 已移除自定义运行源「${target.id}」`, { tone: 'emerald' });
+      renderRuntimePanel();
+    } catch (err) {
+      showStudioToast(`移除运行源失败：${err.message}`, { tone: 'error' });
+    }
+  };
+
   // 一级子视图导航栏（顶层只放子视图切换 + SSE + 沙箱演练/释放）
   const topNavCard = el('div', null, 'st-card st-rt-subtabs-head');
   const subBar = el('div', null, 'st-graph-controls');
   for (const [vk, vl, tipKey] of [
-    ['tasks', '🌳 任务推进树（默认）', 'rt:view:tasks'],
-    ['fleet', `🛰️ 会话与子会话编队 (${fleetFamCount})`, 'rt:view:fleet'],
-    ['diag', `🩺 底层排障与健康诊断${sWarnCount > 0 ? ` (⚠️ ${sWarnCount})` : ''}`, 'rt:view:diag'],
+    ['tasks', '🌳 任务推进树', 'rt:view:tasks'],
+    ['fleet', `🛰️ 智能体会话编队 (${fleetFamCount})`, 'rt:view:fleet'],
+    ['diag', `🩺 异常排障 (${sWarnCount > 0 ? `⚠️ ${sWarnCount} 告警` : '🟢 无卡死'})`, 'rt:view:diag'],
   ]) {
     const b = el('button', vl, `st-btn${state.rtView === vk ? ' is-active' : ''}`);
     b.type = 'button';
@@ -2687,8 +2910,20 @@ async function renderRuntimePanel() {
 
   const lockWarnMs = rt.kpi?.lockWarnMs || 30000;
   if (state.rtView === 'tasks') {
-    renderRuntimeScopeToolbar(viewHost, { curRepo, repoTargets, allTargets, scopeBaseTargets });
-    renderTaskTreeView(viewHost, scopedTargets);
+    renderRuntimeScopeToolbar(viewHost, {
+      curRepo,
+      repoTargets,
+      allTargets,
+      scopeBaseTargets,
+      onEditTarget: handleEditTarget,
+      onRemoveTarget: handleRemoveTarget,
+    });
+    renderTaskTreeView(viewHost, scopedTargets, {
+      fleetFamCount,
+      onGoFleet: () => { state.rtView = 'fleet'; renderRuntimePanel(); },
+      onRunSandbox: runSandboxWithGuard,
+      onMountSource: () => openRegisterRuntimeModal(() => renderRuntimePanel()),
+    });
   } else if (state.rtView === 'fleet') {
     const paintFleet = () => {
       mountFleetMonitor(viewHost, {
@@ -2706,10 +2941,17 @@ async function renderRuntimePanel() {
     };
     paintFleet();
   } else {
-    renderRuntimeScopeToolbar(viewHost, { curRepo, repoTargets, allTargets, scopeBaseTargets });
+    renderRuntimeScopeToolbar(viewHost, {
+      curRepo,
+      repoTargets,
+      allTargets,
+      scopeBaseTargets,
+      onEditTarget: handleEditTarget,
+      onRemoveTarget: handleRemoveTarget,
+    });
     renderDiagnosticsView(viewHost, scopedTargets, lockWarnMs, {
-      hasActiveSandboxLock: rt.hasActiveSandboxLock,
-      onReleaseSandbox: releaseSandboxWithGuard,
+      onEditTarget: handleEditTarget,
+      onRemoveTarget: handleRemoveTarget,
     });
   }
 
@@ -2756,8 +2998,8 @@ async function selectRepo(repoId, { skipRender = false } = {}) {
   state.alignment = alignData;
   const def = pickDefaultArtifactNode(state.snap.nodes || []) || (state.snap.reviewItems || [])[0] || null;
   state.selectedUid = def ? def.uid : null;
-  if (!skipRender && state.reviewMode !== 'alignment') {
-    state.reviewMode = state.alignment?.portfolio?.present ? 'alignment' : 'reader';
+  if (!skipRender) {
+    state.reviewMode = (state.alignment?.portfolio?.present || state.alignment?.upstreamBindings?.present) ? 'alignment' : 'reader';
   }
   updateTopbarSummary();
   renderTopContextBars();
@@ -2766,9 +3008,19 @@ async function selectRepo(repoId, { skipRender = false } = {}) {
 
 async function openExportDrawer() {
   const backdrop = document.getElementById('st-export-backdrop');
+  const preview = document.getElementById('st-export-preview');
   backdrop.hidden = false;
-  const sum = await apiJson('/api/studio/summary');
-  document.getElementById('st-export-preview').textContent = sum.markdown || '';
+  preview.textContent = '正在汇总当前工作区全部受管仓库审阅台账…';
+  try {
+    const sum = await apiJson('/api/studio/summary');
+    const md = sum.markdown || '';
+    const hasAny = Object.keys(state.decisions || {}).length > 0 || (state.annotations || []).length > 0;
+    preview.textContent = hasAny
+      ? md
+      : `（提示：当前各受管仓库尚未写入审阅结论或批注，以下为初始汇总模板；完成第 ② 步「按顺序逐篇审阅」后会自动填充正文清单）\n\n${md}`;
+  } catch (err) {
+    preview.textContent = `加载汇总台账失败：${err.message}`;
+  }
 }
 
 async function boot() {

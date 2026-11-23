@@ -30,6 +30,7 @@ import {
   STUDIO_RUNTIME_REGISTRY_PATH,
   collectStudioRuntimeView,
   registerMonitorTarget,
+  removeMonitorTarget,
   runSandboxExercise,
 } from './runtime-bridge.mjs';
 import { collectSessionFleet } from './session-fleet.mjs';
@@ -412,7 +413,7 @@ export async function createStudioServer({
         return;
       }
 
-      if (req.method === 'POST') {
+      if (req.method === 'POST' || req.method === 'DELETE') {
         if (!isSafeLoopbackOrigin(req)) {
           sendJson(res, 403, { ok: false, error: '已拒绝非本地回环 Origin 来源的写请求。' });
           return;
@@ -421,7 +422,9 @@ export async function createStudioServer({
           sendJson(res, 403, { ok: false, error: '当前控制台处于只读模式；请去掉 --readonly 参数以启用审阅落盘。' });
           return;
         }
-        const body = await readJsonBody(req);
+        const body = req.method === 'DELETE'
+          ? { id: url.searchParams.get('id') || '' }
+          : await readJsonBody(req);
 
         if (pathname === '/api/studio/annotations' || pathname === '/api/studio/decisions') {
           const catalog = await getCatalog(false);
@@ -477,6 +480,17 @@ export async function createStudioServer({
           });
           broadcast('runtime-change', { at: new Date().toISOString() });
           sendJson(res, 200, { ok: true, ...registered });
+          return;
+        }
+
+        if (pathname === '/api/studio/runtime/unregister' || (req.method === 'DELETE' && pathname === '/api/studio/runtime/target')) {
+          const catalog = await getCatalog(false);
+          const repoRoots = [...catalog.byId.values()].map(r => r.realPath);
+          const removed = await removeMonitorTarget(resolvedRoot, body?.id ?? body, runtimeRegistryPath, {
+            allowedRoots: [resolvedRoot, ...repoRoots, ...allowedRoots, tmpdir()],
+          });
+          broadcast('runtime-change', { at: new Date().toISOString() });
+          sendJson(res, 200, { ok: true, ...removed });
           return;
         }
 

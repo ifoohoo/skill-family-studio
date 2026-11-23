@@ -196,8 +196,9 @@ export function mountFleetMonitor(host, {
       mk(doc, 'p', '系统已自动只读检索 Antigravity、Claude Code、Codex 会话目录以及 .skill-family-studio/fleet/。你可以点击上方「▶ 运行隔离沙箱演练」立即预览完整 6 节点多智能体协作编队。', 'st-muted-xs'),
     );
     emptyCard.firstChild.style.marginTop = '0';
-    const tryBtn = mk(doc, 'button', '▶ 运行沙箱演练并预览 6 节点多智能体编队', 'st-btn st-btn-primary');
+    const tryBtn = mk(doc, 'button', '▶ 运行隔离沙箱演练', 'st-btn st-btn-primary');
     tryBtn.type = 'button';
+    tryBtn.disabled = state.writable === false;
     tryBtn.addEventListener('click', onRunSandbox);
     emptyCard.append(tryBtn);
     host.append(emptyCard);
@@ -457,6 +458,20 @@ export function mountFleetMonitor(host, {
       const cy = li * laneH + laneH / 2;
       laneSvg.append(svgEl(doc, 'line', { x1: 0, y1: cy, x2: trackW, y2: cy, class: 'st-fleet-lane-baseline' }));
     }
+    if (visibleAgents.length === 0) {
+      const emptyLaneBox = mk(doc, 'div', null, 'st-empty-actions');
+      emptyLaneBox.style.padding = '12px';
+      const clearLaneBtn = mk(doc, 'button', '🔄 清空筛选条件', 'st-btn');
+      clearLaneBtn.type = 'button';
+      clearLaneBtn.addEventListener('click', () => {
+        state.rtFleetAgentQuery = '';
+        laneSearch.value = '';
+        paintLanes();
+      });
+      emptyLaneBox.append(mk(doc, 'span', '当前搜索条件下无匹配会话。', 'st-muted-xs'), clearLaneBtn);
+      laneScroller.append(emptyLaneBox);
+      return;
+    }
     const activeEvent = allEvents.find(e => e.id === state.rtFleetSelectedEventId) || shownEvents[0] || allEvents[0] || null;
     shownEvents.forEach((ev, idx) => {
       const cx = trackPad + idx * pitch;
@@ -541,7 +556,12 @@ export function mountFleetMonitor(host, {
       const av = mk(doc, 'span', toAg?.roleShort || '子', 'st-fleet-avatar st-fleet-avatar-sm');
       av.style.setProperty('--st-fleet-hue', hue);
       leftT.append(av, mk(doc, 'strong', d.label), mk(doc, 'span', d.mode === 'reviewer' ? '只读复核' : '子会话', 'st-badge st-badge-zinc'));
-      const stBadge = mk(doc, 'span', d.status === 'in_progress' ? '● 运行中' : (d.status === 'completed' ? '✓ 已完成' : '待处理'), `st-badge ${d.status === 'in_progress' ? 'st-badge-indigo' : 'st-badge-emerald'}`);
+      const stBadge = mk(
+        doc,
+        'span',
+        d.status === 'in_progress' ? '● 运行中' : (d.status === 'completed' ? '✓ 已完成' : '待处理'),
+        `st-badge ${d.status === 'in_progress' ? 'st-badge-indigo' : (d.status === 'completed' ? 'st-badge-emerald' : 'st-badge-zinc')}`,
+      );
       top.append(leftT, stBadge);
       const prev = mk(doc, 'div', (d.prompt || '').replace(/\s+/g, ' ').slice(0, 140), 'st-muted-xs');
       itemBox.append(top, prev);
@@ -696,6 +716,15 @@ export function mountFleetMonitor(host, {
     evListCol.replaceChildren();
     if (!filteredEvs.length) {
       evListCol.append(mk(doc, 'p', '当前筛选条件下暂无交互事件。', 'st-muted-xs'));
+      const clearEvBtn = mk(doc, 'button', '🔄 清空筛选条件', 'st-btn');
+      clearEvBtn.type = 'button';
+      clearEvBtn.addEventListener('click', () => {
+        state.rtFleetEventKind = 'all';
+        state.rtFleetEventQuery = '';
+        evSearchInp.value = '';
+        paintEvents();
+      });
+      evListCol.append(clearEvBtn);
     } else {
       for (const ev of filteredEvs) {
         const fromAg = agentMap.get(ev.from);
