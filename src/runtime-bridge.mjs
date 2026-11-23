@@ -618,24 +618,37 @@ async function scanProcessesReadOnly(resolvedTarget) {
     const parsed = await safeJson(full);
     if (!parsed.ok || !parsed.value) continue;
     const doc = parsed.value;
+    const ev = doc.evidence && typeof doc.evidence === 'object' ? doc.evidence : {};
     const rawSt = String(doc.processStatus ?? doc.status ?? '').toUpperCase();
     const processStatus = PROCESS_STATUSES.includes(rawSt)
       ? rawSt
       : (rawSt === 'ACTIVE' || rawSt === 'SUPERVISING' ? 'RUNNING' : 'EXITED');
     const exitCode = typeof doc.exitCode === 'number'
       ? doc.exitCode
-      : (typeof doc.exit_code === 'number' ? doc.exit_code : null);
-    const startedAt = doc.startedAt ?? doc.createdAt ?? null;
-    const endedAt = doc.endedAt ?? doc.finishedAt ?? null;
+      : (typeof doc.exitStatus === 'number'
+        ? doc.exitStatus
+        : (typeof ev.childExitCode === 'number'
+          ? ev.childExitCode
+          : (typeof doc.exit_code === 'number' ? doc.exit_code : null)));
+    const pid = typeof doc.pid === 'number' ? doc.pid : (typeof ev.pid === 'number' ? ev.pid : null);
+    const startedAt = doc.startedAt ?? ev.startedAt ?? doc.createdAt ?? null;
+    const endedAt = doc.endedAt ?? doc.finishedAt ?? ev.finishedAt ?? null;
     const durationMs = typeof doc.durationMs === 'number'
       ? doc.durationMs
-      : (startedAt && endedAt ? Math.max(0, Date.parse(endedAt) - Date.parse(startedAt)) : null);
+      : (typeof ev.durationMs === 'number'
+        ? ev.durationMs
+        : (startedAt && endedAt ? Math.max(0, Date.parse(endedAt) - Date.parse(startedAt)) : null));
     const timedOut = processStatus === 'TIMED_OUT' || Boolean(doc.timedOut);
+    const cmdSrc = typeof doc.command === 'string' ? doc.command : (typeof ev.command === 'string' ? ev.command : null);
+    const cmdArgs = Array.isArray(doc.args) ? doc.args : (Array.isArray(ev.args) ? ev.args : null);
     const command = Array.isArray(doc.argv)
-      ? doc.argv.map(String).slice(0, 4).join(' ')
-      : (typeof doc.command === 'string'
-        ? `${doc.command}${Array.isArray(doc.args) ? ` ${doc.args.slice(0, 3).join(' ')}` : ''}`.trim()
+      ? doc.argv.map(s => basename(String(s)) || String(s)).slice(0, 4).join(' ')
+      : (cmdSrc
+        ? `${basename(cmdSrc)} ${cmdArgs ? cmdArgs.slice(0, 3).join(' ') : ''}`.trim()
         : basename(full));
+    const sigSeq = Array.isArray(ev.signalSequence) && ev.signalSequence.length
+      ? ev.signalSequence.map(s => (typeof s === 'string' ? s : s?.signal)).filter(Boolean).join('→')
+      : null;
 
     processes.push({
       id: `proc:${full}`,
@@ -643,12 +656,13 @@ async function scanProcessesReadOnly(resolvedTarget) {
       filePath: full,
       displayPath: shortDisplayPath(full),
       label: basename(full),
+      pid,
       command: sanitizePublicText(command),
       processStatus,
       exitCode,
       durationMs,
       timedOut,
-      killSignal: doc.killSignal ?? doc.signal ?? (timedOut ? 'SIGTERM/SIGKILL' : null),
+      killSignal: doc.killSignal ?? doc.signal ?? ev.childSignal ?? sigSeq ?? (timedOut ? 'SIGTERM/SIGKILL' : null),
       startedAt,
       endedAt,
       ok: typeof doc.ok === 'boolean' ? doc.ok : (exitCode === 0),

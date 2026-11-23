@@ -1653,7 +1653,7 @@ function renderProcessSubpanel(host, scopedTargets) {
   const tbl = el('table', null, 'st-prose-table');
   const thead = el('thead');
   const hr = el('tr');
-  for (const h of ['运行源 / 文件', '命令/脚本', '状态', '退出码', '耗时', '保护标记']) hr.append(el('th', h));
+  for (const h of ['运行源 / 文件', 'PID', '命令/脚本', '状态', '退出码', '耗时', '保护标记']) hr.append(el('th', h));
   thead.append(hr);
   const tbody = el('tbody');
   for (const p of procs) {
@@ -1667,6 +1667,7 @@ function renderProcessSubpanel(host, scopedTargets) {
 
     tr.append(
       el('td', `${p.targetTitle} · ${p.label}`, 'st-muted-xs'),
+      el('td', p.pid !== null && p.pid !== undefined ? String(p.pid) : '—', 'st-tabular'),
       el('td', p.command || p.label, 'st-tabular'),
       tdSt,
       el('td', p.exitCode !== null && p.exitCode !== undefined ? String(p.exitCode) : '—', 'st-tabular'),
