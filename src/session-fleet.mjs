@@ -1,15 +1,14 @@
 // @feature STU006
 // @feature STU003
 
-import { createReadStream } from 'node:fs';
-import { lstat, readdir, readFile } from 'node:fs/promises';
+import { lstat, open, readdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
-import { createInterface } from 'node:readline';
 import { cleanInlinePlain, sanitizePublicText } from './markdown-render.mjs';
 
+const MAX_FLEET_JSON_BYTES = 8 * 1024 * 1024;
 const SENSITIVE_PATH_RE = /(?:^|[\\/])(?:\.ssh|\.gnupg|\.aws|\.kube|\.docker|\.netrc|\.npmrc|\.pypirc|\.git-credentials|keychains|\.env(?:\.[^\\/]+)?)(?:$|[\\/])/i;
-const SECRET_TOKEN_RE = /(?:sk-(?:proj|ant|svcacct)-[A-Za-z0-9_-]{16,}|sk-(?=[A-Za-z0-9_-]*(?:\d|[A-Z]|_))[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9]{16,}|npm_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|AIza[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{12,}|Bearer\s+[A-Za-z0-9._~+/=-]{12,})/g;
+const SECRET_TOKEN_RE = /(?:-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----|[A-Za-z0-9+/=\r\n]{16,})?|[Aa]uthorization:\s*[Bb]asic\s+[A-Za-z0-9+/=]{6,}|(?:https?|wss?):\/\/[^\s/@:]+:[^\s/@]+@|(?:AKIA|ASIA)[0-9A-Z]{16}|sk_live_[A-Za-z0-9_-]{12,}|glpat-[A-Za-z0-9_-]{12,}|sk-(?:proj|ant|svcacct)-[A-Za-z0-9_-]{16,}|sk-(?=[A-Za-z0-9_-]*(?:\d|[A-Z]|_))[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9]{16,}|npm_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|AIza[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{12,}|[Bb]earer\s+[A-Za-z0-9._~+/=-]{12,})/g;
 
 export function sanitizeFleetText(value) {
   return sanitizePublicText(String(value ?? '')).replace(SECRET_TOKEN_RE, '<REDACTED_TOKEN>');
@@ -48,27 +47,68 @@ function inferRoleBadge(label, isRoot, isReviewer) {
   return '执行';
 }
 
+function trimPartialEdgeLines(text, { dropFirst = false, dropLast = false } = {}) {
+  let out = text;
+  if (dropFirst) {
+    const firstNl = out.indexOf('\n');
+    out = firstNl === -1 ? '' : out.slice(firstNl + 1);
+  }
+  if (dropLast) {
+    const lastNl = out.lastIndexOf('\n');
+    if (lastNl !== -1) out = out.slice(0, lastNl);
+  }
+  return out
+    .split(/\r?\n/)
+    .map(l => l.trimEnd())
+    .filter(l => l.trim().length > 0);
+}
+
+async function readWindowUtf8(fh, offset, length) {
+  if (length <= 0) return '';
+  const buf = Buffer.allocUnsafe(length);
+  let totalRead = 0;
+  while (totalRead < length) {
+    const { bytesRead } = await fh.read(buf, totalRead, length - totalRead, offset + totalRead);
+    if (!bytesRead) break;
+    totalRead += bytesRead;
+  }
+  return buf.subarray(0, totalRead).toString('utf8');
+}
+
 async function readJsonlLinesBounded(filePath, maxBytes = 2_500_000, maxLines = 1800) {
   if (SENSITIVE_PATH_RE.test(filePath)) return [];
   let st;
   try { st = await lstat(filePath); } catch { return []; }
-  if (!st.isFile() || st.isSymbolicLink()) return [];
-  const lines = [];
-  let seenBytes = 0;
-  const stream = createReadStream(filePath, { encoding: 'utf8', start: 0, end: Math.max(0, Math.min(st.size - 1, maxBytes - 1)) });
-  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+  if (!st.isFile() || st.isSymbolicLink() || st.size <= 0) return [];
+  const capBytes = Math.max(4096, maxBytes);
+  const capLines = Math.max(4, maxLines);
+  const headTarget = Math.max(1, Math.floor(capLines * 0.35));
+  let fh;
   try {
-    for await (const line of rl) {
-      if (!line.trim()) continue;
-      seenBytes += Buffer.byteLength(line, 'utf8');
-      lines.push(line);
-      if (lines.length >= maxLines || seenBytes >= maxBytes) break;
+    fh = await open(filePath, 'r');
+    if (st.size <= capBytes) {
+      const fullText = await readWindowUtf8(fh, 0, st.size);
+      const allLines = trimPartialEdgeLines(fullText);
+      if (allLines.length <= capLines) return allLines;
+      const tailTarget = capLines - headTarget;
+      return [...allLines.slice(0, headTarget), ...allLines.slice(-tailTarget)];
     }
+    const headBytes = Math.max(2048, Math.floor(capBytes * 0.35));
+    const tailBytes = Math.max(2048, capBytes - headBytes);
+    const tailOffset = Math.max(headBytes, st.size - tailBytes);
+    const headText = await readWindowUtf8(fh, 0, Math.min(headBytes, st.size));
+    const tailText = await readWindowUtf8(fh, tailOffset, st.size - tailOffset);
+    const headLines = trimPartialEdgeLines(headText, { dropFirst: false, dropLast: true });
+    const tailLines = trimPartialEdgeLines(tailText, { dropFirst: tailOffset > 0, dropLast: false });
+    const keptHead = headLines.slice(0, headTarget);
+    const tailBudget = Math.max(1, capLines - keptHead.length);
+    const keptTail = tailLines.slice(-tailBudget);
+    return [...keptHead, ...keptTail];
+  } catch {
+    return [];
   } finally {
-    rl.close();
-    stream.destroy();
+    await fh?.close().catch(() => {});
   }
-  return lines;
 }
 
 export function parseAntigravityTranscript(rawLines, conversationId) {
@@ -1147,10 +1187,23 @@ export async function collectSessionFleet({
   try {
     const localEnts = await readdir(localFleetDir, { withFileTypes: true });
     for (const ent of localEnts) {
-      if (!ent.isFile() || !ent.name.endsWith('.json')) continue;
+      if (!ent.name.endsWith('.json')) continue;
       const abs = join(localFleetDir, ent.name);
       if (SENSITIVE_PATH_RE.test(abs)) continue;
-      const doc = JSON.parse(await readFile(abs, 'utf8'));
+      let st;
+      try { st = await lstat(abs); } catch { continue; }
+      if (!st.isFile() || st.isSymbolicLink() || st.size > MAX_FLEET_JSON_BYTES) continue;
+      let fh;
+      let rawText;
+      try {
+        fh = await open(abs, 'r');
+        rawText = await readWindowUtf8(fh, 0, st.size);
+      } catch {
+        continue;
+      } finally {
+        await fh?.close().catch(() => {});
+      }
+      const doc = JSON.parse(rawText);
       if (doc && Array.isArray(doc.agents)) {
         sourcesScanned.local += 1;
         families.push({

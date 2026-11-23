@@ -46,6 +46,7 @@ const state = {
   selectedAnchor: null,
   archifySelectedNode: null,
   docCache: new Map(),
+  repoCountsCache: new Map(),
   drafts: new Map(),
   writable: true,
   rtScope: 'repo', // 'repo' | 'workspace'
@@ -130,14 +131,23 @@ function countRepoProgress(repo) {
     else if (s === 'changes_requested') changes++;
     else if (s === 'deferred') deferred++;
   }
+  const cached = state.repoCountsCache?.get(repo.id);
   const total = state.snap?.repoId === repo.id
     ? (state.snap.reviewItems?.length || repo.reviewableCount || targets.size)
-    : Math.max(repo.reviewableCount || 0, targets.size);
+    : (cached?.reviewableCount ?? Math.max(repo.reviewableCount || 0, targets.size));
   return { approved, reviewing, changes, deferred, decided: approved + changes + deferred, total };
 }
 
-async function apiJson(url, options) {
-  const res = await fetch(url, options);
+async function apiJson(url, options = {}) {
+  const opts = { ...options };
+  const method = String(opts.method || 'GET').toUpperCase();
+  const headers = new Headers(opts.headers || {});
+  if (method === 'POST' || method === 'DELETE') {
+    headers.set('X-Studio-Request', '1');
+    if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  }
+  opts.headers = headers;
+  const res = await fetch(url, opts);
   const data = await res.json();
   if (!res.ok || data.ok === false) throw new Error(data.error || `请求失败 (${res.status})`);
   return data;
@@ -526,8 +536,10 @@ function renderRepoPopover() {
 
       const foot = el('div', null, 'st-repo-opt-head');
       const metrics = el('div', null, 'st-repo-opt-metrics');
+      const cachedCounts = state.repoCountsCache?.get(r.id);
+      const graphNodes = cachedCounts?.nodeCount ?? r.nodeCount ?? 0;
       metrics.append(
-        el('span', `制品 ${r.nodeCount ?? 0}`),
+        el('span', `图节点 ${graphNodes}`),
         el('span', `· ${r.versionLockLabel}`),
         el('span', `· ${r.runtimeLabel}`),
       );
@@ -592,6 +604,7 @@ function switchTab(nextTab) {
     b.setAttribute('aria-selected', String(active));
   });
   document.querySelectorAll('[data-panel]').forEach(p => { p.hidden = p.dataset.panel !== nextTab; });
+  if (typeof window !== 'undefined') window.scrollTo(0, 0);
   renderTopContextBars();
   renderActiveTab();
 }
@@ -633,15 +646,6 @@ function findNextPendingHumanItem(currentUid = state.selectedUid) {
     return { item: curItem, allCompleted: false };
   }
   return { item: null, allCompleted: true };
-}
-
-function findNextUnreviewed(currentUid = state.selectedUid) {
-  const { item } = findNextPendingHumanItem(currentUid);
-  if (item) return item;
-  const list = state.snap?.reviewItems ?? [];
-  const humanOnly = list.filter(i => !i.isMachineContract);
-  const pool = humanOnly.length > 0 ? humanOnly : list;
-  return pool[0] ?? null;
 }
 
 function startGuidedReview() {
@@ -1220,6 +1224,12 @@ function triggerGuideAction(actionId) {
   else if (actionId === 'go-tab-diag') { state.rtView = 'diag'; switchTab('runtime'); }
 }
 
+function wrapProseTable(tbl) {
+  const wrap = el('div', null, 'st-table-wrap');
+  wrap.append(tbl);
+  return wrap;
+}
+
 function renderGuidePanel() {
   const host = document.getElementById('st-panel-guide');
   host.replaceChildren();
@@ -1277,7 +1287,7 @@ function renderGuidePanel() {
     tbl.append(th, tb);
     const ul = el('ul');
     for (const s of cs.behindTheScenes || []) ul.append(el('li', s));
-    csCard.append(tbl, ul);
+    csCard.append(wrapProseTable(tbl), ul);
 
     if (Array.isArray(g.usageModes) && g.usageModes.length > 0) {
       const modeGrid = el('div', null, 'st-mode-grid');
@@ -1391,7 +1401,7 @@ function renderGuidePanel() {
     tbody.append(tr);
   }
   tbl.append(thead, tbody);
-  diagCard.append(tbl);
+  diagCard.append(wrapProseTable(tbl));
 
   if (g.alignmentGuide) {
     diagCard.append(el('h3', '2. 高阶 ⇄ 详设 ⇄ 代码测试三层双向互锁闭环图', ''));
@@ -1415,7 +1425,6 @@ function renderGuidePanel() {
     satTbl.append(satHead, satBody);
 
     const driftTbl = el('table', null, 'st-prose-table');
-    driftTbl.style.marginTop = '12px';
     const dHead = el('thead');
     const dHr = el('tr');
     dHr.append(el('th', '告警徽章与错误码'), el('th', '识别到什么问题'), el('th', '推荐处理动作'));
@@ -1429,7 +1438,9 @@ function renderGuidePanel() {
       dBody.append(tr);
     }
     driftTbl.append(dHead, dBody);
-    diagCard.append(satTbl, driftTbl);
+    const driftWrap = wrapProseTable(driftTbl);
+    driftWrap.style.marginTop = '12px';
+    diagCard.append(wrapProseTable(satTbl), driftWrap);
   }
   if (Array.isArray(g.shortcutsAndGuards) && g.shortcutsAndGuards.length > 0) {
     diagCard.append(el('h3', '3. 常用操作防呆与快捷键速查', ''));
@@ -1447,7 +1458,7 @@ function renderGuidePanel() {
       scBody.append(tr);
     }
     scTbl.append(scHead, scBody);
-    diagCard.append(scTbl);
+    diagCard.append(wrapProseTable(scTbl));
   }
   host.append(diagCard);
 
@@ -1752,6 +1763,7 @@ function renderGraphPanel() {
     const curTheme = document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
     const stage = el('div', null, 'st-archify-stage');
     const iframe = el('iframe', null, 'st-archify-frame');
+    iframe.setAttribute('sandbox', 'allow-scripts');
     iframe.title = fig.title;
     iframe.src = `/api/studio/archify/${encodeURIComponent(state.repoId)}/${fig.htmlPath}?theme=${encodeURIComponent(curTheme)}&embed=1`;
 
@@ -1794,28 +1806,22 @@ function renderGraphPanel() {
       }
     };
 
-    iframe.addEventListener('load', () => {
-      try {
-        const doc = iframe.contentDocument;
-        if (!doc) return;
-        doc.addEventListener('click', ev => {
-          const nodeEl = ev.target?.closest?.('[data-node-id]');
-          const outlineEl = ev.target?.closest?.('[data-outline-node]');
-          const nodeId = nodeEl?.getAttribute('data-node-id') || outlineEl?.getAttribute('data-outline-node');
-          if (!nodeId) return;
-          const label = nodeEl?.getAttribute('data-node-label') || outlineEl?.textContent?.trim() || nodeId;
-          bindArchifyNodeSelection(nodeId, label);
-        }, true);
-        doc.addEventListener('keydown', ev => {
-          if (ev.key === 'Escape' && state.fullscreenGraph) {
-            state.fullscreenGraph = false;
-            split.classList.remove('is-fullscreen');
-            if (fsBtnRef) { fsBtnRef.classList.remove('is-active'); fsBtnRef.textContent = '全屏画布'; }
-            floatBar.hidden = true;
-          }
-        }, true);
-      } catch {}
-    });
+    graphAbortCtrl = new AbortController();
+    window.addEventListener('message', ev => {
+      if (ev.source !== iframe.contentWindow) return;
+      const msg = ev.data;
+      if (!msg || msg.__studioArchify !== true) return;
+      if (msg.type === 'node-click' && msg.nodeId) {
+        bindArchifyNodeSelection(String(msg.nodeId), String(msg.label || msg.nodeId));
+      } else if (msg.type === 'focus-search') {
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', metaKey: true, ctrlKey: true, bubbles: true, cancelable: true }));
+      } else if (msg.type === 'escape' && state.fullscreenGraph) {
+        state.fullscreenGraph = false;
+        split.classList.remove('is-fullscreen');
+        if (fsBtnRef) { fsBtnRef.classList.remove('is-active'); fsBtnRef.textContent = '全屏画布'; }
+        floatBar.hidden = true;
+      }
+    }, { signal: graphAbortCtrl.signal });
 
     stage.append(floatBar, iframe);
     leftCard.append(stage);
@@ -2007,6 +2013,7 @@ function renderAlignmentOverview(host) {
     }
     filterGroup.append(stepNextBtn);
     const qInp = el('input', null, 'st-input');
+    qInp.id = 'st-align-search';
     qInp.type = 'search';
     qInp.style.width = '240px';
     qInp.placeholder = '按需求标题、摘要、编号或目标仓搜索…';
@@ -2208,11 +2215,18 @@ function renderAlignmentOverview(host) {
       tbody.append(tr);
     }
     tbl.append(thead, tbody);
-    upCard.append(tbl);
+    upCard.append(wrapProseTable(tbl));
     wrap.append(upCard);
   }
 
   const ic = al.internalCodeLocks || {};
+  const isPortfolioNoCode = Boolean(
+    al.portfolio?.present
+    && !ic.requireCodeLocks
+    && (ic.implementsCount ?? 0) === 0
+    && (ic.verifiesCount ?? 0) === 0
+    && (ic.matchedEntriesCount ?? 0) === 0
+  );
   const codeCard = el('div', null, 'st-card st-guide-section');
   const codeHead = el('div', null, 'st-repo-opt-head');
   codeHead.style.marginBottom = '10px';
@@ -2226,17 +2240,18 @@ function renderAlignmentOverview(host) {
   }
   codeCard.append(codeHead);
   const kpiRow = el('div', null, 'st-kpi-grid');
-  const mkBox = (lbl, val, tone, tipKey) => {
+  const mkBox = (lbl, val, tone, tipKey, statusLabel = null) => {
     const c = el('div', null, 'st-card st-kpi-card');
     const top = el('div', null, 'st-graph-controls');
     top.append(el('span', lbl, 'st-muted-xs'), infoTrigger(tipKey, document));
-    c.append(top, el('div', val, 'st-kpi-val'), el('span', tone === 'emerald' ? '覆盖正常' : '需关注', `st-badge st-badge-${tone}`));
+    const badgeTxt = statusLabel || (tone === 'emerald' ? '覆盖正常' : (tone === 'zinc' ? '无需代码锁' : '需关注'));
+    c.append(top, el('div', val, 'st-kpi-val'), el('span', badgeTxt, `st-badge st-badge-${tone}`));
     kpiRow.append(c);
   };
-  mkBox('代码实现锁 (implements)', `${ic.implementsCount ?? 0} 条`, (ic.implementsCount ?? 0) > 0 ? 'emerald' : (ic.requireCodeLocks ? 'rose' : 'zinc'), 'lockCard:implements');
-  mkBox('测试验证锁 (verifies)', `${ic.verifiesCount ?? 0} 条`, (ic.verifiesCount ?? 0) > 0 ? 'emerald' : 'zinc', 'lockCard:verifies');
-  mkBox('声明式代码/技能入口', `${ic.matchedEntriesCount ?? 0} 个`, (ic.unclaimedEntries?.length ?? 0) === 0 ? 'emerald' : 'amber', 'lockCard:entries');
-  mkBox('未认领入口与锁漂移', `${(ic.unclaimedEntries?.length ?? 0) + (ic.drifts?.length ?? 0)} 项`, ic.healthy ? 'emerald' : 'rose', 'lockCard:unclaimed');
+  mkBox('代码实现锁 (implements)', `${ic.implementsCount ?? 0} 条`, (ic.implementsCount ?? 0) > 0 ? 'emerald' : (ic.requireCodeLocks ? 'rose' : 'zinc'), 'lockCard:implements', isPortfolioNoCode ? '高阶规划仓豁免' : null);
+  mkBox('测试验证锁 (verifies)', `${ic.verifiesCount ?? 0} 条`, (ic.verifiesCount ?? 0) > 0 ? 'emerald' : 'zinc', 'lockCard:verifies', isPortfolioNoCode ? '高阶规划仓豁免' : null);
+  mkBox('声明式代码/技能入口', `${ic.matchedEntriesCount ?? 0} 个`, isPortfolioNoCode ? 'zinc' : ((ic.unclaimedEntries?.length ?? 0) === 0 ? 'emerald' : 'amber'), 'lockCard:entries', isPortfolioNoCode ? '仅含高阶规划' : null);
+  mkBox('未认领入口与锁漂移', `${(ic.unclaimedEntries?.length ?? 0) + (ic.drifts?.length ?? 0)} 项`, ic.healthy ? 'emerald' : 'rose', 'lockCard:unclaimed', isPortfolioNoCode && ic.healthy ? '零漂移' : null);
   codeCard.append(kpiRow);
 
   const unclaimedDetails = ic.unclaimedEntryDetails || (ic.unclaimedEntries || []).map(p => ({ path: p, title: p, typeLabel: '源码入口' }));
@@ -2265,7 +2280,9 @@ function renderAlignmentOverview(host) {
     }
     codeCard.append(list);
   }
-  if (ic.healthy) {
+  if (isPortfolioNoCode && ic.healthy) {
+    codeCard.append(el('p', 'ℹ️ 高阶规划仓不直接承载业务代码锁（通过上方跨仓分配总账互锁）。', 'st-muted-xs'));
+  } else if (ic.healthy) {
     codeCard.append(el('p', '🟢 本仓核心源码、SKILL.md 入口与测试文件均已完成双向版本锁绑定且哈希新鲜。', 'st-muted-xs'));
   }
   wrap.append(codeCard);
@@ -2342,6 +2359,7 @@ function renderReviewPanel() {
   const readerCard = el('div', null, 'st-card');
 
   const searchInp = el('input', null, 'st-input');
+  searchInp.id = 'st-review-search';
   searchInp.type = 'search';
   searchInp.placeholder = '搜索标题、摘要或编号…';
   searchInp.value = state.reviewQuery;
@@ -2701,7 +2719,7 @@ function openRegisterRuntimeModal(onRegistered, editTarget = null) {
   (isEdit ? fTitle.inp : fId.inp).focus();
 }
 
-function renderTaskTreeView(host, scopedTargets, { plans = [], fleetFamCount = 0, onGoFleet = null, onRunSandbox = null, onMountSource = null } = {}) {
+function renderTaskTreeView(host, scopedTargets, { plans = [], fleetFamCount = 0, onGoFleet = null, onRunSandbox = null, onMountSource = null, onScopeWorkspace = null } = {}) {
   const bannerNote = el('div', '什么时候看这里：不仅跟踪实时沙箱与当前挂载的活跃执行计划，也聚合工作区近期进行中与已完成的历史执行计划与规划总览，点击左侧任意计划卡右侧即刻展开任务树与摘要。', 'st-scenario-banner');
   host.append(bannerNote);
 
@@ -2724,7 +2742,9 @@ function renderTaskTreeView(host, scopedTargets, { plans = [], fleetFamCount = 0
       wsPlansBtn.type = 'button';
       wsPlansBtn.addEventListener('click', () => {
         state.rtScope = 'workspace';
-        renderRuntimePanel();
+        state.rtSelectedTargetId = '__all__';
+        if (typeof onScopeWorkspace === 'function') onScopeWorkspace();
+        else renderRuntimePanel();
       });
       actRow.append(wsPlansBtn);
     }
@@ -2762,6 +2782,7 @@ function renderTaskTreeView(host, scopedTargets, { plans = [], fleetFamCount = 0
 
   const filterRow = el('div', null, 'st-graph-controls');
   const planSearch = el('input', null, 'st-input');
+  planSearch.id = 'st-plan-search';
   planSearch.type = 'search';
   planSearch.placeholder = '搜索计划标题、摘要或仓库…';
   planSearch.value = state.rtPlanQuery || '';
@@ -2909,6 +2930,7 @@ function renderTaskTreeView(host, scopedTargets, { plans = [], fleetFamCount = 0
     ctrl.style.padding = '0 0 12px 0';
     const pills = el('div', null, 'st-graph-controls');
     const qInp = el('input', null, 'st-input');
+    qInp.id = 'st-align-search';
     qInp.type = 'search';
     qInp.style.width = '240px';
     qInp.placeholder = '按波次、编号或步骤关键词过滤…';
@@ -3224,25 +3246,35 @@ function renderDiagnosticsView(host, scopedTargets, lockWarnMs, { onEditTarget =
   if (!scopedTargets.length) {
     secCard.append(el('p', '当前范围暂无运行源。', 'st-muted-xs'));
   } else {
-    secCard.append(buildRuntimeTargetsTable(scopedTargets, document, {
+    secCard.append(wrapProseTable(buildRuntimeTargetsTable(scopedTargets, document, {
       writable: state.writable,
       onEdit: onEditTarget,
       onRemove: onRemoveTarget,
-    }));
+    })));
   }
   host.append(secCard);
 }
 
-function renderRuntimeScopeToolbar(targetHost, { curRepo, repoTargets, allTargets, scopeBaseTargets, onEditTarget, onRemoveTarget }) {
+function renderRuntimeScopeToolbar(targetHost, { curRepo, repoTargets, allTargets, scopeBaseTargets, onEditTarget, onRemoveTarget, onPaintSync, onMountSync }) {
   const bar = el('div', null, 'st-card st-rt-toolbar');
   const leftBar = el('div', null, 'st-graph-controls');
   const scopeSwitch = el('div', null, 'st-view-switch');
   const bRepo = el('button', `聚焦当前项目 (${curRepo?.name || '当前仓'} · ${repoTargets.length})`, `st-btn${state.rtScope === 'repo' ? ' is-active' : ''}`);
   bRepo.type = 'button';
-  bRepo.addEventListener('click', () => { state.rtScope = 'repo'; state.rtSelectedTargetId = '__all__'; renderRuntimePanel(); });
+  bRepo.addEventListener('click', () => {
+    state.rtScope = 'repo';
+    state.rtSelectedTargetId = '__all__';
+    if (typeof onPaintSync === 'function') onPaintSync();
+    else renderRuntimePanel({ forceRefresh: false });
+  });
   const bAll = el('button', `全工作区监控源聚合 (${allTargets.length} 源)`, `st-btn${state.rtScope === 'workspace' ? ' is-active' : ''}`);
   bAll.type = 'button';
-  bAll.addEventListener('click', () => { state.rtScope = 'workspace'; state.rtSelectedTargetId = '__all__'; renderRuntimePanel(); });
+  bAll.addEventListener('click', () => {
+    state.rtScope = 'workspace';
+    state.rtSelectedTargetId = '__all__';
+    if (typeof onPaintSync === 'function') onPaintSync();
+    else renderRuntimePanel({ forceRefresh: false });
+  });
   scopeSwitch.append(bRepo, bAll);
 
   const srcSelect = el('select', null, 'st-select');
@@ -3256,20 +3288,24 @@ function renderRuntimeScopeToolbar(targetHost, { curRepo, repoTargets, allTarget
     if (state.rtSelectedTargetId === t.id) o.selected = true;
     srcSelect.append(o);
   }
-  srcSelect.addEventListener('change', () => { state.rtSelectedTargetId = srcSelect.value; renderRuntimePanel(); });
+  srcSelect.addEventListener('change', () => {
+    state.rtSelectedTargetId = srcSelect.value;
+    if (typeof onPaintSync === 'function') onPaintSync();
+    else renderRuntimePanel({ forceRefresh: false });
+  });
   leftBar.append(scopeSwitch, infoTrigger('rt:scope', document), srcSelect);
 
   const rightBar = el('div', null, 'st-graph-controls');
   const mountBtn = el('button', '+ 挂载运行源', 'st-btn');
   mountBtn.type = 'button';
   mountBtn.disabled = !state.writable;
-  mountBtn.addEventListener('click', () => openRegisterRuntimeModal(() => renderRuntimePanel()));
+  mountBtn.addEventListener('click', () => openRegisterRuntimeModal(() => (onMountSync ? onMountSync() : renderRuntimePanel({ forceRefresh: true }))));
   rightBar.append(mountBtn);
 
   bar.append(leftBar, rightBar);
   targetHost.append(bar);
 
-  const customTargets = allTargets.filter(t => t.isUserRegistered);
+  const customTargets = scopeBaseTargets.filter(t => t.isUserRegistered);
   if (customTargets.length > 0) {
     const customBar = el('div', null, 'st-upstream-capsule-bar');
     const customList = el('div', null, 'st-graph-controls');
@@ -3293,206 +3329,235 @@ function renderRuntimeScopeToolbar(targetHost, { curRepo, repoTargets, allTarget
   }
 }
 
-async function renderRuntimePanel() {
+let runtimeLoadSeq = 0;
+
+async function renderRuntimePanel({ forceRefresh = true } = {}) {
   stopLockTicker();
   const host = document.getElementById('st-panel-runtime');
+  const mySeq = ++runtimeLoadSeq;
   if (!state.runtime) {
     host.replaceChildren(el('p', '正在采集 Foundation 运行态与会话编队快照…', 'st-muted-xs'));
   }
-  try {
-    const [rtRes, fleetRes] = await Promise.all([
-      apiJson(`/api/studio/runtime?repo=${encodeURIComponent(state.repoId || '')}`),
-      apiJson('/api/studio/fleet').catch(() => null),
-    ]);
-    state.runtime = rtRes;
-    if (fleetRes) state.fleet = fleetRes;
-  } catch (err) {
-    host.replaceChildren(el('p', `读取运行态失败：${err.message}`, 'st-muted-xs'));
-    return;
-  }
-  host.replaceChildren();
-  const rt = state.runtime;
-  const curRepo = state.repos.find(r => r.id === state.repoId);
-  const allTargets = rt.targets || [];
-  const repoTargets = rt.currentRepoTargets || [];
-  const scopeBaseTargets = state.rtScope === 'repo' ? repoTargets : allTargets;
-  const scopedTargets = state.rtSelectedTargetId === '__all__'
-    ? scopeBaseTargets
-    : scopeBaseTargets.filter(t => t.id === state.rtSelectedTargetId);
-
-  const sLocks = collectUniqueScopedLocks(scopedTargets);
-  const sActiveLocks = sLocks.filter(l => l.isActive);
-  const sWarnCount = sActiveLocks.filter(l => l.isStaleWarning).length
-    + scopedTargets.filter(t => t.stateStore?.integrity === 'CHAIN_BROKEN').length
-    + scopedTargets.flatMap(t => t.processes || []).filter(p => p.processStatus === 'TIMED_OUT').length;
-  const fleetFamCount = state.fleet?.families?.length ?? 0;
-
-  const runSandboxWithGuard = async triggerBtn => {
-    const prevTxt = triggerBtn?.textContent;
-    if (triggerBtn) { triggerBtn.disabled = true; triggerBtn.textContent = '演练中…'; }
+  if (forceRefresh || !state.runtime || state.runtimeRepoId !== state.repoId) {
     try {
-      await apiJson('/api/studio/runtime/sandbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-      showStudioToast('✓ 已生成隔离沙箱演练数据（含 3 层任务树、6 节点编队与排他写锁）', { tone: 'emerald' });
-      renderRuntimePanel();
+      const [rtRes, fleetRes] = await Promise.all([
+        apiJson(`/api/studio/runtime?repo=${encodeURIComponent(state.repoId || '')}`),
+        apiJson('/api/studio/fleet').catch(() => null),
+      ]);
+      if (mySeq !== runtimeLoadSeq) return;
+      state.runtime = rtRes;
+      state.runtimeRepoId = state.repoId;
+      if (fleetRes) state.fleet = fleetRes;
     } catch (err) {
-      showStudioToast(`启动沙箱演练失败：${err.message}`, { tone: 'error' });
-    } finally {
-      if (triggerBtn) { triggerBtn.disabled = !state.writable; triggerBtn.textContent = prevTxt || '▶ 运行隔离沙箱演练'; }
-    }
-  };
-
-  const releaseSandboxWithGuard = async triggerBtn => {
-    if (triggerBtn) triggerBtn.disabled = true;
-    try {
-      await apiJson('/api/studio/runtime/sandbox/release', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-      showStudioToast('🔓 已释放沙箱排他写锁', { tone: 'emerald' });
-      renderRuntimePanel();
-    } catch (err) {
-      showStudioToast(`释放沙箱锁失败：${err.message}`, { tone: 'error' });
-    } finally {
-      if (triggerBtn) triggerBtn.disabled = !state.writable;
-    }
-  };
-
-  const handleEditTarget = target => {
-    if (!state.writable) {
-      showStudioToast('当前处于只读模式（--readonly），无法编辑挂载运行源。', { tone: 'warn' });
+      if (mySeq !== runtimeLoadSeq) return;
+      host.replaceChildren(el('p', `读取运行态失败：${err.message}`, 'st-muted-xs'));
       return;
     }
-    openRegisterRuntimeModal(() => renderRuntimePanel(), target);
-  };
+  }
 
-  const handleRemoveTarget = async target => {
-    if (!state.writable) {
-      showStudioToast('当前处于只读模式（--readonly），无法移除运行源。', { tone: 'warn' });
-      return;
+  const paintRuntimeView = () => {
+    stopLockTicker();
+    host.replaceChildren();
+    const rt = state.runtime;
+    if (!rt) return;
+    const curRepo = state.repos.find(r => r.id === state.repoId);
+    const allTargets = rt.targets || [];
+    const repoTargets = state.repoId
+      ? allTargets.filter(t => t.repoId === state.repoId || t.isSandbox)
+      : allTargets;
+    const scopeBaseTargets = state.rtScope === 'repo' ? repoTargets : allTargets;
+    if (state.rtSelectedTargetId !== '__all__' && !scopeBaseTargets.some(t => t.id === state.rtSelectedTargetId)) {
+      state.rtSelectedTargetId = '__all__';
     }
-    try {
-      await apiJson('/api/studio/runtime/unregister', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: target.id }),
-      });
-      if (state.rtSelectedTargetId === target.id) state.rtSelectedTargetId = '__all__';
-      showStudioToast(`✓ 已移除自定义运行源「${target.id}」`, { tone: 'emerald' });
-      renderRuntimePanel();
-    } catch (err) {
-      showStudioToast(`移除运行源失败：${err.message}`, { tone: 'error' });
-    }
-  };
+    const scopedTargets = state.rtSelectedTargetId === '__all__'
+      ? scopeBaseTargets
+      : scopeBaseTargets.filter(t => t.id === state.rtSelectedTargetId);
 
-  // 一级子视图导航栏（顶层只放子视图切换 + SSE + 沙箱演练/释放）
-  const topNavCard = el('div', null, 'st-card st-rt-subtabs-head');
-  const subBar = el('div', null, 'st-graph-controls');
-  for (const [vk, vl, tipKey] of [
-    ['tasks', '🌳 任务推进树', 'rt:view:tasks'],
-    ['fleet', `🛰️ 智能体会话编队 (${fleetFamCount})`, 'rt:view:fleet'],
-    ['diag', `🩺 异常排障 (${sWarnCount > 0 ? `⚠️ ${sWarnCount} 告警` : '🟢 无卡死'})`, 'rt:view:diag'],
-  ]) {
-    const b = el('button', vl, `st-btn${state.rtView === vk ? ' is-active' : ''}`);
-    b.type = 'button';
-    b.addEventListener('click', () => { state.rtView = vk; renderRuntimePanel(); });
-    subBar.append(b, infoTrigger(tipKey, document));
-  }
+    const sLocks = collectUniqueScopedLocks(scopedTargets);
+    const sActiveLocks = sLocks.filter(l => l.isActive);
+    const sWarnCount = sActiveLocks.filter(l => l.isStaleWarning).length
+      + scopedTargets.filter(t => t.stateStore?.integrity === 'CHAIN_BROKEN').length
+      + scopedTargets.flatMap(t => t.processes || []).filter(p => p.processStatus === 'TIMED_OUT').length;
+    const fleetFamCount = state.fleet?.families?.length ?? 0;
 
-  const rightBar = el('div', null, 'st-graph-controls');
-  const ssePill = el('span', null, 'st-live-pill');
-  ssePill.append(el('span', null, 'st-live-dot'), el('span', state.rtSseStatus === 'connected' ? 'SSE 实时同步' : '重连中…'));
-
-  const sbxBtn = el('button', '▶ 运行隔离沙箱演练', 'st-btn st-btn-primary');
-  sbxBtn.type = 'button';
-  sbxBtn.disabled = !state.writable;
-  sbxBtn.addEventListener('click', () => runSandboxWithGuard(sbxBtn));
-
-  rightBar.append(ssePill, sbxBtn);
-  if (rt.hasActiveSandboxLock) {
-    const relBtn = el('button', '🔓 释放沙箱锁', 'st-btn st-btn-amber');
-    relBtn.type = 'button';
-    relBtn.disabled = !state.writable;
-    relBtn.addEventListener('click', () => releaseSandboxWithGuard(relBtn));
-    rightBar.append(relBtn);
-  }
-  topNavCard.append(subBar, rightBar);
-  host.append(topNavCard);
-
-  const viewHost = el('div');
-  host.append(viewHost);
-
-  const lockWarnMs = rt.kpi?.lockWarnMs || 30000;
-  if (state.rtView === 'tasks') {
-    renderRuntimeScopeToolbar(viewHost, {
-      curRepo,
-      repoTargets,
-      allTargets,
-      scopeBaseTargets,
-      onEditTarget: handleEditTarget,
-      onRemoveTarget: handleRemoveTarget,
-    });
-    renderTaskTreeView(viewHost, scopedTargets, {
-      plans: rt.plans || [],
-      fleetFamCount,
-      onGoFleet: () => { state.rtView = 'fleet'; renderRuntimePanel(); },
-      onRunSandbox: runSandboxWithGuard,
-      onMountSource: () => openRegisterRuntimeModal(() => renderRuntimePanel()),
-    });
-  } else if (state.rtView === 'fleet') {
-    const paintFleet = () => {
-      mountFleetMonitor(viewHost, {
-        fleetData: state.fleet,
-        state,
-        doc: document,
-        infoTrigger,
-        onStateChange: paintFleet,
-        onRefresh: async () => {
-          state.fleet = await apiJson('/api/studio/fleet').catch(() => state.fleet);
-          paintFleet();
-        },
-        onRunSandbox: () => runSandboxWithGuard(sbxBtn),
-      });
-    };
-    paintFleet();
-  } else {
-    renderRuntimeScopeToolbar(viewHost, {
-      curRepo,
-      repoTargets,
-      allTargets,
-      scopeBaseTargets,
-      onEditTarget: handleEditTarget,
-      onRemoveTarget: handleRemoveTarget,
-    });
-    renderDiagnosticsView(viewHost, scopedTargets, lockWarnMs, {
-      onEditTarget: handleEditTarget,
-      onRemoveTarget: handleRemoveTarget,
-    });
-  }
-
-  if (sActiveLocks.length > 0 && state.tab === 'runtime' && state.rtView === 'diag') {
-    lockTickTimer = setInterval(() => {
-      if (state.tab !== 'runtime' || state.rtView !== 'diag') { stopLockTicker(); return; }
-      const nodes = host.querySelectorAll('[data-lock-acquired-at]');
-      const now = Date.now();
-      for (const n of nodes) {
-        const ts = Date.parse(n.dataset.lockAcquiredAt || '');
-        if (!Number.isFinite(ts)) continue;
-        const ageMs = Math.max(0, now - ts);
-        n.textContent = `已持锁 ${formatDurationMs(ageMs)}`;
+    const runSandboxWithGuard = async triggerBtn => {
+      const prevTxt = triggerBtn?.textContent;
+      if (triggerBtn) { triggerBtn.disabled = true; triggerBtn.textContent = '演练中…'; }
+      try {
+        await apiJson('/api/studio/runtime/sandbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        showStudioToast('✓ 已生成隔离沙箱演练数据（含 3 层任务树、6 节点编队与排他写锁）', { tone: 'emerald' });
+        renderRuntimePanel({ forceRefresh: true });
+      } catch (err) {
+        showStudioToast(`启动沙箱演练失败：${err.message}`, { tone: 'error' });
+      } finally {
+        if (triggerBtn) { triggerBtn.disabled = !state.writable; triggerBtn.textContent = prevTxt || '▶ 运行隔离沙箱演练'; }
       }
-    }, 1000);
-  }
+    };
+
+    const releaseSandboxWithGuard = async triggerBtn => {
+      if (triggerBtn) triggerBtn.disabled = true;
+      try {
+        await apiJson('/api/studio/runtime/sandbox/release', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        showStudioToast('🔓 已释放沙箱排他写锁', { tone: 'emerald' });
+        renderRuntimePanel({ forceRefresh: true });
+      } catch (err) {
+        showStudioToast(`释放沙箱锁失败：${err.message}`, { tone: 'error' });
+      } finally {
+        if (triggerBtn) triggerBtn.disabled = !state.writable;
+      }
+    };
+
+    const handleEditTarget = target => {
+      if (!state.writable) {
+        showStudioToast('当前处于只读模式（--readonly），无法编辑挂载运行源。', { tone: 'warn' });
+        return;
+      }
+      openRegisterRuntimeModal(() => renderRuntimePanel({ forceRefresh: true }), target);
+    };
+
+    const handleRemoveTarget = async target => {
+      if (!state.writable) {
+        showStudioToast('当前处于只读模式（--readonly），无法移除运行源。', { tone: 'warn' });
+        return;
+      }
+      try {
+        await apiJson('/api/studio/runtime/unregister', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: target.id }),
+        });
+        if (state.rtSelectedTargetId === target.id) state.rtSelectedTargetId = '__all__';
+        showStudioToast(`✓ 已移除自定义运行源「${target.id}」`, { tone: 'emerald' });
+        renderRuntimePanel({ forceRefresh: true });
+      } catch (err) {
+        showStudioToast(`移除运行源失败：${err.message}`, { tone: 'error' });
+      }
+    };
+
+    // 一级子视图导航栏（顶层只放子视图切换 + SSE + 沙箱演练/释放）
+    const topNavCard = el('div', null, 'st-card st-rt-subtabs-head');
+    const subBar = el('div', null, 'st-graph-controls');
+    for (const [vk, vl, tipKey] of [
+      ['tasks', '🌳 任务推进树', 'rt:view:tasks'],
+      ['fleet', `🛰️ 智能体会话编队 (${fleetFamCount})`, 'rt:view:fleet'],
+      ['diag', `🩺 异常排障 (${sWarnCount > 0 ? `⚠️ ${sWarnCount} 告警` : '🟢 无卡死'})`, 'rt:view:diag'],
+    ]) {
+      const b = el('button', vl, `st-btn${state.rtView === vk ? ' is-active' : ''}`);
+      b.type = 'button';
+      b.addEventListener('click', () => { state.rtView = vk; paintRuntimeView(); });
+      subBar.append(b, infoTrigger(tipKey, document));
+    }
+
+    const rightBar = el('div', null, 'st-graph-controls');
+    const ssePill = el('span', null, 'st-live-pill');
+    ssePill.append(el('span', null, 'st-live-dot'), el('span', state.rtSseStatus === 'connected' ? 'SSE 实时同步' : '重连中…'));
+
+    const sbxBtn = el('button', '▶ 运行隔离沙箱演练', 'st-btn st-btn-primary');
+    sbxBtn.type = 'button';
+    sbxBtn.disabled = !state.writable;
+    sbxBtn.addEventListener('click', () => runSandboxWithGuard(sbxBtn));
+
+    rightBar.append(ssePill, sbxBtn);
+    if (rt.hasActiveSandboxLock) {
+      const relBtn = el('button', '🔓 释放沙箱锁', 'st-btn st-btn-amber');
+      relBtn.type = 'button';
+      relBtn.disabled = !state.writable;
+      relBtn.addEventListener('click', () => releaseSandboxWithGuard(relBtn));
+      rightBar.append(relBtn);
+    }
+    topNavCard.append(subBar, rightBar);
+    host.append(topNavCard);
+
+    const viewHost = el('div');
+    host.append(viewHost);
+
+    const lockWarnMs = rt.kpi?.lockWarnMs || 30000;
+    if (state.rtView === 'tasks') {
+      renderRuntimeScopeToolbar(viewHost, {
+        curRepo,
+        repoTargets,
+        allTargets,
+        scopeBaseTargets,
+        onEditTarget: handleEditTarget,
+        onRemoveTarget: handleRemoveTarget,
+        onPaintSync: paintRuntimeView,
+        onMountSync: () => renderRuntimePanel({ forceRefresh: true }),
+      });
+      renderTaskTreeView(viewHost, scopedTargets, {
+        plans: rt.plans || [],
+        fleetFamCount,
+        onGoFleet: () => { state.rtView = 'fleet'; paintRuntimeView(); },
+        onScopeWorkspace: paintRuntimeView,
+        onRunSandbox: runSandboxWithGuard,
+        onMountSource: () => openRegisterRuntimeModal(() => renderRuntimePanel({ forceRefresh: true })),
+      });
+    } else if (state.rtView === 'fleet') {
+      const paintFleet = () => {
+        mountFleetMonitor(viewHost, {
+          fleetData: state.fleet,
+          state,
+          doc: document,
+          infoTrigger,
+          onStateChange: paintFleet,
+          onRefresh: async () => {
+            state.fleet = await apiJson('/api/studio/fleet').catch(() => state.fleet);
+            paintFleet();
+          },
+          onRunSandbox: () => runSandboxWithGuard(sbxBtn),
+        });
+      };
+      paintFleet();
+    } else {
+      renderRuntimeScopeToolbar(viewHost, {
+        curRepo,
+        repoTargets,
+        allTargets,
+        scopeBaseTargets,
+        onEditTarget: handleEditTarget,
+        onRemoveTarget: handleRemoveTarget,
+        onPaintSync: paintRuntimeView,
+        onMountSync: () => renderRuntimePanel({ forceRefresh: true }),
+      });
+      renderDiagnosticsView(viewHost, scopedTargets, lockWarnMs, {
+        onEditTarget: handleEditTarget,
+        onRemoveTarget: handleRemoveTarget,
+      });
+    }
+
+    if (sActiveLocks.length > 0 && state.tab === 'runtime' && state.rtView === 'diag') {
+      lockTickTimer = setInterval(() => {
+        if (state.tab !== 'runtime' || state.rtView !== 'diag') { stopLockTicker(); return; }
+        const nodes = host.querySelectorAll('[data-lock-acquired-at]');
+        const now = Date.now();
+        for (const n of nodes) {
+          const ts = Date.parse(n.dataset.lockAcquiredAt || '');
+          if (!Number.isFinite(ts)) continue;
+          const ageMs = Math.max(0, now - ts);
+          n.textContent = `已持锁 ${formatDurationMs(ageMs)}`;
+        }
+      }, 1000);
+    }
+  };
+
+  paintRuntimeView();
 }
 
 function renderActiveTab() {
   if (state.tab === 'guide') renderGuidePanel();
   else if (state.tab === 'graph') renderGraphPanel();
   else if (state.tab === 'review') renderReviewPanel();
-  else if (state.tab === 'runtime') renderRuntimePanel();
+  else if (state.tab === 'runtime') renderRuntimePanel({ forceRefresh: !state.runtime || state.runtimeRepoId !== state.repoId });
 }
 
 let selectRepoSeq = 0;
+let selectRepoAbort = null;
 
 async function selectRepo(repoId, { skipRender = false } = {}) {
   if (!repoId) return;
   const mySeq = ++selectRepoSeq;
+  if (selectRepoAbort) selectRepoAbort.abort();
+  selectRepoAbort = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const signal = selectRepoAbort?.signal;
   state.repoId = repoId;
   state.snap = null;
   state.alignment = null;
@@ -3502,18 +3567,31 @@ async function selectRepo(repoId, { skipRender = false } = {}) {
   state.archifySelectedNode = null;
   state.selectedAnchor = null;
   state.rtSelectedTargetId = '__all__';
+  updateTopbarSummary();
+  renderTopContextBars();
   if (!skipRender) renderActiveTab();
   const u = new URL(location.href);
   u.searchParams.set('repo', repoId);
   if (state.tab) u.searchParams.set('tab', state.tab);
   history.replaceState(null, '', u);
-  const [data, alignData] = await Promise.all([
-    apiJson(`/api/studio/repo?repo=${encodeURIComponent(repoId)}`),
-    apiJson(`/api/studio/alignment?repo=${encodeURIComponent(repoId)}`).catch(() => null),
-  ]);
+  let data;
+  let alignData;
+  try {
+    [data, alignData] = await Promise.all([
+      apiJson(`/api/studio/repo?repo=${encodeURIComponent(repoId)}`, signal ? { signal } : {}),
+      apiJson(`/api/studio/alignment?repo=${encodeURIComponent(repoId)}`, signal ? { signal } : {}).catch(() => null),
+    ]);
+  } catch (err) {
+    if (err?.name === 'AbortError' || mySeq !== selectRepoSeq) return;
+    throw err;
+  }
   if (mySeq !== selectRepoSeq) return;
   state.snap = data.snapshot;
   state.alignment = alignData;
+  state.repoCountsCache?.set(repoId, {
+    reviewableCount: state.snap.reviewItems?.length ?? 0,
+    nodeCount: state.snap.nodes?.length ?? 0,
+  });
   const def = pickDefaultArtifactNode(state.snap.nodes || []) || (state.snap.reviewItems || [])[0] || null;
   state.selectedUid = def ? def.uid : null;
   if (!skipRender) {
@@ -3551,7 +3629,13 @@ async function boot() {
     document.documentElement.dataset.theme = nxt;
     localStorage.setItem('st-theme', nxt);
     const frame = document.querySelector('.st-archify-frame');
-    try { frame?.contentDocument?.documentElement?.setAttribute('data-theme', nxt); } catch {}
+    if (frame?.src) {
+      try {
+        const u = new URL(frame.src, location.href);
+        u.searchParams.set('theme', nxt);
+        frame.src = u.toString();
+      } catch {}
+    }
   });
   document.getElementById('st-progress-capsule').addEventListener('click', openExportDrawer);
 
@@ -3596,6 +3680,40 @@ async function boot() {
     }
   });
   document.addEventListener('keydown', ev => {
+    if ((ev.metaKey || ev.ctrlKey) && !ev.altKey && !ev.shiftKey && ev.key.toLowerCase() === 'k') {
+      ev.preventDefault();
+      if (!pop.hidden) {
+        const rs = document.getElementById('st-repo-search');
+        rs?.focus();
+        rs?.select?.();
+        return;
+      }
+      if (state.tab === 'review') {
+        const targetSearch = state.reviewMode === 'alignment'
+          ? (document.getElementById('st-align-search') || document.getElementById('st-review-search'))
+          : (document.getElementById('st-review-search') || document.getElementById('st-align-search'));
+        if (targetSearch) {
+          targetSearch.focus();
+          targetSearch.select?.();
+          return;
+        }
+      } else if (state.tab === 'runtime') {
+        const rtSearch = document.getElementById('st-plan-search')
+          || document.querySelector('#st-panel-runtime .st-md-master input[type="search"], #st-panel-runtime input[type="search"]');
+        if (rtSearch) {
+          rtSearch.focus();
+          rtSearch.select?.();
+          return;
+        }
+      }
+      pop.hidden = false;
+      trig.setAttribute('aria-expanded', 'true');
+      renderRepoPopover();
+      const rs = document.getElementById('st-repo-search');
+      rs?.focus();
+      rs?.select?.();
+      return;
+    }
     if (ev.key !== 'Escape') return;
     if (isTooltipOpen(document)) { closeGlobalTooltip(document); return; }
     const repoModal = document.getElementById('st-repo-modal');

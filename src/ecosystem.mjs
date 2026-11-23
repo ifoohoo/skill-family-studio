@@ -16,7 +16,7 @@ import {
 import { readFileContained, resolveContained, writeFileAtomic } from 'skill-family-harness-node';
 import { parse as parseYaml } from 'yaml';
 import { DEFAULT_LAYERS } from './graph-layout.mjs';
-import { cleanInlinePlain, escapeHtml, extractArtifactBrief, renderMarkdownToHtml, sanitizePublicText } from './markdown-render.mjs';
+import { cleanInlinePlain, escapeHtml, extractArtifactBrief, renderMarkdownToHtml, sanitizePublicText, stripYamlFrontmatter } from './markdown-render.mjs';
 import { sortItemsForGuidedReview } from './review-state.mjs';
 
 const SKIP_DIRS = new Set([
@@ -583,6 +583,12 @@ export async function readQuickRepoMeta(repoReal) {
   let lockPresent = false;
   let lockedCount = 0;
   let estimatedNodes = 0;
+  let estimatedDesignNodes = 0;
+  const isCodeEndpoint = ep => {
+    if (!ep || typeof ep !== 'object') return false;
+    if (ep.type === 'code' || ep.type === 'test' || ep.type === 'implementation') return true;
+    return typeof ep.path === 'string' && CODE_EXT_RE.test(ep.path);
+  };
   try {
     const lk = JSON.parse(await readFileContained(repoReal, VERSION_LOCK_PATH, { encoding: 'utf8' }));
     lockPresent = true;
@@ -590,17 +596,34 @@ export async function readQuickRepoMeta(repoReal) {
     const relArr = Array.isArray(lk.artifactRelations) ? lk.artifactRelations : [];
     lockedCount = locksArr.length + relArr.length;
     const uidSet = new Set();
-    for (const item of [...locksArr, ...relArr]) {
+    const designUidSet = new Set();
+    for (const item of locksArr) {
       for (const rawEp of [item?.source, item?.target, item?.from, item?.to, item?.artifact]) {
         const key = extractLockEndpointKey(rawEp);
-        if (key) uidSet.add(key);
+        if (key) {
+          uidSet.add(key);
+          if (!isCodeEndpoint(rawEp)) designUidSet.add(key);
+        }
+      }
+    }
+    for (const item of relArr) {
+      for (const rawEp of [item?.source, item?.target, item?.from, item?.to, item?.artifact]) {
+        const key = extractLockEndpointKey(rawEp);
+        if (key) {
+          uidSet.add(key);
+          if (!isCodeEndpoint(rawEp)) designUidSet.add(key);
+        }
       }
     }
     estimatedNodes = uidSet.size;
+    estimatedDesignNodes = designUidSet.size;
   } catch {}
 
+  const configuredArtifactFiles = estimatedNodes === 0 || estimatedDesignNodes === 0
+    ? await countConfiguredArtifactFiles(repoReal)
+    : 0;
   if (estimatedNodes === 0) {
-    estimatedNodes = await countConfiguredArtifactFiles(repoReal);
+    estimatedNodes = configuredArtifactFiles;
   }
 
   let richItemBonus = 0;
@@ -636,6 +659,10 @@ export async function readQuickRepoMeta(repoReal) {
     }
   }
 
+  const reviewableBase = estimatedDesignNodes > 0
+    ? estimatedDesignNodes
+    : (configuredArtifactFiles > 0 ? configuredArtifactFiles : estimatedNodes);
+
   return {
     pkgName,
     description,
@@ -649,6 +676,7 @@ export async function readQuickRepoMeta(repoReal) {
     lockedCount,
     versionLockLabel: lockPresent ? `已锁 (${lockedCount})` : '未建锁',
     estimatedNodeCount: estimatedNodes + richItemBonus,
+    estimatedReviewableCount: reviewableBase + richItemBonus,
     runtimeActive,
     runtimeLabel,
   };
@@ -783,7 +811,7 @@ export async function discoverStudioRepos(workspaceRoot, { scanRoots, env } = {}
       lockedCount: meta.lockedCount,
       versionLockLabel: meta.versionLockLabel,
       nodeCount: meta.estimatedNodeCount,
-      reviewableCount: meta.estimatedNodeCount,
+      reviewableCount: meta.estimatedReviewableCount ?? meta.estimatedNodeCount,
       runtimeActive: meta.runtimeActive,
       runtimeLabel: meta.runtimeLabel,
       realPath,
@@ -806,22 +834,48 @@ export async function discoverStudioRepos(workspaceRoot, { scanRoots, env } = {}
   };
 }
 
-async function loadArchifyCollection(repoReal, manifestRel, extraItems, archifyDiagrams, allowedArchifyDirs) {
+function parseMarkdownFrontmatterSafe(rawText) {
+  const { frontmatterRaw, body } = stripYamlFrontmatter(rawText);
+  const frontmatter = {};
+  if (frontmatterRaw) {
+    try {
+      const parsed = parseYaml(frontmatterRaw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed)) {
+          if (!['__proto__', 'constructor', 'prototype'].includes(k)) frontmatter[k] = v;
+        }
+      }
+    } catch {}
+  }
+  return { frontmatter, body };
+}
+
+function normalizeSafeRelativeAssetPath(rawPath) {
+  const clean = String(rawPath ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!clean || clean.includes('\0') || clean.startsWith('/') || clean.split('/').includes('..')) {
+    return null;
+  }
+  return clean;
+}
+
+async function loadArchifyCollection(repoReal, manifestRel, extraItems, archifyDiagrams, allowedArchifyFiles, allowedArchifyDirs) {
   const ms = await readJsonSafeContained(repoReal, manifestRel);
   if (!ms) return;
   for (const doc of ms.documents ?? []) {
     if (doc.markdown && typeof doc.markdown === 'string') {
       try {
         const mdRaw = sanitizePublicText(await readFileContained(repoReal, doc.markdown, { encoding: 'utf8' }));
+        const { frontmatter, body } = parseMarkdownFrontmatterSafe(mdRaw);
         const code = String(doc.pageId || basename(doc.markdown, '.md')).toUpperCase();
         const brief = extractArtifactBrief({
-          rawText: mdRaw,
+          rawText: body,
+          frontmatter,
           fallbackTitle: doc.title,
           code,
           typeLabel: '业务专题文稿',
           path: doc.markdown,
         });
-        const rendered = renderMarkdownToHtml(mdRaw, {
+        const rendered = renderMarkdownToHtml(body, {
           idPrefix: `art-${doc.pageId || 'doc'}`,
           heroMeta: {
             title: sanitizePublicText(doc.title || brief.title),
@@ -829,7 +883,8 @@ async function loadArchifyCollection(repoReal, manifestRel, extraItems, archifyD
             code,
             typeLabel: '业务专题文稿',
             path: doc.markdown,
-            status: 'active',
+            status: String(frontmatter.status || 'active'),
+            frontmatter,
           },
         });
         extraItems.push({
@@ -845,18 +900,29 @@ async function loadArchifyCollection(repoReal, manifestRel, extraItems, archifyD
           title: sanitizePublicText(doc.title || rendered.title || brief.title || basename(doc.markdown)),
           summary: cleanInlinePlain(doc.summary || brief.summary),
           path: doc.markdown,
-          status: 'active',
+          status: String(frontmatter.status || 'active'),
           isDesignNode: true,
           inDegree: 0,
           outDegree: (doc.figures ?? []).length,
-          inlineDoc: { title: doc.title || rendered.title, summary: cleanInlinePlain(doc.summary || brief.summary), headings: rendered.headings, html: rendered.html },
+          inlineDoc: { title: doc.title || rendered.title, summary: cleanInlinePlain(doc.summary || brief.summary), frontmatter, headings: rendered.headings, html: rendered.html },
         });
       } catch {}
     }
     for (const fig of doc.figures ?? []) {
       if (!fig?.html) continue;
-      const cleanHtml = String(fig.html).replace(/\\/g, '/').replace(/^\.\//, '');
-      allowedArchifyDirs.add(dirname(cleanHtml));
+      const cleanHtml = normalizeSafeRelativeAssetPath(fig.html);
+      if (!cleanHtml) continue;
+      allowedArchifyFiles.add(cleanHtml);
+      const figDir = dirname(cleanHtml);
+      if (figDir && figDir !== '.') allowedArchifyDirs.add(figDir);
+      const safeResources = [];
+      for (const r of Array.isArray(fig.resources) ? fig.resources : []) {
+        const cleanRes = normalizeSafeRelativeAssetPath(r);
+        if (cleanRes) {
+          allowedArchifyFiles.add(cleanRes);
+          safeResources.push(cleanRes);
+        }
+      }
       archifyDiagrams.push({
         id: fig.id,
         title: sanitizePublicText(fig.title || fig.id),
@@ -864,7 +930,7 @@ async function loadArchifyCollection(repoReal, manifestRel, extraItems, archifyD
         docPageId: doc.pageId ? String(doc.pageId) : null,
         docTitle: sanitizePublicText(doc.title || ''),
         htmlPath: cleanHtml,
-        resources: Array.isArray(fig.resources) ? fig.resources : [],
+        resources: safeResources,
         bindings: Array.isArray(fig.bindings)
           ? fig.bindings
               .filter(b => b?.nodeId && b?.pageId)
@@ -1001,11 +1067,12 @@ async function loadRepoCollections(repoReal) {
   const collections = await resolveEffectiveCollections(repoReal, studioCfg);
   const extraItems = [];
   const archifyDiagrams = [];
+  const allowedArchifyFiles = new Set();
   const allowedArchifyDirs = new Set();
 
   for (const col of collections) {
     if (col.kind === 'archify-model-scenes' && col.manifestJson) {
-      await loadArchifyCollection(repoReal, col.manifestJson, extraItems, archifyDiagrams, allowedArchifyDirs);
+      await loadArchifyCollection(repoReal, col.manifestJson, extraItems, archifyDiagrams, allowedArchifyFiles, allowedArchifyDirs);
     } else if (col.kind === 'lifecycle-story-pack') {
       extraItems.push(...await loadLifecycleStoryPack(repoReal, col));
     }
@@ -1019,6 +1086,7 @@ async function loadRepoCollections(repoReal) {
       for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
         if (e.isFile() && e.name.endsWith('.html')) {
           const relHtml = `artifacts/diagrams/${e.name}`;
+          allowedArchifyFiles.add(relHtml);
           allowedArchifyDirs.add('artifacts/diagrams');
           archifyDiagrams.push({
             id: basename(e.name, '.html'),
@@ -1034,7 +1102,7 @@ async function loadRepoCollections(repoReal) {
     } catch {}
   }
 
-  return { studioCfg, extraItems, archifyDiagrams, allowedArchifyDirs };
+  return { studioCfg, extraItems, archifyDiagrams, allowedArchifyFiles, allowedArchifyDirs };
 }
 
 async function loadRepoSchemaSafe(repoReal) {
@@ -1312,18 +1380,6 @@ export async function inspectProjectRepo(record, emptyScanDir) {
       || (srcToken ? candidates.find(c => normCodeToken(c.code || c.path) === srcToken) : null)
       || null;
   };
-  const extractMdTitle = (rawMd, fallbackTitle) => {
-    const text = String(rawMd || '').replace(/\r\n/g, '\n');
-    const fm = /^---\n([\s\S]*?)\n---/.exec(text);
-    if (fm) {
-      try {
-        const meta = parseYaml(fm[1]);
-        if (meta && typeof meta.title === 'string' && meta.title.trim()) return meta.title.trim();
-      } catch {}
-    }
-    const h1 = /^#\s+(.+)$/m.exec(text);
-    return h1 ? h1[1].trim() : fallbackTitle;
-  };
   const buildDiskCompanionCandidates = cItem => {
     const cleanP = String(cItem.path || '').replace(/\\/g, '/').replace(/^\.\//, '');
     const relDir = dirname(cleanP);
@@ -1491,6 +1547,7 @@ export async function inspectProjectRepo(record, emptyScanDir) {
     contents,
     inlineDocs,
     companionPaths,
+    allowedArchifyFiles: colResult.allowedArchifyFiles,
     allowedArchifyDirs: colResult.allowedArchifyDirs,
   };
 }
@@ -1555,7 +1612,7 @@ export async function readRepoDocument(record, cachedEntry, { path: rawPath, uid
       isMachineContract: false,
       title: inline.title,
       summary: inline.summary || matchedMeta?.summary || '',
-      frontmatter: {},
+      frontmatter: inline.frontmatter || {},
       headings: inline.headings,
       html: inline.html,
     };
@@ -1580,20 +1637,7 @@ export async function readRepoDocument(record, cachedEntry, { path: rawPath, uid
   const sanitized = sanitizePublicText(rawText);
   const ext = extname(cleanPath).toLowerCase();
   if (ext === '.md') {
-    let frontmatter = {};
-    let body = sanitized;
-    const fm = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(sanitized.replace(/\r\n/g, '\n'));
-    if (fm) {
-      try {
-        const parsed = parseYaml(fm[1]);
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          for (const [k, v] of Object.entries(parsed)) {
-            if (!['__proto__', 'constructor', 'prototype'].includes(k)) frontmatter[k] = v;
-          }
-        }
-      } catch {}
-      body = fm[2];
-    }
+    const { frontmatter, body } = parseMarkdownFrontmatterSafe(sanitized);
     const brief = extractArtifactBrief({
       rawText: body,
       frontmatter,
@@ -1662,12 +1706,16 @@ export async function readRepoDocument(record, cachedEntry, { path: rawPath, uid
 }
 
 export async function readRepoArchifyAsset(record, cachedEntry, rawAssetPath) {
-  const cleanPath = String(rawAssetPath ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '');
-  if (!cleanPath || cleanPath.startsWith('/') || cleanPath.split('/').includes('..')) {
+  const cleanPath = normalizeSafeRelativeAssetPath(rawAssetPath);
+  if (!cleanPath) {
     throw Object.assign(new Error('非法的 Archify 资源路径请求。'), { statusCode: 400 });
   }
-  const allowed = [...cachedEntry.allowedArchifyDirs].some(dir => cleanPath.startsWith(`${dir}/`));
-  if (!allowed) {
+  const exactAllowed = Boolean(cachedEntry.allowedArchifyFiles?.has(cleanPath));
+  const dirAllowed = [...(cachedEntry.allowedArchifyDirs ?? [])].some(dir => {
+    const norm = String(dir ?? '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+    return norm && norm !== '.' && cleanPath.startsWith(`${norm}/`);
+  });
+  if (!exactAllowed && !dirAllowed) {
     throw Object.assign(new Error('请求的图谱文件不在受管 Archify 目录白名单内。'), { statusCode: 404 });
   }
   const bytes = await readFileContained(record.realPath, cleanPath);

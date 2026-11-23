@@ -47,6 +47,43 @@ import { computePathDigest } from './setup-advisor.mjs';
 
 const PKG_SRC_DIR = fileURLToPath(new URL('./', import.meta.url));
 const UI_DIR = join(PKG_SRC_DIR, 'ui');
+const MAX_SSE_CLIENTS = 64;
+
+const ARCHIFY_BRIDGE_SCRIPT = `<script>
+(function(){
+  if(window.__studioArchifyBridge)return;
+  window.__studioArchifyBridge=true;
+  var post=function(payload){try{if(window.parent&&window.parent!==window){window.parent.postMessage(payload,'*');}}catch(_){}};
+  document.addEventListener('click',function(ev){
+    var t=ev.target;
+    if(!t||typeof t.closest!=='function')return;
+    var el=t.closest('[data-node-id],[data-outline-node]')||t.closest('[id^="node-"]:not(#node-finder):not(#node-outline):not([id^="node-finder-"]):not([id^="node-outline-"])');
+    if(!el)return;
+    var nodeId=el.getAttribute('data-node-id')||el.getAttribute('data-outline-node')||'';
+    if(!nodeId){
+      var rawId=el.getAttribute('id')||'';
+      if(rawId.indexOf('node-')===0&&rawId!=='node-finder'&&rawId!=='node-outline')nodeId=rawId.slice(5);
+    }
+    if(!nodeId)return;
+    var label=el.getAttribute('data-node-label')||(el.hasAttribute('data-outline-node')?(el.textContent||'').trim():'')||nodeId;
+    post({__studioArchify:true,type:'node-click',nodeId:nodeId,label:label});
+  },true);
+  document.addEventListener('keydown',function(ev){
+    if(ev.key==='Escape')post({__studioArchify:true,type:'escape',nodeId:null});
+    else if((ev.metaKey||ev.ctrlKey)&&!ev.altKey&&!ev.shiftKey&&String(ev.key||'').toLowerCase()==='k'){
+      ev.preventDefault();
+      post({__studioArchify:true,type:'focus-search',nodeId:null});
+    }
+  },true);
+})();
+</script>`;
+
+export function injectArchifyBridgeHtml(htmlText) {
+  const raw = String(htmlText ?? '');
+  const idx = raw.search(/<\/body\s*>/i);
+  if (idx === -1) return `${raw}\n${ARCHIFY_BRIDGE_SCRIPT}`;
+  return `${raw.slice(0, idx)}${ARCHIFY_BRIDGE_SCRIPT}\n${raw.slice(idx)}`;
+}
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -76,19 +113,28 @@ export function isSafeLoopbackHost(req) {
   try {
     const parsed = new URL(`http://${trimmed}`);
     const host = parsed.hostname.toLowerCase();
-    return host === '127.0.0.1' || host === 'localhost' || host === '[::1]' || host === '::1';
+    return host === '127.0.0.1' || host === 'localhost' || host === '[::1]';
   } catch {
     return false;
   }
 }
 
-export function isSafeLoopbackOrigin(req) {
+export function isSafeLoopbackOrigin(req, expectedPort = null) {
   const origin = req.headers.origin;
-  if (!origin) return true;
+  if (origin === undefined || origin === '') return true;
+  if (typeof origin !== 'string') return false;
+  const trimmed = origin.trim();
+  if (!trimmed || trimmed.toLowerCase() === 'null') return false;
   try {
-    const parsed = new URL(origin);
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
     const host = parsed.hostname.toLowerCase();
-    return host === '127.0.0.1' || host === 'localhost' || host === '[::1]';
+    if (host !== '127.0.0.1' && host !== 'localhost' && host !== '[::1]') return false;
+    if (expectedPort !== null && expectedPort !== undefined && Number(expectedPort) > 0) {
+      const originPort = parsed.port ? Number(parsed.port) : (parsed.protocol === 'https:' ? 443 : 80);
+      if (originPort !== Number(expectedPort)) return false;
+    }
+    return true;
   } catch {
     return false;
   }
@@ -258,14 +304,32 @@ export async function createStudioServer({
       }
 
       if (pathname === '/api/studio/events') {
+        if (req.method !== 'GET') { sendJson(res, 405, { ok: false, error: '仅支持 GET 请求。' }); return; }
+        if (sseClients.size >= MAX_SSE_CLIENTS) {
+          sendJson(res, 503, { ok: false, error: `实时事件订阅客户端数量已达上限（${MAX_SSE_CLIENTS}）。` });
+          return;
+        }
         res.writeHead(200, {
           'Content-Type': 'text/event-stream; charset=utf-8',
           'Cache-Control': 'no-cache, no-transform',
           Connection: 'keep-alive',
         });
-        res.write(`event: connected\ndata: ${JSON.stringify({ writable, at: new Date().toISOString() })}\n\n`);
+        let cleaned = false;
+        const cleanup = () => {
+          if (cleaned) return;
+          cleaned = true;
+          sseClients.delete(res);
+        };
         sseClients.add(res);
-        req.on('close', () => sseClients.delete(res));
+        req.once('close', cleanup);
+        req.once('aborted', cleanup);
+        res.once('close', cleanup);
+        res.once('error', cleanup);
+        try {
+          res.write(`event: connected\ndata: ${JSON.stringify({ writable, at: new Date().toISOString() })}\n\n`);
+        } catch {
+          cleanup();
+        }
         return;
       }
 
@@ -347,12 +411,20 @@ export async function createStudioServer({
         if (!record) { sendJson(res, 404, { ok: false, error: `未找到指定的技能族仓库：${repoId}` }); return; }
         const entry = await getRepoEntry(record, false);
         const { cleanPath, bytes } = await readRepoArchifyAsset(record, entry, assetRel);
-        res.writeHead(200, {
-          'Content-Type': MIME_TYPES[extname(cleanPath).toLowerCase()] || 'application/octet-stream',
+        const ext = extname(cleanPath).toLowerCase();
+        const isHtml = ext === '.html' || ext === '.htm';
+        const headers = {
+          'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
           'Cache-Control': 'no-cache',
           'X-Content-Type-Options': 'nosniff',
-        });
-        res.end(bytes);
+        };
+        let payload = bytes;
+        if (isHtml) {
+          headers['Content-Security-Policy'] = 'sandbox allow-scripts';
+          payload = Buffer.from(injectArchifyBridgeHtml(bytes.toString('utf8')), 'utf8');
+        }
+        res.writeHead(200, headers);
+        res.end(payload);
         return;
       }
 
@@ -444,8 +516,18 @@ export async function createStudioServer({
       }
 
       if (req.method === 'POST' || req.method === 'DELETE') {
-        if (!isSafeLoopbackOrigin(req)) {
-          sendJson(res, 403, { ok: false, error: '已拒绝非本地回环 Origin 来源的写请求。' });
+        const expectedPort = server.address()?.port ?? (Number.isInteger(port) && port > 0 ? port : null);
+        if (!isSafeLoopbackOrigin(req, expectedPort)) {
+          sendJson(res, 403, { ok: false, error: '已拒绝非同端口本地回环 Origin 来源的写请求。' });
+          return;
+        }
+        if (String(req.headers['x-studio-request'] ?? '').trim() !== '1') {
+          sendJson(res, 403, { ok: false, error: '写接口必须携带自定义请求头 X-Studio-Request: 1。' });
+          return;
+        }
+        const mediaType = String(req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+        if (mediaType !== 'application/json') {
+          sendJson(res, 415, { ok: false, error: '写接口仅接受 Content-Type: application/json。' });
           return;
         }
         if (!writable) {
@@ -503,10 +585,12 @@ export async function createStudioServer({
         }
 
         if (pathname === '/api/studio/runtime/register' || pathname === '/api/monitor/register') {
-          const catalog = await getCatalog(false);
-          const repoRoots = [...catalog.byId.values()].map(r => r.realPath);
-          const registered = await registerMonitorTarget(resolvedRoot, body, runtimeRegistryPath, {
-            allowedRoots: [resolvedRoot, ...repoRoots, ...allowedRoots, tmpdir()],
+          const registered = await enqueueWrite(async () => {
+            const catalog = await getCatalog(false);
+            const repoRoots = [...catalog.byId.values()].map(r => r.realPath);
+            return registerMonitorTarget(resolvedRoot, body, runtimeRegistryPath, {
+              allowedRoots: [resolvedRoot, ...repoRoots, ...allowedRoots, tmpdir()],
+            });
           });
           broadcast('runtime-change', { at: new Date().toISOString() });
           sendJson(res, 200, { ok: true, ...registered });
@@ -514,10 +598,12 @@ export async function createStudioServer({
         }
 
         if (pathname === '/api/studio/runtime/unregister' || (req.method === 'DELETE' && pathname === '/api/studio/runtime/target')) {
-          const catalog = await getCatalog(false);
-          const repoRoots = [...catalog.byId.values()].map(r => r.realPath);
-          const removed = await removeMonitorTarget(resolvedRoot, body?.id ?? body, runtimeRegistryPath, {
-            allowedRoots: [resolvedRoot, ...repoRoots, ...allowedRoots, tmpdir()],
+          const removed = await enqueueWrite(async () => {
+            const catalog = await getCatalog(false);
+            const repoRoots = [...catalog.byId.values()].map(r => r.realPath);
+            return removeMonitorTarget(resolvedRoot, body?.id ?? body, runtimeRegistryPath, {
+              allowedRoots: [resolvedRoot, ...repoRoots, ...allowedRoots, tmpdir()],
+            });
           });
           broadcast('runtime-change', { at: new Date().toISOString() });
           sendJson(res, 200, { ok: true, ...removed });
@@ -525,22 +611,28 @@ export async function createStudioServer({
         }
 
         if (pathname === '/api/studio/runtime/sandbox') {
-          if (sandboxHandle?.releaseLock) {
-            try { await sandboxHandle.releaseLock(); } catch {}
-          }
-          if (sandboxHandle?.sandboxRoot) {
-            try { await rm(sandboxHandle.sandboxRoot, { recursive: true, force: true }); } catch {}
-          }
-          sandboxHandle = await runSandboxExercise({ holdLock: true, simulateTimeout: true });
+          const sbxOut = await enqueueWrite(async () => {
+            if (sandboxHandle?.releaseLock) {
+              try { await sandboxHandle.releaseLock(); } catch {}
+            }
+            if (sandboxHandle?.sandboxRoot) {
+              try { await rm(sandboxHandle.sandboxRoot, { recursive: true, force: true }); } catch {}
+            }
+            sandboxHandle = await runSandboxExercise({ holdLock: true, simulateTimeout: true });
+            return { target: sandboxHandle.targetEntry, lockHeld: Boolean(sandboxHandle.isLockHeld?.()) };
+          });
           broadcast('runtime-change', { at: new Date().toISOString() });
-          sendJson(res, 200, { ok: true, target: sandboxHandle.targetEntry, lockHeld: Boolean(sandboxHandle.isLockHeld?.()) });
+          sendJson(res, 200, { ok: true, ...sbxOut });
           return;
         }
 
         if (pathname === '/api/studio/runtime/sandbox/release') {
-          const released = sandboxHandle?.releaseLock ? Boolean(await sandboxHandle.releaseLock()) : false;
+          const relOut = await enqueueWrite(async () => {
+            const released = sandboxHandle?.releaseLock ? Boolean(await sandboxHandle.releaseLock()) : false;
+            return { released, lockHeld: Boolean(sandboxHandle?.isLockHeld?.()) };
+          });
           broadcast('runtime-change', { at: new Date().toISOString(), action: 'sandbox-release' });
-          sendJson(res, 200, { ok: true, released, lockHeld: Boolean(sandboxHandle?.isLockHeld?.()) });
+          sendJson(res, 200, { ok: true, ...relOut });
           return;
         }
 

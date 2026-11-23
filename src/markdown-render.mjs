@@ -35,6 +35,23 @@ export function cleanInlinePlain(text) {
     .trim();
 }
 
+export function stripYamlFrontmatter(rawText) {
+  const normalized = String(rawText ?? '')
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n');
+  const match = /^(?:[ \t]*\n)*---[ \t]*\n(?:([\s\S]*?)\n)?---[ \t]*(?:\n([\s\S]*)|$)/.exec(normalized);
+  if (!match) return { frontmatterRaw: '', body: normalized, hasFrontmatter: false };
+  const fmRaw = match[1] || '';
+  if (fmRaw.trim() && !/^(?:#[^\n]*|[A-Za-z0-9_.-]+\s*:)/m.test(fmRaw.trimStart())) {
+    return { frontmatterRaw: '', body: normalized, hasFrontmatter: false };
+  }
+  return {
+    frontmatterRaw: fmRaw,
+    body: match[2] ?? '',
+    hasFrontmatter: true,
+  };
+}
+
 export function extractArtifactBrief({
   rawText = '',
   frontmatter = null,
@@ -43,21 +60,18 @@ export function extractArtifactBrief({
   typeLabel = '',
   path = '',
 } = {}) {
-  const normalized = sanitizePublicText(String(rawText ?? '')).replace(/\r\n/g, '\n');
-  let body = normalized;
+  const sanitized = sanitizePublicText(String(rawText ?? ''));
+  const stripped = stripYamlFrontmatter(sanitized);
+  const body = stripped.body;
   const fmParsed = { ...(frontmatter && typeof frontmatter === 'object' ? frontmatter : {}) };
-  const fmMatch = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(normalized);
-  if (fmMatch) {
-    body = fmMatch[2];
-    if (!frontmatter) {
-      for (const line of fmMatch[1].split('\n')) {
-        const kv = /^([A-Za-z0-9_.-]+)\s*:\s*(.+)$/.exec(line.trim());
-        if (!kv) continue;
-        const k = kv[1];
-        if (['__proto__', 'constructor', 'prototype'].includes(k)) continue;
-        const v = kv[2].trim().replace(/^["']|["']$/g, '');
-        if (v && !fmParsed[k]) fmParsed[k] = v;
-      }
+  if (stripped.hasFrontmatter && !frontmatter && stripped.frontmatterRaw) {
+    for (const line of stripped.frontmatterRaw.split('\n')) {
+      const kv = /^([A-Za-z0-9_.-]+)\s*:\s*(.+)$/.exec(line.trim());
+      if (!kv) continue;
+      const k = kv[1];
+      if (['__proto__', 'constructor', 'prototype'].includes(k)) continue;
+      const v = kv[2].trim().replace(/^["']|["']$/g, '');
+      if (v && !fmParsed[k]) fmParsed[k] = v;
     }
   }
 
@@ -316,7 +330,8 @@ export function renderMermaidOffline(rawLines) {
 }
 
 export function renderMarkdownToHtml(markdown, { idPrefix = 'sec', stripNavLine = false, heroMeta = null } = {}) {
-  const lines = String(markdown ?? '').replace(/\r\n/g, '\n').split('\n');
+  const { body: bodyWithoutFm } = stripYamlFrontmatter(markdown);
+  const lines = bodyWithoutFm.split('\n');
   const headings = [];
   const blocks = [];
   let i = 0;
@@ -336,6 +351,11 @@ export function renderMarkdownToHtml(markdown, { idPrefix = 'sec', stripNavLine 
     if (!trimmed) { i++; continue; }
     if (trimmed.startsWith('# ')) {
       if (!title) title = trimmed.slice(2).trim();
+      i++;
+      continue;
+    }
+    if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+      blocks.push('<hr class="st-prose-hr" />');
       i++;
       continue;
     }

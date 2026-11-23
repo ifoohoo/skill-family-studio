@@ -27,6 +27,7 @@ export const STUDIO_RUNTIME_REGISTRY_PATH = '.skill-family-studio/runtime-regist
 export const FOUNDATION_RUNTIME_REGISTRY_PATH = '.artifacts/runtime-monitor/registry.json';
 export const LEGACY_RUNTIME_REGISTRY_PATH = 'artifacts/runtime-monitor/registry.json';
 export const DEFAULT_LOCK_WARN_MS = 30_000;
+export const MAX_RUNTIME_FILE_BYTES = 8 * 1024 * 1024;
 
 const SENSITIVE_SEGMENTS = new Set(['.ssh', '.gnupg', '.aws', '.kube', '.docker', '.netrc', '.npmrc', '.pypirc', '.git-credentials', 'keychains']);
 const SKIP_SCAN_DIRS = new Set(['node_modules', '.git', 'dist', '.cache', '.venv', '__pycache__']);
@@ -107,7 +108,24 @@ function shortDisplayPath(fullPath) {
 }
 
 async function safeLstat(p) { try { return await lstat(p); } catch { return null; } }
-async function safeJson(p) { try { return { ok: true, value: JSON.parse(await readFile(p, 'utf8')) }; } catch { return { ok: false }; } }
+async function readTextBoundedSafe(p, maxBytes = MAX_RUNTIME_FILE_BYTES) {
+  try {
+    const st = await safeLstat(p);
+    if (!st || st.isSymbolicLink() || !st.isFile() || st.size > maxBytes) return null;
+    return await readFile(p, 'utf8');
+  } catch {
+    return null;
+  }
+}
+async function safeJson(p, maxBytes = MAX_RUNTIME_FILE_BYTES) {
+  try {
+    const raw = await readTextBoundedSafe(p, maxBytes);
+    if (raw === null) return { ok: false };
+    return { ok: true, value: JSON.parse(raw) };
+  } catch {
+    return { ok: false };
+  }
+}
 
 async function walkBounded(rootDir, maxDepth = 3, accept = null) {
   const out = [];
@@ -1155,12 +1173,15 @@ export async function collectStudioRuntimeView({
       lockPaths: (raw.lockPaths ?? []).map(p => resolveRuntimeTargetPath(base, p, { allowedRoots: effectiveRoots })).filter(Boolean),
     };
     let taskSummary = { format: 'none', total: 0, done: 0, running: 0, blocked: 0, todo: 0, percent: 0, tasks: [], milestones: [] };
-    if (resolved.planPath && (await safeLstat(resolved.planPath))?.isFile()) {
-      taskSummary = parsePlanSummary(
-        await readFile(resolved.planPath, 'utf8'),
-        extname(resolved.planPath).toLowerCase(),
-        resolved.title,
-      );
+    if (resolved.planPath) {
+      const planRaw = await readTextBoundedSafe(resolved.planPath);
+      if (planRaw !== null) {
+        taskSummary = parsePlanSummary(
+          planRaw,
+          extname(resolved.planPath).toLowerCase(),
+          resolved.title,
+        );
+      }
     }
     const [stateStore, locks, processes] = await Promise.all([
       inspectStateStoreReadOnly(resolved.stateDir, { lockWarnMs }),
@@ -1270,15 +1291,15 @@ async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHist
     let summary = ts.focusBanner?.detail || '';
     let liveMarkdown = '';
     if ((!summary || ts.total === 0) && t.planPath) {
-      try {
-        const raw = await readFile(t.planPath, 'utf8');
+      const raw = await readTextBoundedSafe(t.planPath);
+      if (raw !== null) {
         if (!summary) {
           summary = extractArtifactBrief({ rawText: raw, fallbackTitle: t.title, typeLabel: '活跃执行计划', path: t.planPath }).summary;
         }
         if (ts.total === 0) {
           liveMarkdown = sanitizePublicText(raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '')).trim().slice(0, 60000);
         }
-      } catch {}
+      }
     }
     if (!summary) summary = `${t.badge || '运行计划'}：共 ${ts.total} 步，已完成 ${ts.done} 步（${ts.percent}%）。`;
     const st = t.planPath ? await safeLstat(t.planPath) : null;
@@ -1331,24 +1352,12 @@ async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHist
     }
   }
 
-  for (const plannerCand of [join(base, '..', '..', 'planner', 'plans'), join(base, '..', 'planner', 'plans')]) {
-    const pst = await safeLstat(plannerCand);
-    if (!pst?.isDirectory()) continue;
-    let ents = [];
-    try { ents = await readdir(plannerCand, { withFileTypes: true }); } catch { ents = []; }
-    for (const ent of ents) {
-      if (!ent.isFile() || !ent.name.endsWith('.md')) continue;
-      if (!/(spec|roadmap|plan|wave)/i.test(ent.name)) continue;
-      await addCandidate(join(plannerCand, ent.name), null, '生态总规 (planner)', '历史规格计划');
-    }
-  }
-
   candidateFiles.sort((a, b) => b.mtimeMs - a.mtimeMs);
   let histCount = 0;
   for (const cand of candidateFiles) {
     if (histCount >= maxHistorical) break;
-    let raw = '';
-    try { raw = await readFile(cand.abs, 'utf8'); } catch { continue; }
+    const raw = await readTextBoundedSafe(cand.abs);
+    if (raw === null) continue;
     const ext = extname(cand.abs).toLowerCase();
     const stem = basename(cand.abs, ext);
     const ts = parsePlanSummary(raw, ext, stem);

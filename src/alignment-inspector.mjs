@@ -196,7 +196,7 @@ function isValidReceiptPayload(recJson) {
   return true;
 }
 
-async function inspectDownstreamLockFreshness(targetRepoReal, verifiedReceiptPath = null) {
+export async function inspectDownstreamLockFreshness(targetRepoReal, verifiedReceiptPath = null) {
   if (verifiedReceiptPath) {
     const recJson = await readJsonContainedSafe(targetRepoReal, verifiedReceiptPath);
     if (isValidReceiptPayload(recJson)) {
@@ -210,35 +210,51 @@ async function inspectDownstreamLockFreshness(targetRepoReal, verifiedReceiptPat
   if (locks.length === 0) {
     return { fresh: false, hasCodeLocks: false, mode: 'empty_code_locks', issueCount: 1 };
   }
+  const hasValidHashRef = ref => Boolean(
+    ref && typeof ref === 'object'
+    && typeof ref.path === 'string' && ref.path.trim()
+    && typeof ref.contentHash === 'string' && ref.contentHash.trim(),
+  );
+  const verifyHashRef = async ref => {
+    if (!hasValidHashRef(ref)) return false;
+    const h = await sha256FilePrefixed(targetRepoReal, ref.path);
+    return h === ref.contentHash;
+  };
   let staleCount = 0;
   let hasFreshImplements = false;
   let hasFreshVerifies = false;
   for (const lk of locks) {
-    let lockStale = false;
-    if (lk?.artifact?.path && lk?.artifact?.contentHash) {
-      const h = await sha256FilePrefixed(targetRepoReal, lk.artifact.path);
-      if (h !== lk.artifact.contentHash) lockStale = true;
-    }
-    if (lk?.source?.path && lk?.source?.contentHash) {
-      const h = await sha256FilePrefixed(targetRepoReal, lk.source.path);
-      if (h !== lk.source.contentHash) lockStale = true;
-    }
-    const verifiedBy = Array.isArray(lk?.verifiedBy) ? lk.verifiedBy : [];
-    for (const vb of verifiedBy) {
-      if (vb?.path && vb?.contentHash) {
-        const h = await sha256FilePrefixed(targetRepoReal, vb.path);
-        if (h !== vb.contentHash) lockStale = true;
-      }
-    }
-    if (lockStale) {
+    if (!lk || typeof lk !== 'object') {
       staleCount += 1;
       continue;
     }
-    if (lk?.kind === 'implements') {
+    if (!(await verifyHashRef(lk.artifact)) || !(await verifyHashRef(lk.source))) {
+      staleCount += 1;
+      continue;
+    }
+    if (lk.verifiedBy !== undefined && !Array.isArray(lk.verifiedBy)) {
+      staleCount += 1;
+      continue;
+    }
+    const verifiedBy = Array.isArray(lk.verifiedBy) ? lk.verifiedBy : [];
+    let verifiedByAllFresh = true;
+    for (const vb of verifiedBy) {
+      if (!(await verifyHashRef(vb))) {
+        verifiedByAllFresh = false;
+        break;
+      }
+    }
+    if (!verifiedByAllFresh) {
+      staleCount += 1;
+      continue;
+    }
+    if (lk.kind === 'implements') {
       hasFreshImplements = true;
       if (verifiedBy.length > 0) hasFreshVerifies = true;
-    } else if (lk?.kind === 'verifies') {
+    } else if (lk.kind === 'verifies') {
       hasFreshVerifies = true;
+    } else {
+      staleCount += 1;
     }
   }
   const hasCodeLocks = hasFreshImplements && hasFreshVerifies;
