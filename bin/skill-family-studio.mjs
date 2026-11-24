@@ -44,7 +44,7 @@ function printHelp() {
   --title <text>          init-workspace 工作区标题
   --role <role>           init-workspace 角色（portfolio | workspace）
   --reviews-file <path>   审阅台账保存路径（相对于 --root，默认 .skill-family-studio/reviews.json）
-  --registry <path>       运行态监控注册表路径（兼容 Foundation monitor 委托）
+  --registry <path>       运行态监控注册表路径（兼容 Foundation check monitor 委托）
   --lock-warn-ms <ms>     令牌锁持锁超时预警阈值毫秒数（默认 30000）
   --allowed-root <dir>    额外允许运行态监控读取的根目录（可重复传入）
   --workbench-url <url>   兼容传入的外部工作台关联地址

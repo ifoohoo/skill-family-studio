@@ -15,6 +15,12 @@ import {
 } from 'artifact-graph';
 import { readFileContained, resolveContained, writeFileAtomic } from 'skill-family-harness-node';
 import { parse as parseYaml } from 'yaml';
+import {
+  computeFoundationBaseline,
+  evaluateRepoFoundationAlignment,
+  readRepoTrackedDependencies,
+  resolveRepoTier,
+} from './alignment-inspector.mjs';
 import { DEFAULT_LAYERS } from './graph-layout.mjs';
 import { cleanInlinePlain, escapeHtml, extractArtifactBrief, renderMarkdownToHtml, sanitizePublicText, stripYamlFrontmatter } from './markdown-render.mjs';
 import { sortItemsForGuidedReview } from './review-state.mjs';
@@ -181,10 +187,25 @@ export async function loadStudioWorkspaceConfig(repoReal) {
     ? wsJson.collections
     : (Array.isArray(yamlStudio?.collections) ? yamlStudio.collections : []);
 
+  const repoTier = wsJson?.repoTier || yamlStudio?.repoTier || null;
+  const repoTierSource = wsJson?.repoTier
+    ? '.studio-workspace.json'
+    : (yamlStudio?.repoTier ? 'artifact-graph.config.yaml#studio' : null);
+  const repoTiers = (wsJson?.repoTiers && typeof wsJson.repoTiers === 'object' && !Array.isArray(wsJson.repoTiers))
+    ? wsJson.repoTiers
+    : ((yamlStudio?.repoTiers && typeof yamlStudio.repoTiers === 'object' && !Array.isArray(yamlStudio.repoTiers)) ? yamlStudio.repoTiers : {});
+  const groupTiers = (wsJson?.groupTiers && typeof wsJson.groupTiers === 'object' && !Array.isArray(wsJson.groupTiers))
+    ? wsJson.groupTiers
+    : ((yamlStudio?.groupTiers && typeof yamlStudio.groupTiers === 'object' && !Array.isArray(yamlStudio.groupTiers)) ? yamlStudio.groupTiers : {});
+
   return {
     hasConfig: Boolean(wsJson || yamlStudio),
     role: wsJson?.role || yamlStudio?.role || null,
     title: wsJson?.title || yamlStudio?.title || null,
+    repoTier,
+    repoTierSource,
+    repoTiers,
+    groupTiers,
     scanRoots,
     groupLabels: mergedLabels,
     collections: collections.filter(c => c && typeof c === 'object' && typeof c.kind === 'string'),
@@ -573,6 +594,7 @@ export async function readQuickRepoMeta(repoReal) {
 
   const studioCfg = await loadStudioWorkspaceConfig(repoReal);
   if (studioCfg.title) metaSources.push({ field: '工作区标题', sourceFile: '.studio-workspace.json / studio.title', active: true });
+  const declaredDeps = await readRepoTrackedDependencies(repoReal);
   const hasPortfolio = await exists(join(repoReal, 'artifacts/portfolio-allocations.json'));
   const hasUpstream = await exists(join(repoReal, 'artifacts/upstream-bindings.json'));
   const repoRole = (hasPortfolio || studioCfg.role === 'portfolio')
@@ -669,6 +691,7 @@ export async function readQuickRepoMeta(repoReal) {
     readmeDesc,
     metaSources,
     version,
+    declaredDeps,
     studioCfg,
     repoRole,
     repoRoleLabel,
@@ -745,6 +768,7 @@ export async function discoverStudioRepos(workspaceRoot, { scanRoots, env } = {}
 
   const rootCfg = await loadStudioWorkspaceConfig(resolve(workspaceRoot)).catch(() => ({ groupLabels: {} }));
   const metas = await Promise.all(found.map(realPath => readQuickRepoMeta(realPath)));
+  const foundationBaseline = await computeFoundationBaseline(metas.map(m => m.declaredDeps));
 
   // 合并工作区及发现的高阶仓提供的自然分组标签（启动仓声明优先）
   const mergedGroupLabels = {};
@@ -786,6 +810,23 @@ export async function discoverStudioRepos(workspaceRoot, { scanRoots, env } = {}
       sources.unshift({ field: '自定义覆写说明', sourceFile: overrides.storagePath, active: true });
     }
 
+    const tierInfo = await resolveRepoTier(realPath, {
+      repoId: id,
+      repoName: name,
+      packageName: meta.pkgName,
+      group,
+      repoRole: meta.repoRole,
+      studioCfg: meta.studioCfg,
+      rootWorkspaceCfg: rootCfg,
+    });
+    const foundationAlignment = evaluateRepoFoundationAlignment({
+      repoTier: tierInfo.repoTier,
+      repoTierLabel: tierInfo.repoTierLabel,
+      repoTierSource: tierInfo.source,
+      declaredDeps: meta.declaredDeps,
+      baseline: foundationBaseline,
+    });
+
     records.push({
       id,
       name,
@@ -804,6 +845,10 @@ export async function discoverStudioRepos(workspaceRoot, { scanRoots, env } = {}
       overrideStoragePath: overrides.storagePath,
       repoRole: meta.repoRole,
       repoRoleLabel: meta.repoRoleLabel,
+      repoTier: tierInfo.repoTier,
+      repoTierLabel: tierInfo.repoTierLabel,
+      repoTierSource: tierInfo.source,
+      foundationAlignment,
       hasStudioConfig: Boolean(meta.studioCfg?.hasConfig),
       isPrimary: primaryReal !== null && realPath === primaryReal,
       pathDigest: createHash('sha256').update(realPath, 'utf8').digest('hex').slice(0, 16),
@@ -831,6 +876,7 @@ export async function discoverStudioRepos(workspaceRoot, { scanRoots, env } = {}
     repos: publicRepos,
     byId: new Map(records.map(r => [r.id, r])),
     groupLabels: mergedGroupLabels,
+    foundationBaseline,
   };
 }
 
@@ -1527,6 +1573,9 @@ export async function inspectProjectRepo(record, emptyScanDir) {
       groupLabel: record.groupLabel,
       repoRole: record.repoRole,
       repoRoleLabel: record.repoRoleLabel,
+      repoTier: record.repoTier,
+      repoTierLabel: record.repoTierLabel,
+      foundationAlignment: record.foundationAlignment,
       configStatus,
       configMessage,
       counts: {

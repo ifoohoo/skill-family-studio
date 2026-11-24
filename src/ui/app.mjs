@@ -401,6 +401,21 @@ function openRepoMetaModal(repo) {
     srcBox.append(el('p', '当前使用仓库目录默认名称，可在下方补全中文说明。', 'st-muted-xs'));
   }
 
+  if (repo.foundationAlignment) {
+    const fa = repo.foundationAlignment;
+    const faRow = el('div', null, 'st-provenance-card');
+    const detailTxt = (fa.laggingPackages || []).length > 0
+      ? fa.laggingPackages.map(p => `${p.name} ${p.current} → ${p.target}`).join('；')
+      : fa.headline;
+    const leftMeta = el('div');
+    leftMeta.append(
+      el('div', `${fa.repoTierLabel || '业务仓'} · ${detailTxt}`, 'st-tabular'),
+      el('div', `分层来源：${fa.repoTierSource || '默认'}`, 'st-muted-xs'),
+    );
+    faRow.append(leftMeta, el('span', fa.badgeLabel || '底座对齐状态', `st-badge st-badge-${fa.badgeTone || 'zinc'}`));
+    srcBox.append(faRow);
+  }
+
   const mkField = (lbl, val, ph) => {
     const box = el('label', null, 'st-field');
     box.append(el('span', lbl, 'st-field-label'));
@@ -532,6 +547,9 @@ function renderRepoPopover() {
       }, { compact: true, showPath: false, maxSummaryChars: 86 });
       const badges = el('div', null, 'st-graph-controls');
       badges.append(el('span', r.repoRoleLabel || '单项目仓', `st-badge ${roleTone}`), el('span', `已审 ${p.decided}/${p.total}`, 'st-badge st-badge-indigo'));
+      if (r.foundationAlignment && ['support_lagging', 'business_optional_upgrade'].includes(r.foundationAlignment.status)) {
+        badges.append(el('span', r.foundationAlignment.badgeLabel, `st-badge st-badge-${r.foundationAlignment.badgeTone || 'zinc'}`));
+      }
       head.append(briefNode, badges);
 
       const foot = el('div', null, 'st-repo-opt-head');
@@ -2003,7 +2021,8 @@ function renderAlignmentOverview(host) {
       ['all', `全部 (${sum.total ?? 0})`],
       ['alerts', `🔴 双向告警 (${alertTotal})`],
       ['in_progress', `⏳ 推进/部分 (${(sum.allocatedInProgress ?? 0) + (sum.partiallyAllocated ?? 0)})`],
-      ['verified', `🟢 已验证满足 (${sum.verifiedSatisfied ?? 0})`],
+      ['traceability_locked', `🔗 双锁齐备 (${sum.traceabilityLocked ?? 0})`],
+      ['verified', `✅ 已验证满足 (${sum.verifiedSatisfied ?? 0})`],
       ['not_applicable', `⚪ 按处置不计 (${sum.notApplicable ?? 0})`],
     ]) {
       const b = el('button', fLabel, `st-btn${state.alignFilter === fKey ? ' is-active' : ''}`);
@@ -2045,6 +2064,7 @@ function renderAlignmentOverview(host) {
       const rows = (pf.items || []).filter(item => {
         if (state.alignFilter === 'alerts' && !(item.issues || []).some(i => ['UNALLOCATED_ACTIVE_DEMAND', 'SOURCE_ARTIFACT_MISSING', 'TARGET_MISSING', 'UNRECIPROCATED_ALLOCATION', 'UPSTREAM_DESIGN_CHANGED', 'DOWNSTREAM_DESIGN_EVOLVED'].includes(i.code))) return false;
         if (state.alignFilter === 'in_progress' && !['allocated_in_progress', 'partially_allocated'].includes(item.computedSatisfaction)) return false;
+        if (state.alignFilter === 'traceability_locked' && item.computedSatisfaction !== 'traceability_locked') return false;
         if (state.alignFilter === 'verified' && item.computedSatisfaction !== 'verified_satisfied') return false;
         if (state.alignFilter === 'not_applicable' && item.computedSatisfaction !== 'not_applicable') return false;
         if (q) {
@@ -2106,7 +2126,13 @@ function renderAlignmentOverview(host) {
           } else {
             allocHead.append(el('span', `${alRowItem.targetRepoName} · ${alRowItem.targetTitle || alRowItem.targetUid}`, 'st-badge st-badge-zinc'));
           }
-          allocHead.append(el('span', alRowItem.codeLocksFresh ? '双锁新鲜' : '待补代码/测试锁', `st-badge ${alRowItem.codeLocksFresh ? 'st-badge-emerald' : 'st-badge-amber'}`));
+          const lockBadgeText = (alRowItem.codeLocksFresh && alRowItem.executionVerified)
+            ? '✅ 实测收据+双锁'
+            : (alRowItem.codeLocksFresh ? '🔗 追溯双锁齐备' : '待补代码/测试锁');
+          const lockBadgeTone = (alRowItem.codeLocksFresh && alRowItem.executionVerified)
+            ? 'st-badge-emerald'
+            : (alRowItem.codeLocksFresh ? 'st-badge-indigo' : 'st-badge-amber');
+          allocHead.append(el('span', lockBadgeText, `st-badge ${lockBadgeTone}`));
           aRow.append(allocHead);
           if (alRowItem.targetSummary) {
             aRow.append(renderEntityBrief(document, {
@@ -2285,6 +2311,22 @@ function renderAlignmentOverview(host) {
   } else if (ic.healthy) {
     codeCard.append(el('p', '🟢 本仓核心源码、SKILL.md 入口与测试文件均已完成双向版本锁绑定且哈希新鲜。', 'st-muted-xs'));
   }
+
+  const fa = al.foundationAlignment;
+  if (fa && fa.status !== 'not_applicable') {
+    const fBox = el('div', null, 'st-provenance-card');
+    fBox.style.marginTop = '12px';
+    const leftF = el('div');
+    const titleLine = el('div', null, 'st-graph-controls');
+    titleLine.append(
+      el('strong', `底座依赖协同体检 · ${fa.repoTierLabel || '业务仓'}`),
+      infoTrigger('foundation:alignment', document),
+    );
+    leftF.append(titleLine, el('div', fa.headline, 'st-muted-xs'));
+    fBox.append(leftF, el('span', fa.badgeLabel, `st-badge st-badge-${fa.badgeTone || 'zinc'}`));
+    codeCard.append(fBox);
+  }
+
   wrap.append(codeCard);
   host.append(wrap);
 }

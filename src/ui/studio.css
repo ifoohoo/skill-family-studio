@@ -510,7 +510,7 @@ html, body {
   margin: 0 auto;
   padding: 20px 28px;
 }
-.st-prose-heading { margin-top: 1.3em; margin-bottom: 0.45em; display: flex; align-items: center; gap: 8px; }
+.st-prose-heading { margin-top: 1.3em; margin-bottom: 0.45em; display: flex; align-items: center; gap: 8px; scroll-margin-top: 96px; }
 .st-prose-heading.is-anchor-hit {
   background: var(--st-accent-soft);
   padding: 4px 10px;

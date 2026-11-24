@@ -49,11 +49,16 @@ export {
 } from './ecosystem.mjs';
 
 export {
+  computeFoundationBaseline,
+  evaluateRepoFoundationAlignment,
   globToRegExp,
+  inspectDownstreamExecutionReceipt,
+  inspectDownstreamLockFreshness,
   inspectInternalCodeLocks,
   inspectPortfolioAllocations,
   inspectRepoAlignment,
   inspectUpstreamBindings,
+  resolveRepoTier,
   sha256FilePrefixed,
 } from './alignment-inspector.mjs';
 

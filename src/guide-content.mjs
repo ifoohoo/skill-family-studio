@@ -47,7 +47,7 @@ export const STUDIO_GUIDE_MODEL = Object.freeze({
         {
           step: 1,
           title: '在顶栏左上角确认、添加或编辑当前项目',
-          detail: '点击左上角「当前项目：<仓库名> ▾」展开列表，可用顶部「输入仓库名、分组或说明过滤…」筛选并点「＋ 添加本地项目」运行期零侵入纳入新仓库；点顶栏或列表中的「✎ 说明与来源」可核对项目说明来自 package.json#description 还是 README.md 首段，并支持「💾 保存自定义说明」「恢复默认来源」或「从列表移除该项目」；点空白处或按 Escape 收起。紧邻其右是「[角色徽章] ⓘ」和「[版本锁状态] ⓘ」。',
+          detail: '点击左上角「当前项目：<仓库名> ▾」展开列表，可用顶部「输入仓库名、分组或说明过滤…」筛选并点「＋ 添加本地项目」运行期零侵入纳入新仓库，同时查看各仓库分层与底座版本对齐徽章（「🟠 支撑仓底座待同批拉齐」或「ℹ️ 可选底座新版本」）；点顶栏或列表中的「✎ 说明与来源」可核对项目说明来自 package.json#description 还是 README.md 首段，并支持「💾 保存自定义说明」「恢复默认来源」或「从列表移除该项目」；点空白处或按 Escape 收起。紧邻其右是「[角色徽章] ⓘ」和「[版本锁状态] ⓘ」。',
           actionId: 'open-repo-switcher',
           actionLabel: '打开项目切换器 ▾',
         },
@@ -181,8 +181,13 @@ export const STUDIO_GUIDE_MODEL = Object.freeze({
     satisfactionStates: [
       {
         code: 'verified_satisfied',
-        badge: '🟢 已验证满足',
-        meaning: '下游全部承接目标存在、上下游摘要双向一致，且下游仓库的 traceability-version-lock.json 同时具备新鲜的 implements 代码锁与 verifies 测试验证锁（只读冻结仓含有效的 verifiedReceiptPath 验证收据）。绝不靠手工台账声称满足。',
+        badge: '✅ 已验证满足',
+        meaning: '下游全部承接目标存在、上下游摘要双向一致、traceability-version-lock.json 具备新鲜 implements + verifies 双锁，且同时检测到全量通过的测试执行收据（.release-skill/testing/requirements.json 对应的 .runs/release-testing/results.json 等 sft 实测回执，或只读冻结仓有效 verifiedReceiptPath）。绝不把静态有锁误当实测已过。',
+      },
+      {
+        code: 'traceability_locked',
+        badge: '🔗 追溯双锁齐备',
+        meaning: '下游目标文件存在、上下游摘要双向一致，且具备新鲜的 implements 代码锁与非空 verifies 验证锁；但尚无真实测试执行通过收据，仅代表静态追溯锁齐备，等待跑通 sft / 发布测试后升为「✅ 已验证满足」。',
       },
       {
         code: 'partially_allocated',
@@ -357,7 +362,8 @@ export function renderUserGuideMarkdown() {
     'flowchart LR',
     '  P["高阶规划仓<br/>(portfolio-allocations.json)"] <-->|"sourceDigest / targetDigest 双向校对"| S["子仓详细设计<br/>(upstream-bindings.json)"]',
     '  S <-->|"implements 代码锁 + verifies 验证锁"| C["真实源码与测试<br/>(traceability-version-lock.json)"]',
-    '  C -->|"同时新鲜才判定已满足"| V["🟢 verified_satisfied"]',
+    '  C -->|"仅静态双锁齐备"| T["🔗 traceability_locked"]',
+    '  T -->|"叠加实测通过收据"| V["✅ verified_satisfied"]',
     '```',
     '',
     '| 满足概况徽章 | 机器派生依据与业务含义 |',

@@ -49,9 +49,14 @@ export const GLOSSARY = Object.freeze({
 
   // 逐项审阅与对齐
   'sat:verified_satisfied': {
-    title: '🟢 已验证满足 (verified_satisfied)',
-    meaning: '最高严格等级的机器派生状态，绝不靠手工台账声称满足。',
-    rule: '同时满足：① 下游目标文件存在；② 上下游摘要双向一致无漂移；③ 下游具备新鲜的 implements 代码锁与 verifies 测试锁（只读仓需含有效验证收据）。',
+    title: '✅ 已验证满足 (verified_satisfied)',
+    meaning: '最高严格等级的机器派生状态：除静态双向摘要一致、implements/verifies 双锁新鲜外，还已核实真实测试执行通过收据（或上游引擎/只读冻结仓有效 verifiedReceiptPath 验收回执）。',
+    rule: '绝不把仅静态有锁当成实测通过；若缺少实测运行通过收据，系统最高只显示「🔗 追溯双锁齐备」。',
+  },
+  'sat:traceability_locked': {
+    title: '🔗 追溯双锁齐备 (traceability_locked)',
+    meaning: '下游目标文件存在、上下游双向摘要一致，且 traceability-version-lock.json 中 implements 代码锁与非空 verifies 验证锁均完整且 SHA-256 新鲜；但当前尚未检测到全量通过的测试运行收据。',
+    rule: '诚实边界：表示静态代码/测试追溯链已齐备，尚不等于“运行态实测已全部通过”，跑通发布测试或 sft 收据后将自动晋升为「✅ 已验证满足」。',
   },
   'sat:partially_allocated': {
     title: '🔵 部分覆盖 (partially_allocated)',
@@ -116,12 +121,17 @@ export const GLOSSARY = Object.freeze({
   'col:alignDisposition': {
     title: '业务处置与承接去向规则',
     meaning: '定义高阶条目在本轮的去向：已拆派 (allocated) 表示已指派给下游技能族仓；暂缓 (deferred)、已合并 (merged)、已废弃 (abandoned) 表示不计入当前交付欠账。',
-    rule: '每条拆派胶囊旁的绿/橙徽章分别表示目标仓已补齐新鲜代码/测试双锁，或尚待补锁。',
+    rule: '每条拆派胶囊旁的徽章区分三态：「✅ 实测收据+双锁」「🔗 追溯双锁齐备（缺实测收据）」「待补代码/测试锁」。',
   },
   'col:alignSatisfaction': {
     title: '实际满足度（机器派生口径）',
-    meaning: '严格由下游目标文件存在性、上下游摘要互锁与双锁新鲜度派生，绝不信任人工口头填表：',
-    rule: '🟢 已验证满足：目标存在 + 双向一致 + 含新鲜 implements/verifies 双锁；🔵 部分覆盖：仍有 remainingScope 未拆；⏳ 推进中：已派单但未补齐验证双锁；⚪ 不计满足：已按处置结案；🔴 漏拆：未派单。',
+    meaning: '严格由下游目标文件存在性、上下游摘要互锁、双锁新鲜度与实测运行收据分层派生，绝不把静态有锁误当实测已过：',
+    rule: '✅ 已验证满足：双锁齐备且含实测通过收据（或只读有效回执）；🔗 追溯双锁齐备：目标存在 + 双向一致 + 新鲜 implements/verifies 双锁（尚无实测收据）；🔵 部分覆盖：仍有 remainingScope 未拆；⏳ 推进中：未补齐双锁；⚪ 不计满足：已按处置结案；🔴 漏拆：未派单。',
+  },
+  'foundation:alignment': {
+    title: '仓库分层 (repoTier) 与底座版本对齐',
+    meaning: '区分底层支撑仓 (support) 与业务仓 (business)，实时核对 package.json 锁定的 artifact-graph 与 Foundation（contracts / harness-node / engineering-kit）版本是否跟上工作区最新基线。',
+    rule: '🟠 支撑仓底座待同批拉齐：支撑仓存在跨代落后，需在本批协同拉齐；ℹ️ 可选底座新版本：业务仓存在可选新版底座，不强制跨仓同批冻结升级。',
   },
   'col:alignHealth': {
     title: '双向对齐结论与漂移诊断',

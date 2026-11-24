@@ -202,8 +202,8 @@ export function buildTriLayerLockSvg(doc = document) {
       x: 24, y: 184, width: 872, height: 64, rx: 10,
       fill: 'var(--st-subtle)', stroke: 'var(--st-border-strong)', 'stroke-width': 1.4,
     }),
-    svgNode(doc, 'text', { x: 460, y: 209, 'text-anchor': 'middle', fill: 'var(--st-fg)', 'font-size': 13, 'font-weight': 700 },
-      '🟢 只有三层同时满足「目标文件存在 + 上下游摘要双向无漂移 + 同时具备新鲜的 implements 与 verifies 锁」，才机械派生为「已验证满足」'),
+    svgNode(doc, 'text', { x: 460, y: 209, 'text-anchor': 'middle', fill: 'var(--st-fg)', 'font-size': 12.5, 'font-weight': 700 },
+      '🔗 仅静态双锁齐备且摘要一致 → 「追溯双锁齐备」 · ✅ 叠加真实测试运行通过收据（或只读有效回执） → 晋升「已验证满足」'),
     svgNode(doc, 'text', { x: 460, y: 232, 'text-anchor': 'middle', fill: 'var(--st-fg-muted)', 'font-size': 11.5 },
       '高阶改动 → UPSTREAM_DESIGN_CHANGED · 详设演进 → DOWNSTREAM_DESIGN_EVOLVED · 漏加 @feature 注解 → UNCLAIMED_IMPLEMENTATION_ENTRY'),
   );

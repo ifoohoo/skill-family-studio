@@ -9,12 +9,12 @@
     "relPath": ".agents/skills"
   },
   "sourceClosure": {
-    "digest": "79de22ac5e9683b7ec7e4d27a6adfc9ba263b2676c3f68036094d82f00e923d0",
+    "digest": "2ba4528ac911221195c386d46c37a622c404e717028c3c5c957086d1af1f0d7a",
     "members": [
       {
         "sourcePath": "skill-family-studio/SKILL.md",
-        "sha256": "89a100020f12312362f893afadda4ec53663a843ef56528c36ee5dede357cc16",
-        "bytes": 6272
+        "sha256": "48e54e37f99e915ed4603ef4b4d98d8a6fd84cfdd69734cf2a762f3d8be9f3ff",
+        "bytes": 6839
       }
     ]
   },
@@ -22,9 +22,9 @@
     {
       "sourcePath": "skill-family-studio/SKILL.md",
       "target": ".agents/skills/skill-family-studio/SKILL.md",
-      "sha256": "89a100020f12312362f893afadda4ec53663a843ef56528c36ee5dede357cc16",
-      "bytes": 6272
+      "sha256": "48e54e37f99e915ed4603ef4b4d98d8a6fd84cfdd69734cf2a762f3d8be9f3ff",
+      "bytes": 6839
     }
   ],
-  "digest": "05814051cf3d78784812fa105f3518ed83008319c99bc276dbcb089b2abe8330"
+  "digest": "28dd826a7af5f8163401115e484efcdf96d5adf18af14e029116e1c3e51c737b"
 }

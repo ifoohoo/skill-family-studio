@@ -66,6 +66,7 @@ npx skill-family-studio inspect-setup --root <当前项目绝对路径> --json
 ## 三、职责与安全红线
 
 - **只读受审仓，零侵入落盘**：批注与审阅结论、运行期添加项目/说明覆写以及网页挂载运行源统一写入工作台启动根目录的 `.skill-family-studio/`（`reviews.json`、`workspace-projects.json`、`runtime-registry.json`）；除用户确认生成 `.studio-workspace.json` 外，绝不修改受审仓任何 Git 跟踪文件。
+- **对齐口径与工程 CLI 规范**：总览表严格区分「🔗 追溯双锁齐备 (`traceability_locked`)」与「✅ 已验证满足 (`verified_satisfied`)」，并在切换器与体检面板区分 `support` 支撑仓（「🟠 支撑仓底座待同批拉齐」）与 `business` 业务仓（「ℹ️ 可选底座新版本」）。如需调用 `skill-family-engineering-kit` 做底层体检或运行态委托，统一使用标准四顶层命令子动作（如 `skill-family-kit check monitor`、`check prereqs`、`check deps`），不使用旧版裸别名。
 - **回环纯离线与沙箱脱敏**：服务仅监听 `127.0.0.1`，写接口强制校验同端口回环 `Origin` 与 `X-Studio-Request: 1`；内嵌 Archify 图采用无 `allow-same-origin` 的同源沙箱隔离（`sandbox="allow-scripts"` + `postMessage`）；多智能体会话编队监控严格只读、有限文件读取并脱敏敏感目录与现代密钥。
 - **不越权 Git 写操作**：本技能不执行 `git commit`、`git push`、`git tag` 或包发布。
 

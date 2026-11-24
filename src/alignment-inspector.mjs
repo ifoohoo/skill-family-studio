@@ -1,12 +1,268 @@
 // @feature STU005
 
 import { createHash } from 'node:crypto';
-import { lstat, readdir, realpath } from 'node:fs/promises';
+import { lstat, readdir, readFile, realpath } from 'node:fs/promises';
 import { basename, extname, join, relative, resolve } from 'node:path';
 import { VERSION_LOCK_PATH } from 'artifact-graph';
 import { readFileContained, resolveContained } from 'skill-family-harness-node';
 import { parse as parseYaml } from 'yaml';
 import { cleanInlinePlain, extractArtifactBrief, sanitizePublicText } from './markdown-render.mjs';
+
+export const TRACKED_FOUNDATION_PACKAGES = Object.freeze([
+  'artifact-graph',
+  'skill-family-contracts',
+  'skill-family-harness-node',
+  'skill-family-engineering-kit',
+]);
+
+export const DEFAULT_SUPPORT_REPO_NAMES = Object.freeze(new Set([
+  'skill-family-foundation-workspace',
+  'skill-family-studio-workspace',
+  'skill-family-studio',
+  'skill-family-test-workspace',
+  'skill-family-hub-workspace',
+  'skill-family-doc-render-workspace',
+  'humanize-rewrite-workspace',
+  'skill-failure-auditor-workspace',
+  'skill-family-audit-workspace',
+  'release-skill',
+  'artifact-graph',
+  'agent-method-registry',
+  'user-story-workspace',
+  'flow-architect',
+  'cost-modeler-workspace',
+  'e2e-test',
+  'artifact-skill-set-workspace',
+]));
+
+const STUDIO_PKG_JSON_URL = new URL('../package.json', import.meta.url);
+let cachedStudioFloorPromise = null;
+
+export function parseSemverTuple(rawSpec) {
+  const s = String(rawSpec ?? '').trim();
+  if (!s || /^(?:workspace|link|npm):/i.test(s) && !/\d+\.\d+\.\d+/.test(s)) return null;
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(s);
+  if (!m) return null;
+  return [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+
+export function compareSemverTuple(a, b) {
+  if (!a && !b) return 0;
+  if (!a) return -1;
+  if (!b) return 1;
+  for (let i = 0; i < 3; i += 1) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return 0;
+}
+
+export function formatSemverTuple(t) {
+  return Array.isArray(t) && t.length === 3 ? `${t[0]}.${t[1]}.${t[2]}` : null;
+}
+
+async function getStudioDefaultFloor() {
+  if (!cachedStudioFloorPromise) {
+    cachedStudioFloorPromise = (async () => {
+      const floor = {};
+      try {
+        const pkg = JSON.parse(await readFile(STUDIO_PKG_JSON_URL, 'utf8'));
+        const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+        for (const name of TRACKED_FOUNDATION_PACKAGES) {
+          const parsed = parseSemverTuple(deps[name]);
+          if (parsed) floor[name] = formatSemverTuple(parsed);
+        }
+      } catch {}
+      return floor;
+    })();
+  }
+  return cachedStudioFloorPromise;
+}
+
+export async function readRepoTrackedDependencies(repoReal) {
+  const pkg = await readJsonContainedSafe(repoReal, 'package.json');
+  if (!pkg) return {};
+  const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+  const out = {};
+  for (const name of TRACKED_FOUNDATION_PACKAGES) {
+    if (typeof deps[name] === 'string' && deps[name].trim()) {
+      const parsed = parseSemverTuple(deps[name]);
+      out[name] = {
+        rawSpec: deps[name].trim(),
+        version: formatSemverTuple(parsed),
+        tuple: parsed,
+      };
+    }
+  }
+  return out;
+}
+
+export async function resolveRepoTier(repoReal, {
+  repoId = '',
+  repoName = '',
+  packageName = '',
+  group = '',
+  repoRole = 'standalone',
+  studioCfg = null,
+  rootWorkspaceCfg = null,
+} = {}) {
+  const normalizeTier = raw => {
+    const clean = String(raw ?? '').trim().toLowerCase();
+    if (clean === 'support' || clean === 'business') return clean;
+    return null;
+  };
+
+  const manifest = await readJsonContainedSafe(repoReal, 'skill-family.project-manifest.json');
+  const manifestTier = normalizeTier(manifest?.repoTier ?? manifest?.project?.repoTier);
+  if (manifestTier) {
+    return { repoTier: manifestTier, repoTierLabel: manifestTier === 'support' ? '支撑仓 (support)' : '业务仓 (business)', source: 'skill-family.project-manifest.json' };
+  }
+
+  const rootMapTier = normalizeTier(
+    (repoId && rootWorkspaceCfg?.repoTiers?.[repoId])
+    ?? (repoName && rootWorkspaceCfg?.repoTiers?.[repoName])
+    ?? (group && rootWorkspaceCfg?.groupTiers?.[group]),
+  );
+  if (rootMapTier) {
+    return { repoTier: rootMapTier, repoTierLabel: rootMapTier === 'support' ? '支撑仓 (support)' : '业务仓 (business)', source: '.studio-workspace.json#repoTiers' };
+  }
+
+  const localTier = normalizeTier(studioCfg?.repoTier);
+  if (localTier) {
+    return {
+      repoTier: localTier,
+      repoTierLabel: localTier === 'support' ? '支撑仓 (support)' : '业务仓 (business)',
+      source: studioCfg?.repoTierSource || '.studio-workspace.json / artifact-graph.config.yaml#studio',
+    };
+  }
+
+  if (repoRole !== 'portfolio' && (
+    DEFAULT_SUPPORT_REPO_NAMES.has(repoName)
+    || DEFAULT_SUPPORT_REPO_NAMES.has(packageName)
+  )) {
+    return { repoTier: 'support', repoTierLabel: '支撑仓 (support)', source: 'default-support-catalog' };
+  }
+
+  return { repoTier: 'business', repoTierLabel: '业务仓 (business)', source: 'default-business' };
+}
+
+export async function computeFoundationBaseline(repoDepsList = []) {
+  const floor = await getStudioDefaultFloor();
+  const bestTuples = {};
+  for (const [name, ver] of Object.entries(floor)) {
+    const parsed = parseSemverTuple(ver);
+    if (parsed) bestTuples[name] = parsed;
+  }
+  for (const declared of repoDepsList) {
+    if (!declared || typeof declared !== 'object') continue;
+    for (const name of TRACKED_FOUNDATION_PACKAGES) {
+      const tuple = declared[name]?.tuple || parseSemverTuple(declared[name]?.rawSpec || declared[name]);
+      if (tuple && (!bestTuples[name] || compareSemverTuple(tuple, bestTuples[name]) > 0)) {
+        bestTuples[name] = tuple;
+      }
+    }
+  }
+  const baseline = {};
+  for (const [name, tuple] of Object.entries(bestTuples)) {
+    baseline[name] = formatSemverTuple(tuple);
+  }
+  return baseline;
+}
+
+export function evaluateRepoFoundationAlignment({
+  repoTier = 'business',
+  repoTierLabel = null,
+  repoTierSource = 'default-business',
+  declaredDeps = {},
+  baseline = {},
+} = {}) {
+  const effectiveTier = repoTier === 'support' ? 'support' : 'business';
+  const effectiveTierLabel = repoTierLabel || (effectiveTier === 'support' ? '支撑仓 (support)' : '业务仓 (business)');
+  const declared = {};
+  const laggingPackages = [];
+
+  for (const name of TRACKED_FOUNDATION_PACKAGES) {
+    const entry = declaredDeps[name];
+    if (!entry) continue;
+    const curTuple = entry.tuple || parseSemverTuple(entry.version || entry.rawSpec || entry);
+    const curVersion = formatSemverTuple(curTuple);
+    const targetVersion = baseline[name] || null;
+    const targetTuple = parseSemverTuple(targetVersion);
+    const lagging = Boolean(curTuple && targetTuple && compareSemverTuple(curTuple, targetTuple) < 0);
+    declared[name] = {
+      rawSpec: entry.rawSpec || curVersion || String(entry),
+      version: curVersion,
+      baselineVersion: targetVersion,
+      lagging,
+    };
+    if (lagging) {
+      laggingPackages.push({
+        name,
+        current: curVersion,
+        target: targetVersion,
+        rawSpec: entry.rawSpec || curVersion,
+      });
+    }
+  }
+
+  const trackedCount = Object.keys(declared).length;
+  if (trackedCount === 0) {
+    return {
+      repoTier: effectiveTier,
+      repoTierLabel: effectiveTierLabel,
+      repoTierSource,
+      status: 'not_applicable',
+      badgeLabel: '⚪ 未锁定底座包',
+      badgeTone: 'zinc',
+      headline: '当前仓库未声明 Foundation 或 artifact-graph 依赖包。',
+      baseline,
+      declared,
+      laggingPackages,
+    };
+  }
+
+  if (laggingPackages.length > 0) {
+    const summaryList = laggingPackages.map(p => `${p.name} ${p.current} → ${p.target}`).join('；');
+    if (effectiveTier === 'support') {
+      return {
+        repoTier: effectiveTier,
+        repoTierLabel: effectiveTierLabel,
+        repoTierSource,
+        status: 'support_lagging',
+        badgeLabel: '🟠 支撑仓底座待同批拉齐',
+        badgeTone: 'amber',
+        headline: `支撑仓底座跨代落后，需在本批协同拉齐：${summaryList}`,
+        baseline,
+        declared,
+        laggingPackages,
+      };
+    }
+    return {
+      repoTier: effectiveTier,
+      repoTierLabel: effectiveTierLabel,
+      repoTierSource,
+      status: 'business_optional_upgrade',
+      badgeLabel: 'ℹ️ 可选底座新版本',
+      badgeTone: 'indigo',
+      headline: `业务仓存在可选新版底座：${summaryList}（非阻断，可按节奏升级）`,
+      baseline,
+      declared,
+      laggingPackages,
+    };
+  }
+
+  return {
+    repoTier: effectiveTier,
+    repoTierLabel: effectiveTierLabel,
+    repoTierSource,
+    status: 'aligned',
+    badgeLabel: effectiveTier === 'support' ? '🟢 支撑仓底座已对齐' : '🟢 底座版本已对齐',
+    badgeTone: 'emerald',
+    headline: 'Foundation 与 artifact-graph 锁定版本已与工作区最新基线一致。',
+    baseline,
+    declared,
+    laggingPackages,
+  };
+}
 
 const UID_TYPE_LABELS = Object.freeze({
   story: '用户故事',
@@ -191,24 +447,130 @@ async function resolveRelativeRepo(baseRepoReal, relRepoPath, catalog) {
 
 function isValidReceiptPayload(recJson) {
   if (!recJson || typeof recJson !== 'object') return false;
-  if (recJson.ok === false || recJson.valid === false) return false;
-  if (recJson.status === 'failed' || recJson.decision === 'FAIL') return false;
+  if (recJson.ok === false || recJson.valid === false || recJson.passed === false) return false;
+  if (recJson.status === 'failed' || recJson.overallStatus === 'failed' || recJson.decision === 'FAIL') return false;
+  if (recJson.verdict === 'FAIL' || recJson.verdict === 'failed') return false;
+  if (recJson.summary && typeof recJson.summary === 'object' && Number(recJson.summary.failed || 0) > 0) return false;
+  if (Array.isArray(recJson.failedIds) && recJson.failedIds.length > 0) return false;
+  if (Array.isArray(recJson.notExecutedIds) && recJson.notExecutedIds.length > 0) return false;
   return true;
+}
+
+const EXECUTION_RECEIPT_CANDIDATES = Object.freeze([
+  '.runs/release-testing/results.json',
+  '.runs/testing/results.json',
+  '.runs/sft/results.json',
+  '.runs/sft/receipt.json',
+  '.release-skill/testing/results.json',
+  'artifacts/tests/sft-test-receipt.json',
+]);
+
+export async function inspectDownstreamExecutionReceipt(targetRepoReal) {
+  const reqDoc = await readJsonContainedSafe(targetRepoReal, '.release-skill/testing/requirements.json');
+  const reqSha = reqDoc ? await sha256FilePrefixed(targetRepoReal, '.release-skill/testing/requirements.json') : null;
+  const reqRawHex = reqSha ? reqSha.replace(/^sha256:/, '') : null;
+  const requiredIds = Array.isArray(reqDoc?.requirements)
+    ? reqDoc.requirements.filter(r => r && r.optional !== true && typeof r.id === 'string').map(r => r.id)
+    : [];
+
+  for (const relPath of EXECUTION_RECEIPT_CANDIDATES) {
+    const recJson = await readJsonContainedSafe(targetRepoReal, relPath);
+    if (!recJson) continue;
+    if (!isValidReceiptPayload(recJson)) {
+      return { passed: false, receiptPath: relPath, reason: 'receipt_failed' };
+    }
+    if (reqRawHex && typeof recJson.requirementsSha256 === 'string' && recJson.requirementsSha256 !== reqRawHex) {
+      return { passed: false, receiptPath: relPath, reason: 'requirements_digest_mismatch' };
+    }
+
+    if (Array.isArray(recJson.items) && recJson.items.length > 0) {
+      if (recJson.summary && (Number(recJson.summary.notExecuted || 0) > 0 || Number(recJson.summary.incompleteOrUncovered || 0) > 0)) {
+        return { passed: false, receiptPath: relPath, reason: 'incomplete_execution' };
+      }
+      const nonSkipped = recJson.items.filter(it => it?.disposition !== 'explicitly_skipped' && it?.optional !== true);
+      const allItemsPassed = nonSkipped.length > 0
+        && nonSkipped.every(it => it.passed === true || it.verdict === 'passed');
+      const statusOk = recJson.ok === true || ['passed', 'passed_with_explicit_skips'].includes(recJson.overallStatus);
+      if (allItemsPassed && statusOk) {
+        return { passed: true, receiptPath: relPath, reason: 'sft_run_receipt_passed' };
+      }
+      return { passed: false, receiptPath: relPath, reason: 'items_not_all_passed' };
+    }
+
+    if (Array.isArray(recJson.results) && recJson.results.length > 0) {
+      const nonSkipped = recJson.results.filter(r => r?.disposition !== 'explicitly_skipped' && r?.optional !== true);
+      const allResultsPassed = nonSkipped.length > 0 && nonSkipped.every(r => r.verdict === 'passed' || r.passed === true);
+      const coveredSet = new Set(nonSkipped.map(r => r.requirementId).filter(Boolean));
+      const allRequiredCovered = requiredIds.length === 0 || requiredIds.every(id => coveredSet.has(id));
+      if (allResultsPassed && allRequiredCovered) {
+        return { passed: true, receiptPath: relPath, reason: 'requirements_results_passed' };
+      }
+      return { passed: false, receiptPath: relPath, reason: 'results_incomplete_or_failed' };
+    }
+
+    if (recJson.ok === true || recJson.valid === true || recJson.status === 'passed' || recJson.overallStatus === 'passed' || recJson.decision === 'PASS') {
+      return { passed: true, receiptPath: relPath, reason: 'direct_receipt_passed' };
+    }
+  }
+
+  return { passed: false, receiptPath: null, reason: 'no_execution_receipt' };
 }
 
 export async function inspectDownstreamLockFreshness(targetRepoReal, verifiedReceiptPath = null) {
   if (verifiedReceiptPath) {
     const recJson = await readJsonContainedSafe(targetRepoReal, verifiedReceiptPath);
     if (isValidReceiptPayload(recJson)) {
-      return { fresh: true, hasCodeLocks: true, mode: 'receipt', issueCount: 0 };
+      return {
+        fresh: true,
+        hasCodeLocks: true,
+        hasFreshImplements: true,
+        hasFreshVerifies: true,
+        executionVerified: true,
+        receiptPath: verifiedReceiptPath,
+        lockTier: 'verified_satisfied',
+        mode: 'receipt',
+        issueCount: 0,
+      };
     }
-    return { fresh: false, hasCodeLocks: false, mode: 'receipt_invalid', issueCount: 1 };
+    return {
+      fresh: false,
+      hasCodeLocks: false,
+      hasFreshImplements: false,
+      hasFreshVerifies: false,
+      executionVerified: false,
+      receiptPath: verifiedReceiptPath,
+      lockTier: 'in_progress',
+      mode: 'receipt_invalid',
+      issueCount: 1,
+    };
   }
   const lockJson = await readJsonContainedSafe(targetRepoReal, VERSION_LOCK_PATH);
-  if (!lockJson) return { fresh: false, hasCodeLocks: false, mode: 'missing_lock_file', issueCount: 1 };
+  if (!lockJson) {
+    return {
+      fresh: false,
+      hasCodeLocks: false,
+      hasFreshImplements: false,
+      hasFreshVerifies: false,
+      executionVerified: false,
+      receiptPath: null,
+      lockTier: 'in_progress',
+      mode: 'missing_lock_file',
+      issueCount: 1,
+    };
+  }
   const locks = Array.isArray(lockJson.locks) ? lockJson.locks : [];
   if (locks.length === 0) {
-    return { fresh: false, hasCodeLocks: false, mode: 'empty_code_locks', issueCount: 1 };
+    return {
+      fresh: false,
+      hasCodeLocks: false,
+      hasFreshImplements: false,
+      hasFreshVerifies: false,
+      executionVerified: false,
+      receiptPath: null,
+      lockTier: 'in_progress',
+      mode: 'empty_code_locks',
+      issueCount: 1,
+    };
   }
   const hasValidHashRef = ref => Boolean(
     ref && typeof ref === 'object'
@@ -258,13 +620,20 @@ export async function inspectDownstreamLockFreshness(targetRepoReal, verifiedRec
     }
   }
   const hasCodeLocks = hasFreshImplements && hasFreshVerifies;
+  const fresh = staleCount === 0 && hasCodeLocks;
   const missingKinds = (hasFreshImplements ? 0 : 1) + (hasFreshVerifies ? 0 : 1);
+  const execReceipt = fresh ? await inspectDownstreamExecutionReceipt(targetRepoReal) : { passed: false, receiptPath: null };
+  const executionVerified = Boolean(fresh && execReceipt.passed);
+  const lockTier = !fresh ? 'in_progress' : (executionVerified ? 'verified_satisfied' : 'traceability_locked');
   return {
-    fresh: staleCount === 0 && hasCodeLocks,
+    fresh,
     hasCodeLocks,
     hasFreshImplements,
     hasFreshVerifies,
-    mode: hasCodeLocks ? 'code_locks' : 'incomplete_code_locks',
+    executionVerified,
+    receiptPath: execReceipt.receiptPath,
+    lockTier,
+    mode: !hasCodeLocks ? 'incomplete_code_locks' : (executionVerified ? 'code_locks_and_receipt' : 'code_locks'),
     issueCount: staleCount + missingKinds,
   };
 }
@@ -371,7 +740,8 @@ export async function inspectInternalCodeLocks(repoReal) {
   };
 }
 const SATISFACTION_META = Object.freeze({
-  verified_satisfied: { code: 'verified_satisfied', label: '🟢 已验证满足', tone: 'emerald' },
+  verified_satisfied: { code: 'verified_satisfied', label: '✅ 已验证满足', tone: 'emerald' },
+  traceability_locked: { code: 'traceability_locked', label: '🔗 追溯双锁齐备', tone: 'indigo' },
   partially_allocated: { code: 'partially_allocated', label: '🔵 部分覆盖', tone: 'indigo' },
   allocated_in_progress: { code: 'allocated_in_progress', label: '⏳ 已派单推进中', tone: 'amber' },
   not_applicable: { code: 'not_applicable', label: '⚪ 按处置不计满足', tone: 'zinc' },
@@ -395,6 +765,7 @@ export async function inspectPortfolioAllocations(repoReal, catalog) {
   const summary = {
     total: rawItems.length,
     verifiedSatisfied: 0,
+    traceabilityLocked: 0,
     partiallyAllocated: 0,
     allocatedInProgress: 0,
     notApplicable: 0,
@@ -497,6 +868,8 @@ export async function inspectPortfolioAllocations(repoReal, catalog) {
         targetExists: Boolean(currentTargetDigest),
         reciprocalFound: Boolean(reciprocalBinding) || Boolean(a?.readonlyTarget),
         codeLocksFresh: lockCheck.fresh && lockCheck.hasCodeLocks,
+        executionVerified: Boolean(lockCheck.executionVerified || a?.upstreamStatus === 'verified_satisfied' || a?.satisfaction === 'verified_satisfied'),
+        receiptPath: lockCheck.receiptPath || a?.verifiedReceiptPath || null,
         lockMode: lockCheck.mode,
         issues: allocIssues,
       });
@@ -514,13 +887,20 @@ export async function inspectPortfolioAllocations(repoReal, catalog) {
       computedSatisfaction = 'partially_allocated';
       summary.partiallyAllocated += 1;
     } else {
-      const allTargetsReady = allocations.every(al => al.targetExists && al.reciprocalFound && al.codeLocksFresh);
+      const allTargetsLocked = allocations.every(al => al.targetExists && al.reciprocalFound && al.codeLocksFresh);
+      const upstreamSaysVerified = raw?.upstreamStatus === 'verified_satisfied'
+        || raw?.satisfaction === 'verified_satisfied'
+        || raw?.upstreamEngineStatus === 'verified_satisfied';
+      const allTargetsExecutionVerified = allTargetsLocked && (upstreamSaysVerified || allocations.every(al => al.executionVerified));
       const noBlockingDrift = !itemIssues.some(iss =>
         ['SOURCE_ARTIFACT_MISSING', 'TARGET_MISSING', 'UPSTREAM_DESIGN_CHANGED', 'DOWNSTREAM_DESIGN_EVOLVED', 'UNRECIPROCATED_ALLOCATION'].includes(iss.code),
       );
-      if (allTargetsReady && noBlockingDrift) {
+      if (allTargetsExecutionVerified && noBlockingDrift) {
         computedSatisfaction = 'verified_satisfied';
         summary.verifiedSatisfied += 1;
+      } else if (allTargetsLocked && noBlockingDrift) {
+        computedSatisfaction = 'traceability_locked';
+        summary.traceabilityLocked += 1;
       } else {
         computedSatisfaction = 'allocated_in_progress';
         summary.allocatedInProgress += 1;
@@ -543,6 +923,8 @@ export async function inspectPortfolioAllocations(repoReal, catalog) {
       summary.driftCount += 1;
     } else if (disposition !== 'allocated') {
       health = { code: 'DISPOSED', label: '⚪ 按处置结案', tone: 'zinc' };
+    } else if (computedSatisfaction === 'traceability_locked') {
+      health = { code: 'TRACEABILITY_LOCKED', label: '🔗 双锁齐备·待实测收据', tone: 'indigo' };
     } else if (computedSatisfaction !== 'verified_satisfied') {
       health = { code: 'IN_PROGRESS', label: '🔵 摘要对齐·实施验证中', tone: 'indigo' };
     }
@@ -689,6 +1071,29 @@ export async function inspectRepoAlignment(record, catalog) {
     inspectInternalCodeLocks(record.realPath),
   ]);
 
+  const role = portfolio.present ? 'portfolio' : (upstreamBindings.present ? 'subproject' : 'standalone');
+  let foundationAlignment = record.foundationAlignment || null;
+  if (!foundationAlignment) {
+    const declaredDeps = await readRepoTrackedDependencies(record.realPath);
+    const tierInfo = record.repoTier
+      ? { repoTier: record.repoTier, repoTierLabel: record.repoTierLabel, source: record.repoTierSource || 'catalog' }
+      : await resolveRepoTier(record.realPath, {
+        repoId: record.id,
+        repoName: record.name,
+        packageName: record.packageName,
+        group: record.group,
+        repoRole: record.repoRole || role,
+      });
+    const baseline = catalog?.foundationBaseline || await computeFoundationBaseline([declaredDeps]);
+    foundationAlignment = evaluateRepoFoundationAlignment({
+      repoTier: tierInfo.repoTier,
+      repoTierLabel: tierInfo.repoTierLabel,
+      repoTierSource: tierInfo.source,
+      declaredDeps,
+      baseline,
+    });
+  }
+
   const totalAlerts = (portfolio.summary?.driftCount ?? 0)
     + (portfolio.summary?.missingCount ?? 0)
     + (portfolio.summary?.unallocated ?? 0)
@@ -701,7 +1106,11 @@ export async function inspectRepoAlignment(record, catalog) {
     ok: true,
     repoId: record.id,
     repoName: record.name,
-    role: portfolio.present ? 'portfolio' : (upstreamBindings.present ? 'subproject' : 'standalone'),
+    role,
+    repoTier: foundationAlignment.repoTier,
+    repoTierLabel: foundationAlignment.repoTierLabel,
+    repoTierSource: foundationAlignment.repoTierSource,
+    foundationAlignment,
     totalAlerts,
     portfolio,
     upstreamBindings,
