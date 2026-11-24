@@ -76,12 +76,31 @@ export async function readRepoTrackedDependencies(repoReal) {
   const pkg = await readJsonContainedSafe(repoReal, 'package.json');
   if (!pkg) return {};
   const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+  const localOverrides = await readJsonContainedSafe(repoReal, '.skill-family-local-overrides.json');
+  const overrideMap = {
+    ...(pkg?.pnpm?.overrides && typeof pkg.pnpm.overrides === 'object' ? pkg.pnpm.overrides : {}),
+    ...(localOverrides?.overrides && typeof localOverrides.overrides === 'object' ? localOverrides.overrides : {}),
+  };
   const out = {};
   for (const name of TRACKED_FOUNDATION_PACKAGES) {
     if (typeof deps[name] === 'string' && deps[name].trim()) {
-      const parsed = parseSemverTuple(deps[name]);
+      let rawSpec = deps[name].trim();
+      let parsed = parseSemverTuple(rawSpec);
+      const ov = typeof overrideMap[name] === 'string' ? overrideMap[name].trim() : '';
+      if (/^(?:link|file):/i.test(ov)) {
+        try {
+          const relTarget = ov.replace(/^(?:link|file):/i, '');
+          const linkedPkgJson = resolve(repoReal, relTarget, 'package.json');
+          const linkedPkg = JSON.parse(await readFile(linkedPkgJson, 'utf8'));
+          const linkedTuple = parseSemverTuple(linkedPkg?.version);
+          if (linkedTuple) {
+            parsed = linkedTuple;
+            rawSpec = `${ov} (${formatSemverTuple(linkedTuple)})`;
+          }
+        } catch {}
+      }
       out[name] = {
-        rawSpec: deps[name].trim(),
+        rawSpec,
         version: formatSemverTuple(parsed),
         tuple: parsed,
       };
