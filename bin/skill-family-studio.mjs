@@ -4,6 +4,7 @@
 // @feature STU006
 
 import { spawn } from 'node:child_process';
+import { readFileSync, realpathSync } from 'node:fs';
 import { mkdir, mkdtemp, open, readFile, realpath, rm } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -52,6 +53,7 @@ function printHelp() {
   --readonly              只读预览模式，拒绝审阅批注或结论落盘
   --out <relPath>         snapshot 子命令将 JSON 写入 --root 内的相对路径
   --json                  以结构化 JSON 输出
+  --version, -v           显示当前版本号
   --help, -h              显示本帮助说明
 `);
 }
@@ -107,6 +109,7 @@ export function parseStudioCliArgs(argv = []) {
       writable: { type: 'boolean' },
       readonly: { type: 'boolean', default: false },
       json: { type: 'boolean', default: false },
+      version: { type: 'boolean', short: 'v', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
   });
@@ -129,8 +132,9 @@ export function parseStudioCliArgs(argv = []) {
     .filter(Boolean);
 
   return {
-    subcommand: positionals[0] || (values.help ? 'help' : 'serve'),
+    subcommand: positionals[0] || (values.help ? 'help' : (values.version ? 'version' : 'serve')),
     help: Boolean(values.help),
+    version: Boolean(values.version),
     root: resolve(values.root || '.'),
     port,
     scanRoots: values['scan-roots'],
@@ -277,6 +281,11 @@ async function main(argv = process.argv.slice(2)) {
     printHelp();
     return;
   }
+  if (opts.version || opts.subcommand === 'version') {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+    process.stdout.write(`${pkg.version}\n`);
+    return;
+  }
 
   if (opts.subcommand === 'serve') {
     const srv = await createStudioServer({
@@ -351,7 +360,15 @@ async function main(argv = process.argv.slice(2)) {
   throw new Error(`未知子命令 "${opts.subcommand}"；请运行 skill-family-studio --help 查看支持的命令（inspect-setup / init-workspace / serve / ensure / open / snapshot / doctor）。`);
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === CLI_PATH) {
+function resolveEntryRealPath(targetPath) {
+  try {
+    return realpathSync(targetPath);
+  } catch {
+    return resolve(targetPath);
+  }
+}
+
+if (process.argv[1] && resolveEntryRealPath(process.argv[1]) === resolveEntryRealPath(CLI_PATH)) {
   main().catch(err => {
     process.stderr.write(`[skill-family-studio] ${err?.message || err}\n`);
     process.exitCode = 1;

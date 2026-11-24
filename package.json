@@ -18,6 +18,26 @@
     "./layout": "./src/graph-layout.mjs",
     "./review-state": "./src/review-state.mjs"
   },
+  "files": [
+    "bin",
+    "src",
+    "skills",
+    ".agents",
+    ".claude",
+    "plugin.json",
+    ".claude-plugin",
+    "!.claude-plugin/adapter-build-manifest.json",
+    ".codex-plugin",
+    ".kimi-plugin",
+    ".qoder-plugin",
+    ".codebuddy-plugin",
+    "VERSION",
+    "README.md",
+    "USER-GUIDE.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "NOTICE"
+  ],
   "dependencies": {
     "artifact-graph": "1.2.0",
     "skill-family-contracts": "0.39.0",

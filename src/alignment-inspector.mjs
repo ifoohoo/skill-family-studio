@@ -15,19 +15,24 @@ export const TRACKED_FOUNDATION_PACKAGES = Object.freeze([
   'skill-family-engineering-kit',
 ]);
 
-export const DEFAULT_SUPPORT_REPO_NAMES = Object.freeze(new Set([
-  'skill-family-foundation-workspace',
-  'skill-family-studio-workspace',
+const SUPPORT_PUBLIC_NAMES = Object.freeze([
+  'skill-family-foundation',
   'skill-family-studio',
-  'skill-family-test-workspace',
-  'skill-family-hub-workspace',
-  'skill-family-doc-render-workspace',
-  'skill-failure-auditor-workspace',
-  'skill-family-audit-workspace',
+  'skill-family-test',
+  'skill-family-hub',
+  'skill-family-doc-render',
+  'skill-failure-auditor',
+  'skill-family-audit',
   'release-skill',
   'artifact-graph',
   'agent-method-registry',
-]));
+]);
+
+const WORKSPACE_REPO_SUFFIX = '-workspace';
+
+export const DEFAULT_SUPPORT_REPO_NAMES = Object.freeze(new Set(
+  SUPPORT_PUBLIC_NAMES.flatMap(publicName => [publicName, `${publicName}${WORKSPACE_REPO_SUFFIX}`]),
+));
 
 const STUDIO_PKG_JSON_URL = new URL('../package.json', import.meta.url);
 let cachedStudioFloorPromise = null;
