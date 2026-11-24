@@ -478,75 +478,275 @@ async function resolveRelativeRepo(baseRepoReal, relRepoPath, catalog) {
   return null;
 }
 
+function isPlainObject(val) {
+  return Boolean(val && typeof val === 'object' && !Array.isArray(val));
+}
+
 function isValidReceiptPayload(recJson) {
-  if (!recJson || typeof recJson !== 'object') return false;
+  if (!isPlainObject(recJson)) return false;
   if (recJson.ok === false || recJson.valid === false || recJson.passed === false) return false;
-  if (recJson.status === 'failed' || recJson.overallStatus === 'failed' || recJson.decision === 'FAIL') return false;
+  if (recJson.status === 'failed' || recJson.overallStatus === 'failed' || recJson.overallStatus === 'blocked' || recJson.decision === 'FAIL') return false;
   if (recJson.verdict === 'FAIL' || recJson.verdict === 'failed') return false;
   if (recJson.summary && typeof recJson.summary === 'object' && Number(recJson.summary.failed || 0) > 0) return false;
   if (Array.isArray(recJson.failedIds) && recJson.failedIds.length > 0) return false;
   if (Array.isArray(recJson.notExecutedIds) && recJson.notExecutedIds.length > 0) return false;
+  if (Array.isArray(recJson.openIds) && recJson.openIds.length > 0) return false;
   return true;
 }
 
-const EXECUTION_RECEIPT_CANDIDATES = Object.freeze([
-  '.runs/release-testing/results.json',
+const PASSING_EXECUTION_DISPOSITIONS = new Set(['executed', 'reused', 'not-applicable']);
+const ALLOWED_SFT_OVERALL_STATUSES = new Set(['all_required_passed', 'passed', 'passed_with_explicit_skips']);
+const LEGACY_EXECUTION_RECEIPT_CANDIDATES = Object.freeze([
   '.runs/testing/results.json',
-  '.runs/sft/results.json',
-  '.runs/sft/receipt.json',
-  '.release-skill/testing/results.json',
   'artifacts/tests/sft-test-receipt.json',
 ]);
 
-export async function inspectDownstreamExecutionReceipt(targetRepoReal) {
-  const reqDoc = await readJsonContainedSafe(targetRepoReal, '.release-skill/testing/requirements.json');
-  const reqSha = reqDoc ? await sha256FilePrefixed(targetRepoReal, '.release-skill/testing/requirements.json') : null;
-  const reqRawHex = reqSha ? reqSha.replace(/^sha256:/, '') : null;
-  const requiredIds = Array.isArray(reqDoc?.requirements)
-    ? reqDoc.requirements.filter(r => r && r.optional !== true && typeof r.id === 'string').map(r => r.id)
-    : [];
+async function inspectContainedFile(repoReal, relPath) {
+  const clean = String(relPath ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!clean || clean.includes('\0') || clean.startsWith('/') || clean.split('/').includes('..')) {
+    return { status: 'unsafe', relPath: clean };
+  }
+  let abs;
+  try {
+    abs = await resolveContained(repoReal, clean);
+  } catch {
+    return { status: 'unsafe', relPath: clean };
+  }
+  let st;
+  try {
+    st = await lstat(abs);
+  } catch (err) {
+    if (err?.code === 'ENOENT') return { status: 'missing', relPath: clean };
+    return { status: 'unsafe', relPath: clean };
+  }
+  if (st.isSymbolicLink() || !st.isFile()) {
+    return { status: 'unsafe', relPath: clean };
+  }
+  try {
+    const bytes = await readFileContained(repoReal, clean);
+    return { status: 'ok', relPath: clean, bytes };
+  } catch {
+    return { status: 'unsafe', relPath: clean };
+  }
+}
 
-  for (const relPath of EXECUTION_RECEIPT_CANDIDATES) {
-    const recJson = await readJsonContainedSafe(targetRepoReal, relPath);
-    if (!recJson) continue;
-    if (!isValidReceiptPayload(recJson)) {
-      return { passed: false, receiptPath: relPath, reason: 'receipt_failed' };
-    }
-    if (reqRawHex && typeof recJson.requirementsSha256 === 'string' && recJson.requirementsSha256 !== reqRawHex) {
-      return { passed: false, receiptPath: relPath, reason: 'requirements_digest_mismatch' };
-    }
+async function verifyDigestRefContained(repoReal, ref) {
+  if (!isPlainObject(ref) || typeof ref.path !== 'string' || typeof ref.sha256 !== 'string') {
+    return false;
+  }
+  const expectedHex = ref.sha256.trim();
+  if (!/^[a-f0-9]{64}$/.test(expectedHex)) return false;
+  const actualPrefixed = await sha256FilePrefixed(repoReal, ref.path);
+  return actualPrefixed === `sha256:${expectedHex}`;
+}
 
-    if (Array.isArray(recJson.items) && recJson.items.length > 0) {
-      if (recJson.summary && (Number(recJson.summary.notExecuted || 0) > 0 || Number(recJson.summary.incompleteOrUncovered || 0) > 0)) {
-        return { passed: false, receiptPath: relPath, reason: 'incomplete_execution' };
-      }
-      const nonSkipped = recJson.items.filter(it => it?.disposition !== 'explicitly_skipped' && it?.optional !== true);
-      const allItemsPassed = nonSkipped.length > 0
-        && nonSkipped.every(it => it.passed === true || it.verdict === 'passed');
-      const statusOk = recJson.ok === true || ['passed', 'passed_with_explicit_skips'].includes(recJson.overallStatus);
-      if (allItemsPassed && statusOk) {
-        return { passed: true, receiptPath: relPath, reason: 'sft_run_receipt_passed' };
-      }
-      return { passed: false, receiptPath: relPath, reason: 'items_not_all_passed' };
-    }
-
-    if (Array.isArray(recJson.results) && recJson.results.length > 0) {
-      const nonSkipped = recJson.results.filter(r => r?.disposition !== 'explicitly_skipped' && r?.optional !== true);
-      const allResultsPassed = nonSkipped.length > 0 && nonSkipped.every(r => r.verdict === 'passed' || r.passed === true);
-      const coveredSet = new Set(nonSkipped.map(r => r.requirementId).filter(Boolean));
-      const allRequiredCovered = requiredIds.length === 0 || requiredIds.every(id => coveredSet.has(id));
-      if (allResultsPassed && allRequiredCovered) {
-        return { passed: true, receiptPath: relPath, reason: 'requirements_results_passed' };
-      }
-      return { passed: false, receiptPath: relPath, reason: 'results_incomplete_or_failed' };
-    }
-
-    if (recJson.ok === true || recJson.valid === true || recJson.status === 'passed' || recJson.overallStatus === 'passed' || recJson.decision === 'PASS') {
-      return { passed: true, receiptPath: relPath, reason: 'direct_receipt_passed' };
+async function evaluateSingleExecutionReceipt(targetRepoReal, rawDoc, requirementsInfo) {
+  let doc = rawDoc;
+  if (Array.isArray(doc) && doc.length > 0) {
+    doc = doc[doc.length - 1];
+  } else if (isPlainObject(doc) && Array.isArray(doc.runs) && doc.runs.length > 0) {
+    doc = doc.runs[doc.runs.length - 1];
+  }
+  if (!isValidReceiptPayload(doc)) {
+    return { ok: false, reason: 'receipt_failed' };
+  }
+  if (typeof doc.requirementsSha256 === 'string') {
+    if (!requirementsInfo || doc.requirementsSha256.toLowerCase() !== requirementsInfo.rawSha256) {
+      return { ok: false, reason: 'requirements_digest_mismatch' };
     }
   }
 
-  return { passed: false, receiptPath: null, reason: 'no_execution_receipt' };
+  // Format A: release-skill test-intake results ({ results: [...] })
+  if (Array.isArray(doc.results)) {
+    if (doc.results.length === 0) return { ok: false, reason: 'results_incomplete_or_failed' };
+    const passedReqIds = new Set();
+    let passedCount = 0;
+    for (const entry of doc.results) {
+      if (!isPlainObject(entry)) return { ok: false, reason: 'results_incomplete_or_failed' };
+      const reqId = typeof entry.requirementId === 'string' ? entry.requirementId : '';
+      const isOptional = entry.optional === true || (reqId !== '' && Boolean(requirementsInfo?.optionalIds.has(reqId)));
+      const disposition = typeof entry.disposition === 'string' ? entry.disposition : '';
+      const isPassed = PASSING_EXECUTION_DISPOSITIONS.has(disposition)
+        && (entry.verdict === 'passed' || entry.passed === true);
+      if (!isOptional && !isPassed) {
+        return { ok: false, reason: 'results_incomplete_or_failed' };
+      }
+      if (isPassed) {
+        passedCount += 1;
+        if (reqId) passedReqIds.add(reqId);
+      }
+    }
+    if (passedCount === 0) return { ok: false, reason: 'results_incomplete_or_failed' };
+    if (requirementsInfo && !requirementsInfo.requiredIds.every(id => passedReqIds.has(id))) {
+      return { ok: false, reason: 'results_incomplete_or_failed' };
+    }
+    return { ok: true, reason: 'requirements_results_passed' };
+  }
+
+  // Format B: skill-family-test run receipt ({ items: [...] })
+  if (Array.isArray(doc.items)) {
+    if (doc.items.length === 0) return { ok: false, reason: 'items_not_all_passed' };
+    if (typeof doc.overallStatus === 'string' && !ALLOWED_SFT_OVERALL_STATUSES.has(doc.overallStatus)) {
+      return { ok: false, reason: 'disallowed_overall_status' };
+    }
+    if (doc.overallStatus === undefined && doc.ok !== true) {
+      return { ok: false, reason: 'missing_overall_status' };
+    }
+    if (doc.summary && (Number(doc.summary.notExecuted || 0) > 0 || Number(doc.summary.incompleteOrUncovered || 0) > 0)) {
+      return { ok: false, reason: 'incomplete_execution' };
+    }
+    const coveredIds = new Set();
+    let passedCount = 0;
+    for (const item of doc.items) {
+      if (!isPlainObject(item)) return { ok: false, reason: 'items_not_all_passed' };
+      if (item.evidence !== undefined) {
+        if (!Array.isArray(item.evidence)) return { ok: false, reason: 'invalid_evidence_list' };
+        for (const ev of item.evidence) {
+          if (!(await verifyDigestRefContained(targetRepoReal, ev))) {
+            return { ok: false, reason: 'evidence_digest_mismatch' };
+          }
+        }
+      }
+      const reqId = typeof item.requirementId === 'string' ? item.requirementId : '';
+      const itemId = typeof item.id === 'string' ? item.id : '';
+      const isOptional = item.optional === true || (reqId !== '' && Boolean(requirementsInfo?.optionalIds.has(reqId)));
+      const disposition = typeof item.disposition === 'string' ? item.disposition : '';
+      const isPassed = PASSING_EXECUTION_DISPOSITIONS.has(disposition)
+        && (item.verdict === 'passed' || item.passed === true);
+      if (!isOptional && !isPassed) {
+        return { ok: false, reason: 'items_not_all_passed' };
+      }
+      if (isPassed) {
+        passedCount += 1;
+        if (reqId) coveredIds.add(reqId);
+        if (itemId) coveredIds.add(itemId);
+      }
+    }
+    if (passedCount === 0) return { ok: false, reason: 'items_not_all_passed' };
+    if (requirementsInfo && !requirementsInfo.requiredIds.every(id => coveredIds.has(id))) {
+      return { ok: false, reason: 'missing_required_coverage' };
+    }
+    return { ok: true, reason: 'sft_run_receipt_passed' };
+  }
+
+  if (
+    (!requirementsInfo || requirementsInfo.requiredIds.length === 0)
+    && (doc.ok === true || doc.valid === true || doc.status === 'passed' || doc.overallStatus === 'passed' || doc.decision === 'PASS')
+  ) {
+    return { ok: true, reason: 'direct_receipt_passed' };
+  }
+
+  return { ok: false, reason: 'unrecognized_receipt_format' };
+}
+
+export async function inspectDownstreamExecutionReceipt(targetRepoReal) {
+  let reqRelPath = '.release-skill/testing/requirements.json';
+  let resultRelPath = '.runs/release-testing/results.json';
+
+  const releaseCfg = await inspectContainedFile(targetRepoReal, '.release-skill/project.yaml');
+  if (releaseCfg.status === 'unsafe') {
+    return { passed: false, receiptPath: '.release-skill/project.yaml', reason: 'unsafe_project_yaml' };
+  }
+  if (releaseCfg.status === 'ok') {
+    try {
+      const loadedYaml = parseYaml(releaseCfg.bytes.toString('utf8'));
+      if (isPlainObject(loadedYaml) && isPlainObject(loadedYaml.testIntake)) {
+        if (typeof loadedYaml.testIntake.requirementsFile === 'string' && loadedYaml.testIntake.requirementsFile.trim()) {
+          reqRelPath = loadedYaml.testIntake.requirementsFile.trim();
+        }
+        if (typeof loadedYaml.testIntake.resultFile === 'string' && loadedYaml.testIntake.resultFile.trim()) {
+          resultRelPath = loadedYaml.testIntake.resultFile.trim();
+        }
+      }
+    } catch {
+      return { passed: false, receiptPath: '.release-skill/project.yaml', reason: 'invalid_project_yaml' };
+    }
+  }
+
+  let requirementsInfo = null;
+  const reqFile = await inspectContainedFile(targetRepoReal, reqRelPath);
+  if (reqFile.status === 'unsafe') {
+    return { passed: false, receiptPath: reqRelPath, reason: 'unsafe_requirements_file' };
+  }
+  if (reqFile.status === 'ok') {
+    let reqParsed;
+    try {
+      reqParsed = JSON.parse(reqFile.bytes.toString('utf8'));
+    } catch {
+      return { passed: false, receiptPath: reqRelPath, reason: 'invalid_requirements_manifest' };
+    }
+    if (!isPlainObject(reqParsed) || !Array.isArray(reqParsed.requirements) || reqParsed.requirements.length === 0) {
+      return { passed: false, receiptPath: reqRelPath, reason: 'invalid_requirements_manifest' };
+    }
+    const requiredIds = [];
+    const optionalIds = new Set();
+    for (const entry of reqParsed.requirements) {
+      if (!isPlainObject(entry) || typeof entry.id !== 'string' || !entry.id.trim()) {
+        return { passed: false, receiptPath: reqRelPath, reason: 'invalid_requirements_manifest' };
+      }
+      for (const field of ['source', 'criterion']) {
+        if (entry[field] !== undefined && !(await verifyDigestRefContained(targetRepoReal, entry[field]))) {
+          return { passed: false, receiptPath: reqRelPath, reason: 'requirements_ref_digest_mismatch' };
+        }
+      }
+      const id = entry.id.trim();
+      if (entry.optional === true) optionalIds.add(id);
+      else requiredIds.push(id);
+    }
+    requirementsInfo = {
+      rawSha256: createHash('sha256').update(reqFile.bytes).digest('hex'),
+      requiredIds,
+      optionalIds,
+    };
+  }
+
+  const primaryCandidates = Array.from(new Set([resultRelPath, 'artifacts/tests/sft-runs.json']));
+  const foundReceipts = [];
+  for (const rel of primaryCandidates) {
+    const candidate = await inspectContainedFile(targetRepoReal, rel);
+    if (candidate.status === 'unsafe') {
+      return { passed: false, receiptPath: rel, reason: 'unsafe_receipt_file' };
+    }
+    if (candidate.status === 'ok') {
+      try {
+        foundReceipts.push({ relPath: candidate.relPath, json: JSON.parse(candidate.bytes.toString('utf8')) });
+      } catch {
+        return { passed: false, receiptPath: rel, reason: 'invalid_receipt_json' };
+      }
+    }
+  }
+
+  if (foundReceipts.length === 0) {
+    for (const rel of LEGACY_EXECUTION_RECEIPT_CANDIDATES) {
+      const candidate = await inspectContainedFile(targetRepoReal, rel);
+      if (candidate.status === 'unsafe') {
+        return { passed: false, receiptPath: rel, reason: 'unsafe_receipt_file' };
+      }
+      if (candidate.status === 'ok') {
+        try {
+          foundReceipts.push({ relPath: candidate.relPath, json: JSON.parse(candidate.bytes.toString('utf8')) });
+        } catch {
+          return { passed: false, receiptPath: rel, reason: 'invalid_receipt_json' };
+        }
+      }
+    }
+  }
+
+  if (foundReceipts.length === 0) {
+    return { passed: false, receiptPath: null, reason: 'no_execution_receipt' };
+  }
+
+  let lastReason = 'sft_run_receipt_passed';
+  for (const item of foundReceipts) {
+    const evalRes = await evaluateSingleExecutionReceipt(targetRepoReal, item.json, requirementsInfo);
+    if (!evalRes.ok) {
+      return { passed: false, receiptPath: item.relPath, reason: evalRes.reason };
+    }
+    lastReason = evalRes.reason;
+  }
+
+  const preferred = foundReceipts.find(r => r.relPath === 'artifacts/tests/sft-runs.json') || foundReceipts[0];
+  return { passed: true, receiptPath: preferred.relPath, reason: lastReason };
 }
 
 export async function inspectDownstreamLockFreshness(targetRepoReal, verifiedReceiptPath = null) {
