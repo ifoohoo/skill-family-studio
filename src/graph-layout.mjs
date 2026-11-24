@@ -85,9 +85,9 @@ export function computeAdaptiveGraphLayout(
   const padX = 24;
   const padY = 20;
   const bandPadX = 16;
-  const bandHeadH = 36;
+  const bandHeadH = 46;
   const bandPadBottom = 16;
-  const bandGapY = 26;
+  const bandGapY = 30;
   const isUltrawide = safeContainerW >= 3000;
   const is2K = safeContainerW >= 2200;
   const minCardW = isUltrawide ? 260 : (is2K ? 240 : 204);

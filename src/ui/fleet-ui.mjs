@@ -65,15 +65,40 @@ function svgEl(doc, tag, attrs = {}) {
   return n;
 }
 
+function cleanFleetUiLabel(val) {
+  return String(val ?? '')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '$1')
+    .replace(/\*{2,}/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function dedupeSummaryAgainstTitle(rawSummary, rawTitle) {
+  const sum = cleanFleetUiLabel(rawSummary);
+  const title = cleanFleetUiLabel(rawTitle).replace(/…$/, '');
+  if (!sum) return '';
+  if (!title) return sum;
+  if (sum === title || title.startsWith(sum)) return '';
+  if (sum.startsWith(title)) {
+    const rest = sum.slice(title.length).replace(/^[：:，,。；;·\-\s]+/, '').trim();
+    return rest.length >= 8 ? rest : '';
+  }
+  return sum;
+}
+
 function appendInlineFormatted(parent, text, doc) {
   const str = String(text ?? '');
-  const tokens = str.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
+  const tokens = str.split(/(`[^`]+`|\*\*[^*]+\*\*|(?<!\*)\*[^*\n]+\*(?!\*))/g);
   for (const tok of tokens) {
     if (!tok) continue;
     if (tok.startsWith('`') && tok.endsWith('`') && tok.length >= 2) {
       parent.append(mk(doc, 'code', tok.slice(1, -1), 'st-inline-code'));
     } else if (tok.startsWith('**') && tok.endsWith('**') && tok.length >= 4) {
       parent.append(mk(doc, 'strong', tok.slice(2, -2)));
+    } else if (tok.startsWith('*') && tok.endsWith('*') && tok.length >= 3) {
+      parent.append(mk(doc, 'em', tok.slice(1, -1)));
     } else {
       parent.append(doc.createTextNode(tok));
     }
@@ -157,13 +182,19 @@ export function renderSafeMarkdownToDom(markdown, doc = document) {
       wrap.append(tblWrap);
       continue;
     }
-    if (/^[-*]\s+/.test(trimmed)) {
+    const isListStop = ln => {
+      const lt = ln.trim();
+      return !lt || /^#{1,4}\s/.test(lt) || /^```/.test(lt) || /^(---|\*\*\*|___)$/.test(lt) || /^>\s?/.test(lt) || /^[-*+]\s+/.test(lt) || /^\d+\.\s+/.test(lt);
+    };
+    if (/^[-*+]\s+/.test(trimmed)) {
       const ul = mk(doc, 'ul', null, 'st-fleet-md-list');
-      while (i < lines.length && /^[-*]\s+/.test(lines[i].trim())) {
-        const li = mk(doc, 'li');
-        appendInlineFormatted(li, lines[i].trim().replace(/^[-*]\s+/, ''), doc);
-        ul.append(li);
+      while (i < lines.length && /^[-*+]\s+/.test(lines[i].trim())) {
+        const parts = [lines[i].trim().replace(/^[-*+]\s+/, '')];
         i++;
+        while (i < lines.length && !isListStop(lines[i])) { parts.push(lines[i].trim()); i++; }
+        const li = mk(doc, 'li');
+        appendInlineFormatted(li, parts.join(' '), doc);
+        ul.append(li);
       }
       wrap.append(ul);
       continue;
@@ -171,10 +202,12 @@ export function renderSafeMarkdownToDom(markdown, doc = document) {
     if (/^\d+\.\s+/.test(trimmed)) {
       const ol = mk(doc, 'ol', null, 'st-fleet-md-list');
       while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) {
-        const li = mk(doc, 'li');
-        appendInlineFormatted(li, lines[i].trim().replace(/^\d+\.\s+/, ''), doc);
-        ol.append(li);
+        const parts = [lines[i].trim().replace(/^\d+\.\s+/, '')];
         i++;
+        while (i < lines.length && !isListStop(lines[i])) { parts.push(lines[i].trim()); i++; }
+        const li = mk(doc, 'li');
+        appendInlineFormatted(li, parts.join(' '), doc);
+        ol.append(li);
       }
       wrap.append(ol);
       continue;
@@ -247,7 +280,7 @@ export function mountFleetMonitor(host, {
     const emptyCard = mk(doc, 'div', null, 'st-card st-guide-section');
     emptyCard.append(
       mk(doc, 'h3', '🛰️ 暂未探测到包含子会话派生记录的多智能体编队', ''),
-      mk(doc, 'p', '系统已自动只读检索 Antigravity、Claude Code、Codex 会话目录以及 .skill-family-studio/fleet/。你可以点击上方「▶ 运行隔离沙箱演练」立即预览完整 6 节点多智能体协作编队。', 'st-muted-xs'),
+      mk(doc, 'p', '已只读扫描 Antigravity、Claude Code、Codex 会话目录及 .skill-family-studio/fleet/。点击下方「▶ 运行隔离沙箱演练」，可生成多智能体协作样板并查看拓扑网络、泳道与事件详情。', 'st-muted-xs'),
     );
     emptyCard.firstChild.style.marginTop = '0';
     const tryBtn = mk(doc, 'button', '▶ 运行隔离沙箱演练', 'st-btn st-btn-primary');
@@ -334,13 +367,15 @@ export function mountFleetMonitor(host, {
       const card = mk(doc, 'button', null, `st-fleet-sess-card${isSel ? ' is-selected' : ''}`);
       card.type = 'button';
       card.dataset.familyId = f.id;
+      const cardTitle = cleanFleetUiLabel(f.title) || '多智能体会话编队';
+      const distinctCardSum = dedupeSummaryAgainstTitle(f.briefSummary, cardTitle);
       card.append(renderEntityBrief(doc, {
-        title: f.title,
-        summary: f.briefSummary || `${HOST_ZH[f.host] || f.host} · ${f.agents?.length || 0} 个会话`,
+        title: cardTitle,
+        summary: distinctCardSum,
         code: HOST_ZH[f.host] || String(f.host || '').toUpperCase(),
         typeLabel: f.repoHint || '',
         badge: f.host === 'sandbox' ? '演练样板' : '',
-      }, { compact: true, showPath: false, maxSummaryChars: 80 }));
+      }, { compact: true, showPath: false, maxSummaryChars: 76 }));
 
       const foot = mk(doc, 'div', null, 'st-fleet-sess-meta st-tabular');
       foot.append(
@@ -382,14 +417,17 @@ export function mountFleetMonitor(host, {
     // 1. 顶部编队脉冲摘要卡 + 4 KPI
     const header = mk(doc, 'div', null, 'st-fleet-header');
     const hLeft = mk(doc, 'div', null, 'st-fleet-head-left');
+    const headTitle = cleanFleetUiLabel(activeFam.title) || '多智能体会话编队监控';
+    const distinctHeadSum = dedupeSummaryAgainstTitle(activeFam.briefSummary, headTitle)
+      || `关联宿主：${HOST_ZH[activeFam.host] || activeFam.host} · 点击下方会话节点或泳道事件可按单会话筛选联动。`;
     hLeft.append(renderEntityBrief(doc, {
-      title: activeFam.title || '多智能体会话编队监控',
-      summary: activeFam.briefSummary || '在统一时间线上联动查看主会话与子会话拓扑网络、委派与回报泳道，以及每条任务简报。',
+      title: headTitle,
+      summary: distinctHeadSum,
       code: HOST_ZH[activeFam.host] || String(activeFam.host || 'local').toUpperCase(),
       typeLabel: activeFam.repoHint ? `关联目录：${activeFam.repoHint}` : '多智能体编队',
     }, { compact: false, showPath: false, maxSummaryChars: 130 }));
     if (selectedAgent) {
-      const selPill = mk(doc, 'button', `已锁定会话：${selectedAgent.name} ×`, 'st-jump-pill');
+      const selPill = mk(doc, 'button', `已锁定会话：${cleanFleetUiLabel(selectedAgent.name)} ×`, 'st-jump-pill');
       selPill.type = 'button';
       selPill.style.marginTop = '8px';
       selPill.addEventListener('click', () => { state.rtFleetSelectedAgent = null; renderRightDetail(activeFam); });
@@ -483,10 +521,10 @@ export function mountFleetMonitor(host, {
     card.style.setProperty('--st-fleet-hue', hue);
 
     const r1 = mk(doc, 'div', null, 'st-fleet-node-top');
-    const av = mk(doc, 'span', ag.roleShort || '体', 'st-fleet-avatar');
+    const av = mk(doc, 'span', ag.roleShort || '智', 'st-fleet-avatar');
     av.style.setProperty('--st-fleet-hue', hue);
     const dot = mk(doc, 'span', null, `st-fleet-dot st-fleet-dot-${ag.status || 'completed'}`);
-    const titleEl = mk(doc, 'span', ag.name, 'st-fleet-node-name');
+    const titleEl = mk(doc, 'span', cleanFleetUiLabel(ag.name) || ag.id, 'st-fleet-node-name');
     r1.append(av, dot, titleEl);
 
     const r2 = mk(doc, 'div', `${fmtTokens(ag.tokens?.total || 0)} Token · ${ag.model || ''}`, 'st-fleet-node-meta st-tabular');
@@ -574,11 +612,11 @@ export function mountFleetMonitor(host, {
       const rowBtn = mk(doc, 'button', null, `st-fleet-lane-label${isSel ? ' is-selected' : ''}`);
       rowBtn.type = 'button';
       rowBtn.style.height = `${laneH}px`;
-      const av = mk(doc, 'span', ag.roleShort || '体', 'st-fleet-avatar st-fleet-avatar-sm');
+      const av = mk(doc, 'span', ag.roleShort || '智', 'st-fleet-avatar st-fleet-avatar-sm');
       av.style.setProperty('--st-fleet-hue', hue);
       const info = mk(doc, 'div', null, 'st-fleet-lane-copy');
       info.append(
-        mk(doc, 'div', ag.name, 'st-fleet-lane-name'),
+        mk(doc, 'div', cleanFleetUiLabel(ag.name) || ag.id, 'st-fleet-lane-name'),
         mk(doc, 'div', `${fmtTokens(ag.tokens?.total || 0)} · ${ag.steps || 0} 步`, 'st-fleet-lane-meta st-tabular'),
       );
       rowBtn.append(av, info);
@@ -697,14 +735,16 @@ export function mountFleetMonitor(host, {
       itemBox.style.setProperty('--st-fleet-hue', hue);
       const top = mk(doc, 'div', null, 'st-repo-opt-head');
       const leftT = mk(doc, 'div', null, 'st-graph-controls');
-      const av = mk(doc, 'span', toAg?.roleShort || '子', 'st-fleet-avatar st-fleet-avatar-sm');
+      const av = mk(doc, 'span', toAg?.roleShort || '智', 'st-fleet-avatar st-fleet-avatar-sm');
       av.style.setProperty('--st-fleet-hue', hue);
+      const workTitle = cleanFleetUiLabel(d.label) || '未命名委派任务';
+      const workDistinctSum = dedupeSummaryAgainstTitle(d.prompt || '', workTitle);
       const briefNode = renderEntityBrief(doc, {
-        title: d.label || '未命名委派任务',
-        summary: (d.prompt || '').replace(/\s+/g, ' ').trim(),
+        title: workTitle,
+        summary: workDistinctSum,
         code: d.mode === 'reviewer' ? '只读复核' : '子会话',
-        typeLabel: toAg?.name ? `承接：${toAg.name}` : '',
-      }, { compact: true, showPath: false, maxSummaryChars: 96 });
+        typeLabel: toAg?.name ? `承接：${cleanFleetUiLabel(toAg.name)}` : '',
+      }, { compact: true, showPath: false, maxSummaryChars: 92 });
       leftT.append(av, briefNode);
       const stBadge = mk(
         doc,
@@ -736,8 +776,41 @@ export function mountFleetMonitor(host, {
   workCard.append(workHead, workFilters, workList);
 
   rightStack.append(laneCard, workCard);
+
+  // 紧凑分段切换条：1440px 笔记本下默认单舞台全宽展开避免四块面板互相挤压截断，超宽屏亦可选双栏同屏
+  const defaultStageMode = (typeof window !== 'undefined' && window.innerWidth >= 1960) ? 'split' : 'net';
+  const stageBar = mk(doc, 'div', null, 'st-fleet-stage-bar');
+  const stageSwitch = mk(doc, 'div', null, 'st-view-switch');
+  const applyStageMode = () => {
+    const mode = state.rtFleetStageMode || defaultStageMode;
+    stageSwitch.querySelectorAll('button').forEach(btn => {
+      btn.classList.toggle('is-active', btn.dataset.stageMode === mode);
+    });
+    mainGrid.classList.toggle('is-segmented', mode !== 'split');
+    netCard.hidden = mode !== 'split' && mode !== 'net';
+    rightStack.hidden = mode === 'net';
+    laneCard.hidden = mode !== 'split' && mode !== 'lane';
+    workCard.hidden = mode !== 'split' && mode !== 'work';
+  };
+  for (const [mKey, mLbl] of [
+    ['net', `🕸️ 会话网络 (${agents.length})`],
+    ['lane', `🔀 协作泳道 (${allEvents.length})`],
+    ['work', `📋 协作任务 (${scopedDelegations.length})`],
+    ['split', '⊞ 并排同屏'],
+  ]) {
+    const b = mk(doc, 'button', mLbl, 'st-btn st-btn-xs');
+    b.type = 'button';
+    b.dataset.stageMode = mKey;
+    b.addEventListener('click', () => {
+      state.rtFleetStageMode = mKey;
+      applyStageMode();
+    });
+    stageSwitch.append(b);
+  }
+  stageBar.append(stageSwitch, mk(doc, 'span', '点选任意节点、泳道圆点或任务均实时联动下方事件检查', 'st-muted-xs'));
   mainGrid.append(netCard, rightStack);
-  detailHost.append(mainGrid);
+  applyStageMode();
+  detailHost.append(stageBar, mainGrid);
 
   // 3. 底部全宽「事件检查」左右分栏详情器（局部重绘，搜索框绝不失焦）
   const inspCard = mk(doc, 'section', null, 'st-card st-fleet-inspector-card');
@@ -796,18 +869,25 @@ export function mountFleetMonitor(host, {
     const route = mk(doc, 'div', null, 'st-fleet-ev-route');
     const mkParty = (ag, fallbackId) => {
       const sp = mk(doc, 'span', null, 'st-graph-controls');
-      const av = mk(doc, 'span', ag?.roleShort || '体', 'st-fleet-avatar st-fleet-avatar-sm');
+      const av = mk(doc, 'span', ag?.roleShort || '智', 'st-fleet-avatar st-fleet-avatar-sm');
       av.style.setProperty('--st-fleet-hue', hueFor(ag?.hueIndex ?? 0));
-      sp.append(av, mk(doc, 'strong', ag?.name || fallbackId));
+      sp.append(av, mk(doc, 'strong', cleanFleetUiLabel(ag?.name) || fallbackId));
       return sp;
     };
     route.append(mkParty(fromAg, curEv.from), mk(doc, 'span', ' → ', 'st-muted-xs'), mkParty(toAg, curEv.to));
     evDetailCol.append(route);
 
+    const cleanDuty = cleanFleetUiLabel(curEv.duty);
+    const cleanBody = cleanFleetUiLabel(curEv.body);
+    const dutyDuplicatesBody = Boolean(cleanDuty && cleanBody && (cleanBody === cleanDuty || (cleanBody.startsWith(cleanDuty) && cleanBody.length <= cleanDuty.length + 12)));
     const fields = mk(doc, 'div', null, 'st-fleet-ev-fields');
+    if (!dutyDuplicatesBody && cleanDuty) {
+      fields.append(
+        mk(doc, 'div', '委派职责', 'st-muted-xs'),
+        mk(doc, 'div', cleanDuty, 'st-fleet-ev-val'),
+      );
+    }
     fields.append(
-      mk(doc, 'div', '委派职责', 'st-muted-xs'),
-      mk(doc, 'div', curEv.duty || '—', 'st-fleet-ev-val'),
       mk(doc, 'div', '执行模式', 'st-muted-xs'),
       mk(doc, 'div', curEv.executionMode || '—', 'st-fleet-ev-val'),
     );
@@ -882,10 +962,10 @@ export function mountFleetMonitor(host, {
         row.type = 'button';
         const rTop = mk(doc, 'div', null, 'st-repo-opt-head');
         rTop.append(
-          mk(doc, 'span', `${fmtTimeShort(ev.time)} · ${fromAg?.name || ev.from} → ${toAg?.name || ev.to}`, 'st-muted-xs'),
+          mk(doc, 'span', `${fmtTimeShort(ev.time)} · ${cleanFleetUiLabel(fromAg?.name) || ev.from} → ${cleanFleetUiLabel(toAg?.name) || ev.to}`, 'st-muted-xs'),
           mk(doc, 'span', ev.kindLabel || ev.kind, `st-badge ${ev.kind === 'report' ? 'st-badge-emerald' : (ev.kind === 'delegation' ? 'st-badge-amber' : 'st-badge-indigo')}`),
         );
-        row.append(rTop, mk(doc, 'div', ev.summary || ev.duty || '—', 'st-fleet-ev-preview'));
+        row.append(rTop, mk(doc, 'div', cleanFleetUiLabel(ev.summary || ev.duty) || '—', 'st-fleet-ev-preview'));
         row.addEventListener('click', () => {
           state.rtFleetSelectedEventId = ev.id;
           paintLanes();

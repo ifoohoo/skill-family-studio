@@ -5,7 +5,7 @@ export const GLOSSARY = Object.freeze({
   // 顶栏与项目角色
   'role:portfolio': {
     title: '高阶规划仓',
-    meaning: '负责总体业务需求拆解、跨仓分配清单（portfolio-allocations.json）与业务全景闭环图的规划仓库。',
+    meaning: '负责总体业务需求拆解、跨仓分配清单（portfolio-allocations.json）与业务全景流程图的规划仓库。',
     rule: '在「📝 审阅与对齐」第 ① 步提供需求进展与双向对齐总览表，可一键跨仓跳入子项目详设。',
   },
   'role:subproject': {
@@ -15,7 +15,7 @@ export const GLOSSARY = Object.freeze({
   },
   'role:standalone': {
     title: '单项目仓',
-    meaning: '独立维护自身“需求 / 故事 → 详设 → 代码与测试锁”完整闭环的仓库，无需写死任何全局配置。',
+    meaning: '独立维护“需求 / 故事 → 详设 → 代码与测试锁”全链路的仓库，无需额外全局配置。',
     rule: '默认支持直接审阅与单仓代码锁覆盖率体检。',
   },
   versionLock: {
@@ -111,10 +111,10 @@ export const GLOSSARY = Object.freeze({
   'rt:view:fleet': { title: '🛰️ 智能体会话编队', meaning: '汇总本机真实多智能体日志或沙箱演练编队，左侧展示父子会话树，右上画跨会话委派/回报泳道，下方检查每次委派简报。' },
   'rt:view:diag': { title: '🩺 异常排障', meaning: '按需排障页：标签亮出「🟢 无卡死」时平时无需打开；仅在出现「⚠️ 告警」、任务停滞或怀疑排他锁超时时点击排查。' },
   'rt:taskStatus': { title: '任务节点状态', meaning: '🟢 已完成 · 🔵 进行中 · 🔴 异常阻断（含前置依赖 blockedBy）· ⚪ 待推进；父节点自动按子节点汇总百分比。' },
-  'rt:sessionRole': { title: '会话编队角色', meaning: '「主控」负责拆解协调、「子体」并行落地具体任务、「审阅」负责只读独立复核。' },
+  'rt:sessionRole': { title: '会话编队角色', meaning: '「主控」负责拆解协调、「子会话」并行落地具体任务、「审阅」负责只读独立复核。' },
   'rt:tokenLock': { title: 'token-lock 排他文件锁', meaning: 'Foundation 写集保护锁，防止多个并行智能体同时覆写同一批文件；超过阈值（默认 30 秒）自动琥珀色预警，沙箱演练锁可在运行监控右上角一键释放。' },
   'rt:stateStore': { title: 'state-store 事件哈希链 & Fencing', meaning: '每一步状态变迁均以 SHA-256 链接到前序摘要并递增 Fencing 纪元，保证长任务断点续跑防脑裂；VALID 表示校验完整无篡改。' },
-  'rt:processStatus': { title: '受管子进程状态 (EXITED / TIMED_OUT)', meaning: 'supervise-process 对子进程的看门狗记录：RUNNING 运行中、EXITED 正常退出、TIMED_OUT 触发超时代杀保护（SIGTERM/SIGKILL）。' },
+  'rt:processStatus': { title: '受管子进程状态 (EXITED / TIMED_OUT)', meaning: 'supervise-process 对子进程的看门狗记录：RUNNING 运行中、EXITED 正常退出、TIMED_OUT 触发超时强杀保护（SIGTERM/SIGKILL）。' },
 
   // Wave 14：表头统一字典与审阅签收总规则
   'col:alignItem': { title: '高阶需求与原文入口', meaning: '显示高阶需求或规划条目的中文标题、一句话摘要与源码入口，点击条目即可直接跳读正文。' },
@@ -144,7 +144,7 @@ export const GLOSSARY = Object.freeze({
     meaning: '🟢 双向一致表示本仓详设与高阶来源均未发生未同步修改；若高阶或详设任一方改动未回写，会直接标橙/标红提醒。',
   },
   'col:chainVer': { title: '哈希链单条校验结果', meaning: '实时核验每条事件的 recordDigest 与 prevDigest 是否连续无缝，防止状态日志中途损坏或被越界改写。' },
-  'col:procGuard': { title: '看门狗退出与超时强杀标记', meaning: '标明子进程是受控正常退出（exitCode=0），还是因超过 maxSeconds 触发 SIGTERM/SIGKILL 超时代杀保护。' },
+  'col:procGuard': { title: '看门狗退出与超时强杀标记', meaning: '标明子进程是受控正常退出（exitCode=0），还是因超过 maxSeconds 触发 SIGTERM/SIGKILL 超时强杀保护。' },
   'col:runtimeTargets': { title: '监控目标与运行计划进度规则', meaning: '汇总活跃监控源、自定义挂载计划及近期历史计划的完成步数、活跃写锁、状态哈希链与子进程监督记录。' },
   'review:statusRules': {
     title: '审阅签收 5 种状态流转规则',
@@ -317,6 +317,44 @@ export function thWithInfo(doc, label, tipKey) {
   return th;
 }
 
+function appendSummaryWithInlineCode(sumEl, rawText, maxChars, doc) {
+  const cleaned = String(rawText ?? '').replace(/\*{2,}/g, '').trim();
+  if (!cleaned.includes('`')) {
+    sumEl.textContent = cleaned.length > maxChars ? `${cleaned.slice(0, maxChars - 1)}…` : cleaned;
+    return;
+  }
+  const tokens = cleaned.split(/(`[^`\n]+`)/g).filter(Boolean);
+  let remaining = maxChars;
+  let truncated = false;
+  for (const tok of tokens) {
+    if (remaining <= 0) { truncated = true; break; }
+    if (tok.startsWith('`') && tok.endsWith('`') && tok.length >= 2) {
+      const inner = tok.slice(1, -1);
+      const codeEl = doc.createElement('code');
+      codeEl.className = 'st-inline-code';
+      if (inner.length > remaining) {
+        codeEl.textContent = `${inner.slice(0, Math.max(1, remaining - 1))}…`;
+        sumEl.append(codeEl);
+        remaining = 0;
+        break;
+      }
+      codeEl.textContent = inner;
+      sumEl.append(codeEl);
+      remaining -= inner.length;
+    } else {
+      const plain = tok.replace(/`/g, '');
+      if (plain.length > remaining) {
+        sumEl.append(doc.createTextNode(`${plain.slice(0, Math.max(1, remaining - 1))}…`));
+        remaining = 0;
+        break;
+      }
+      sumEl.append(doc.createTextNode(plain));
+      remaining -= plain.length;
+    }
+  }
+  if (truncated && remaining === 0) return;
+}
+
 export function renderEntityBrief(doc, entity = {}, options = {}) {
   const {
     compact = false,
@@ -327,7 +365,7 @@ export function renderEntityBrief(doc, entity = {}, options = {}) {
   const wrap = doc.createElement('div');
   wrap.className = `st-entity-brief${compact ? ' is-compact' : ''}`;
 
-  const rawTitle = String(entity.title || entity.name || entity.code || entity.uid || '未命名条目').trim();
+  const rawTitle = String(entity.title || entity.name || entity.code || entity.uid || '未命名条目').replace(/\*{2,}/g, '').trim();
   const rawCode = String(entity.code || '').trim();
   const typeLabel = String(entity.typeLabel || '').trim();
   const badgeText = String(entity.badge || '').trim();
@@ -360,11 +398,9 @@ export function renderEntityBrief(doc, entity = {}, options = {}) {
   wrap.append(head);
 
   if (!hideSummary && entity.summary) {
-    const rawSum = String(entity.summary).trim();
-    const sumText = rawSum.length > maxSummaryChars ? `${rawSum.slice(0, maxSummaryChars - 1)}…` : rawSum;
     const sumEl = doc.createElement('div');
     sumEl.className = 'st-entity-summary';
-    sumEl.textContent = sumText;
+    appendSummaryWithInlineCode(sumEl, entity.summary, maxSummaryChars, doc);
     wrap.append(sumEl);
   }
 

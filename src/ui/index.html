@@ -48,7 +48,7 @@
         <span id="st-progress-pair" class="st-badge-pair">
           <button type="button" id="st-progress-capsule" class="st-progress-capsule" title="当前项目审阅进度；点击展开全部受管仓库汇总验收单">
             <span id="st-progress-text">审阅进度：已通过 0 · 审阅中 0 · 需修改 0 · 暂缓 0 / 共 0 项</span>
-            <span>导出 ▾</span>
+            <span class="st-progress-export-lbl">导出 ▾</span>
           </button>
           <span id="st-progress-info-slot"></span>
         </span>
@@ -72,7 +72,7 @@
           <h2 id="st-export-title" style="margin:0;font-size:18px;">审阅汇总与验收单导出</h2>
           <button type="button" id="st-export-close" class="st-btn">关闭 ✕</button>
         </div>
-        <p class="st-muted-xs" style="margin:0;">顶栏胶囊显示当前项目进度；下方导出汇总当前工作区全部受管仓库的结论与待解决批注，100% 不改动受审仓的 Git 跟踪文件。</p>
+        <p class="st-muted-xs" style="margin:0;">顶栏胶囊显示当前项目进度；下方导出内容汇总当前工作区全部受管仓库的结论与待解决批注，不修改受审仓库受 Git 跟踪的文件。</p>
         <div style="display:flex;flex-wrap:wrap;gap:8px;">
           <button type="button" id="st-copy-md-btn" class="st-btn st-btn-primary">📋 一键复制 Markdown 验收单</button>
           <a id="st-dl-md-link" href="/api/studio/summary?format=markdown" download="studio-review-summary.md" class="st-btn">⬇ 下载 Markdown 验收单</a>

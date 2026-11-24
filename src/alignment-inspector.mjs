@@ -120,14 +120,15 @@ export async function resolveRepoTier(repoReal, {
 } = {}) {
   const normalizeTier = raw => {
     const clean = String(raw ?? '').trim().toLowerCase();
-    if (clean === 'support' || clean === 'business') return clean;
+    if (clean === 'support' || clean === 'business' || clean === 'portfolio') return clean;
     return null;
   };
+  const labelForTier = tier => (tier === 'support' ? '支撑仓 (support)' : (tier === 'portfolio' ? '高阶规划仓' : '业务仓 (business)'));
 
   const manifest = await readJsonContainedSafe(repoReal, 'skill-family.project-manifest.json');
   const manifestTier = normalizeTier(manifest?.repoTier ?? manifest?.project?.repoTier);
   if (manifestTier) {
-    return { repoTier: manifestTier, repoTierLabel: manifestTier === 'support' ? '支撑仓 (support)' : '业务仓 (business)', source: 'skill-family.project-manifest.json' };
+    return { repoTier: manifestTier, repoTierLabel: labelForTier(manifestTier), source: 'skill-family.project-manifest.json' };
   }
 
   const rootMapTier = normalizeTier(
@@ -136,22 +137,26 @@ export async function resolveRepoTier(repoReal, {
     ?? (group && rootWorkspaceCfg?.groupTiers?.[group]),
   );
   if (rootMapTier) {
-    return { repoTier: rootMapTier, repoTierLabel: rootMapTier === 'support' ? '支撑仓 (support)' : '业务仓 (business)', source: '.studio-workspace.json#repoTiers' };
+    return { repoTier: rootMapTier, repoTierLabel: labelForTier(rootMapTier), source: '.studio-workspace.json#repoTiers' };
   }
 
   const localTier = normalizeTier(studioCfg?.repoTier);
   if (localTier) {
     return {
       repoTier: localTier,
-      repoTierLabel: localTier === 'support' ? '支撑仓 (support)' : '业务仓 (business)',
+      repoTierLabel: labelForTier(localTier),
       source: studioCfg?.repoTierSource || '.studio-workspace.json / artifact-graph.config.yaml#studio',
     };
   }
 
-  if (repoRole !== 'portfolio' && (
+  if (repoRole === 'portfolio') {
+    return { repoTier: 'portfolio', repoTierLabel: '高阶规划仓', source: 'portfolio-role' };
+  }
+
+  if (
     DEFAULT_SUPPORT_REPO_NAMES.has(repoName)
     || DEFAULT_SUPPORT_REPO_NAMES.has(packageName)
-  )) {
+  ) {
     return { repoTier: 'support', repoTierLabel: '支撑仓 (support)', source: 'default-support-catalog' };
   }
 
@@ -183,13 +188,18 @@ export async function computeFoundationBaseline(repoDepsList = []) {
 
 export function evaluateRepoFoundationAlignment({
   repoTier = 'business',
+  repoRole = '',
   repoTierLabel = null,
   repoTierSource = 'default-business',
   declaredDeps = {},
   baseline = {},
 } = {}) {
-  const effectiveTier = repoTier === 'support' ? 'support' : 'business';
-  const effectiveTierLabel = repoTierLabel || (effectiveTier === 'support' ? '支撑仓 (support)' : '业务仓 (business)');
+  const effectiveTier = repoTier === 'support' ? 'support' : ((repoTier === 'portfolio' || repoRole === 'portfolio') ? 'portfolio' : 'business');
+  const effectiveTierLabel = repoTierLabel || (
+    effectiveTier === 'support'
+      ? '支撑仓 (support)'
+      : (effectiveTier === 'portfolio' ? '高阶规划仓' : '业务仓 (business)')
+  );
   const declared = {};
   const laggingPackages = [];
 
@@ -226,7 +236,9 @@ export function evaluateRepoFoundationAlignment({
       status: 'not_applicable',
       badgeLabel: '⚪ 未锁定底座包',
       badgeTone: 'zinc',
-      headline: '当前仓库未声明 Foundation 或 artifact-graph 依赖包。',
+      headline: effectiveTier === 'portfolio'
+        ? '当前高阶规划仓未直接声明底座运行时依赖包。'
+        : '当前仓库未声明 Foundation 或 artifact-graph 依赖包。',
       baseline,
       declared,
       laggingPackages,
@@ -249,6 +261,7 @@ export function evaluateRepoFoundationAlignment({
         laggingPackages,
       };
     }
+    const roleSubject = effectiveTier === 'portfolio' ? '高阶规划仓' : '业务仓';
     return {
       repoTier: effectiveTier,
       repoTierLabel: effectiveTierLabel,
@@ -256,7 +269,7 @@ export function evaluateRepoFoundationAlignment({
       status: 'business_optional_upgrade',
       badgeLabel: 'ℹ️ 可选底座新版本',
       badgeTone: 'indigo',
-      headline: `业务仓存在可选新版底座：${summaryList}（非阻断，可按节奏升级）`,
+      headline: `${roleSubject}存在可选新版底座：${summaryList}（非阻断，可按节奏升级）`,
       baseline,
       declared,
       laggingPackages,
@@ -268,7 +281,9 @@ export function evaluateRepoFoundationAlignment({
     repoTierLabel: effectiveTierLabel,
     repoTierSource,
     status: 'aligned',
-    badgeLabel: effectiveTier === 'support' ? '🟢 支撑仓底座已对齐' : '🟢 底座版本已对齐',
+    badgeLabel: effectiveTier === 'support'
+      ? '🟢 支撑仓底座已对齐'
+      : (effectiveTier === 'portfolio' ? '🟢 高阶规划仓底座已对齐' : '🟢 底座版本已对齐'),
     badgeTone: 'emerald',
     headline: 'Foundation 与 artifact-graph 锁定版本已与工作区最新基线一致。',
     baseline,

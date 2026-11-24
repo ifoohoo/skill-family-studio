@@ -31,7 +31,7 @@ export function buildReviewStatusFlowSvg(doc = document) {
     viewBox: '0 0 920 265',
     class: 'st-guide-svg',
     role: 'img',
-    'aria-label': '审阅状态四态自动与手动流转图',
+    'aria-label': '审阅五态流转图（自动感知与手动签收）',
   });
   const defs = svgNode(doc, 'defs');
   addArrowMarker(doc, defs, 'st-flow-arrow-indigo', 'var(--st-indigo-fg)');

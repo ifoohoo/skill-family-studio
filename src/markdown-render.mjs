@@ -30,6 +30,7 @@ export function cleanInlinePlain(text) {
     .replace(/`([^`]+)`/g, '$1')
     .replace(/\*\*([^*]+)\*\*/g, '$1')
     .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/\*{2,}/g, '')
     .replace(/<[^>]+>/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -102,12 +103,39 @@ export function extractArtifactBrief({
   const rawTitle = cleanInlinePlain(fmParsed.title || h1Title || fallbackTitle || code || fileFallback || '未命名制品');
   const title = rawTitle || cleanInlinePlain(code || fileFallback || '未命名制品');
 
+  const isJsonPath = /\.json$/i.test(String(path || ''));
+  const isCsvPath = /\.csv$/i.test(String(path || ''));
   let summary = cleanInlinePlain(fmParsed.summary || fmParsed.description || fmParsed.purpose || '');
-  if (summary.length < 10) {
+  if (summary.length < 10 && isJsonPath) {
+    try {
+      const parsedJson = JSON.parse(sanitized);
+      if (parsedJson && typeof parsedJson === 'object' && !Array.isArray(parsedJson)) {
+        const strSum = parsedJson.summary || parsedJson.description || parsedJson.reason || parsedJson.title || '';
+        if (typeof strSum === 'string' && cleanInlinePlain(strSum).length >= 10 && cleanInlinePlain(strSum) !== title) {
+          summary = cleanInlinePlain(strSum);
+        } else {
+          const topKeys = Object.keys(parsedJson).filter(k => !k.startsWith('_')).slice(0, 5);
+          if (topKeys.length > 0) {
+            summary = `JSON 结构化数据与状态记录（包含字段：${topKeys.join('、')}）。`;
+          }
+        }
+      }
+    } catch {}
+  } else if (summary.length < 10 && isCsvPath) {
+    const nonEmptyRows = sanitized.split('\n').map(l => l.trim()).filter(Boolean);
+    const cols = (nonEmptyRows[0] || '').split(',').map(c => c.trim()).filter(Boolean).slice(0, 5);
+    const dataCount = Math.max(0, nonEmptyRows.length - 1);
+    summary = cols.length > 0
+      ? `CSV 表格数据记录（共 ${dataCount} 行，列：${cols.join('、')}）。`
+      : `CSV 表格数据记录（${title}）。`;
+  }
+  if (summary.length < 10 && !isJsonPath && !isCsvPath) {
     summary = cleanInlinePlain(proseSnippets.join(' '));
   }
   if (summary.length < 10) {
-    summary = `查看${typeLabel ? `「${typeLabel}」` : '制品'}「${title}」的业务范围、边界约定与验收细则。`;
+    summary = (isJsonPath || isCsvPath)
+      ? `结构化数据与状态证据文件（${title}）。`
+      : `查看${typeLabel ? `「${typeLabel}」` : '制品'}「${title}」的业务范围、边界约定与验收细则。`;
   }
   if (summary.length > 105) {
     const cutWindow = summary.slice(48, 104);
@@ -143,10 +171,14 @@ function renderDocHeroHtml({ title, summary, code, typeLabel, path, status, fron
   ].join('');
 }
 
-function renderInlineMarkdown(text) {
-  let out = escapeHtml(text);
-  out = out.replace(/`([^`]+)`/g, '<code class="st-inline-code">$1</code>');
+export function renderInlineMarkdown(text) {
+  const codeSpans = [];
+  let out = escapeHtml(text).replace(/`([^`]+)`/g, (_m, inner) => {
+    const idx = codeSpans.push(`<code class="st-inline-code">${inner}</code>`) - 1;
+    return `\u0000CODE_${idx}\u0000`;
+  });
   out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  out = out.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '<em>$1</em>');
   out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label, href) => {
     const expMatch = /(?:^|\/)(\d{2})\.md(?:#.*)?$/.exec(href.trim());
     if (expMatch) {
@@ -159,7 +191,7 @@ function renderInlineMarkdown(text) {
     }
     return `<span class="st-inline-ref">${label}</span>`;
   });
-  return out;
+  return out.replace(/\u0000CODE_(\d+)\u0000/g, (_m, idx) => codeSpans[Number(idx)] || '');
 }
 
 export function renderMermaidOffline(rawLines) {
@@ -427,29 +459,66 @@ export function renderMarkdownToHtml(markdown, { idPrefix = 'sec', stripNavLine 
       }
       continue;
     }
-    if (/^[-*]\s+/.test(trimmed)) {
+    const isListContinuationStop = ln => {
+      const lt = ln.trim();
+      return !lt
+        || /^#{1,6}\s/.test(lt)
+        || /^```/.test(lt)
+        || /^(?:-{3,}|\*{3,}|_{3,})$/.test(lt)
+        || /^>/.test(lt)
+        || /^\|/.test(lt)
+        || /^<\/?(?:details|summary)\b/i.test(lt)
+        || /^[-*+]\s+/.test(lt)
+        || /^\d+\.\s+/.test(lt);
+    };
+    const joinSoftLines = parts => {
+      let acc = '';
+      for (const seg of parts) {
+        const s = seg.trim();
+        if (!s) continue;
+        if (!acc) { acc = s; continue; }
+        const cjkEnd = /[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]$/.test(acc);
+        const cjkStart = /^[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]/.test(s);
+        acc += (cjkEnd && cjkStart) ? s : ` ${s}`;
+      }
+      return acc;
+    };
+    if (/^[-*+]\s+/.test(trimmed)) {
       const items = [];
-      while (i < lines.length && /^[-*]\s+/.test(lines[i].trim())) {
-        const lineBody = lines[i].trim().replace(/^[-*]\s+/, '');
+      while (i < lines.length && /^[-*+]\s+/.test(lines[i].trim())) {
+        const parts = [lines[i].trim().replace(/^[-*+]\s+/, '')];
+        i++;
+        while (i < lines.length && !isListContinuationStop(lines[i])) {
+          parts.push(lines[i].trim());
+          i++;
+        }
+        const lineBody = joinSoftLines(parts);
         const kvMatch = /^\*\*([^*：:]{1,28})\*\*\s*[：:]\s*(.+)$/.exec(lineBody);
         if (kvMatch) {
           items.push(`<li class="st-kv-item"><span class="st-kv-key">${escapeHtml(kvMatch[1].trim())}</span><span class="st-kv-val">${renderInlineMarkdown(kvMatch[2].trim())}</span></li>`);
         } else {
           items.push(`<li>${renderInlineMarkdown(lineBody)}</li>`);
         }
-        i++;
       }
       blocks.push(`<ul class="st-prose-list">${items.join('')}</ul>`);
       continue;
     }
     if (/^\d+\.\s+/.test(trimmed)) {
       const items = [];
-      while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) { items.push(`<li>${renderInlineMarkdown(lines[i].trim().replace(/^\d+\.\s+/, ''))}</li>`); i++; }
+      while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) {
+        const parts = [lines[i].trim().replace(/^\d+\.\s+/, '')];
+        i++;
+        while (i < lines.length && !isListContinuationStop(lines[i])) {
+          parts.push(lines[i].trim());
+          i++;
+        }
+        items.push(`<li>${renderInlineMarkdown(joinSoftLines(parts))}</li>`);
+      }
       blocks.push(`<ol class="st-prose-list">${items.join('')}</ol>`);
       continue;
     }
     const p = [];
-    while (i < lines.length && lines[i].trim() && !/^(?:#|```|>|\||[-*]\s+|\d+\.\s+)/.test(lines[i].trim())) {
+    while (i < lines.length && lines[i].trim() && !/^(?:#|```|>|\||[-*+]\s+|\d+\.\s+)/.test(lines[i].trim())) {
       p.push(lines[i].trim());
       i++;
     }

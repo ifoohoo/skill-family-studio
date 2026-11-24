@@ -26,15 +26,25 @@ function tryUnwrapJsonString(val) {
   return val;
 }
 
-function summarizeDutyFromPrompt(rawPrompt, fallback = '子智能体专项任务') {
-  const clean = sanitizeFleetText(rawPrompt)
-    .replace(/<[^>]+>/g, ' ')
+function cleanFleetTitleText(value) {
+  return cleanInlinePlain(sanitizeFleetText(value))
     .replace(/^[#\s>*-]+/, '')
+    .replace(/\*{2,}/g, '')
     .trim();
-  if (!clean) return fallback;
-  const firstLine = clean.split(/\r?\n/).map(l => l.replace(/^[#\s>*-]+/, '').trim()).find(l => l.length > 3) || clean;
-  const normalized = firstLine.replace(/\s+/g, ' ');
-  return normalized.length > 42 ? `${normalized.slice(0, 41)}…` : normalized;
+}
+
+function summarizeDutyFromPrompt(rawPrompt, fallback = '子智能体专项任务') {
+  const sanitized = sanitizeFleetText(rawPrompt)
+    .replace(/<\/?(?:CONTEXT_SUMMARY|subagent_reminder|user_rules|messaging|artifacts|guidelines|instructions|system|task)[^>]*>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ');
+  const lines = sanitized
+    .split(/\r?\n/)
+    .map(l => cleanInlinePlain(l).replace(/^[#\s>*-]+/, '').trim())
+    .filter(Boolean);
+  const firstLine = lines.find(l => l.length > 3) || lines[0] || '';
+  if (!firstLine) return fallback;
+  const normalized = firstLine.replace(/\s+/g, ' ').replace(/\*{2,}/g, '').trim();
+  return normalized.length > 42 ? `${normalized.slice(0, 41).replace(/\*{1,2}$/, '').trim()}…` : normalized;
 }
 
 function inferRoleBadge(label, isRoot, isReviewer) {
@@ -196,7 +206,7 @@ export function parseAntigravityTranscript(rawLines, conversationId) {
       const args = tc?.args && typeof tc.args === 'object' ? tc.args : {};
       if (name === 'invoke_subagent') {
         const promptText = sanitizeFleetText(tryUnwrapJsonString(args.Prompt || args.Task || ''));
-        const explicitName = sanitizeFleetText(tryUnwrapJsonString(args.Name || args.SubagentName || ''));
+        const explicitName = cleanFleetTitleText(tryUnwrapJsonString(args.Name || args.SubagentName || ''));
         pendingSubagentInvokes.push({
           seq: rec.step_index ?? steps,
           time: rec.created_at || updatedAt,
@@ -564,7 +574,7 @@ export function buildSandboxFleetSample(nowIso = new Date().toISOString()) {
     { id: 'sbx-del-2', seq: 12, time: iso(35), from: 'coord-main', to: 'sub-frontend', label: '构建编队监控界面与就地提示浮层', mode: 'subagent', status: 'in_progress', prompt: agents[2].prompt },
     { id: 'sbx-del-3', seq: 13, time: iso(50), from: 'coord-main', to: 'sub-docs', label: '重写零基础逐页说明书与状态流转图', mode: 'subagent', status: 'completed', prompt: agents[3].prompt },
     { id: 'sbx-del-4', seq: 28, time: iso(330), from: 'coord-main', to: 'sub-verify', label: '运行 2560px 宽屏及全功能回归核验', mode: 'subagent', status: 'completed', prompt: agents[4].prompt },
-    { id: 'sbx-del-5', seq: 36, time: iso(525), from: 'sub-verify', to: 'sub-reviewer', label: '发起只读独立终审与闭环核验', mode: 'reviewer', status: 'completed', prompt: agents[5].prompt },
+    { id: 'sbx-del-5', seq: 36, time: iso(525), from: 'sub-verify', to: 'sub-reviewer', label: '发起只读独立终审与验收核对', mode: 'reviewer', status: 'completed', prompt: agents[5].prompt },
   ];
 
   const events = [
@@ -635,7 +645,7 @@ export function buildSandboxFleetSample(nowIso = new Date().toISOString()) {
       duty: '独立只读审阅签收',
       executionMode: '只读独立复核',
       summary: 'PASS：全部核心源码已绑定版本锁，零私有路径泄露，公开仓校验一致。',
-      body: '## 独立复核结论：PASS\n- `unclaimedEntries = 0`\n- 公开仓与私仓 SHA-256 100% 匹配\n- 全部 9 项产品指摘均已闭环。',
+      body: '## 独立复核结论：PASS\n- `unclaimedEntries = 0`\n- 公开仓与私仓 SHA-256 逐字节一致\n- 全部 9 项产品审阅意见均已修复验证。',
       note: '独立审阅官向主控回报最终审核意见。',
     },
   ].sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
@@ -643,7 +653,8 @@ export function buildSandboxFleetSample(nowIso = new Date().toISOString()) {
   return {
     id: 'sandbox-fleet-demo',
     host: 'sandbox',
-    title: '沙箱多智能体协作编队演练（6 会话闭环样板）',
+    title: '沙箱多智能体协作编队演练',
+    briefSummary: '演示主控会话并行委派架构、前端、文档与独立审阅子会话的完整协作轨迹。',
     repoHint: 'skill-family-studio',
     startedAt: iso(0),
     updatedAt: iso(595),
@@ -710,7 +721,7 @@ export function parseClaudeSessionJsonl(rawLines, sessionId, subagentLinesMap = 
     for (const blk of Array.isArray(msg?.content) ? msg.content : []) {
       if (blk?.type === 'tool_use' && (blk.name === 'Agent' || blk.name === 'Task')) {
         const subId = sanitizeFleetText(blk.id || `cl-sub-${delegations.length + 1}`);
-        const subDesc = sanitizeFleetText(blk.input?.description || blk.input?.subagent_type || '子任务委派');
+        const subDesc = cleanFleetTitleText(blk.input?.description || blk.input?.subagent_type || '子任务委派') || '子任务委派';
         const subPrompt = sanitizeFleetText(blk.input?.prompt || '');
         delegations.push({
           id: `cl-del-${subId}`,
@@ -789,7 +800,7 @@ export function parseClaudeSessionJsonl(rawLines, sessionId, subagentLinesMap = 
     }
     const delMatch = delegations[idx - 1];
     const subId = delMatch?.to || subName;
-    const label = delMatch?.label || (sPrompt ? summarizeDutyFromPrompt(sPrompt, `子体 ${subName}`) : `子体 ${subName}`);
+    const label = delMatch?.label || (sPrompt ? summarizeDutyFromPrompt(sPrompt, `子会话 ${subName}`) : `子会话 ${subName}`);
     const isRev = /审阅|复核|review|audit/i.test(label);
     agents.push({
       id: subId,
@@ -849,7 +860,7 @@ export function parseClaudeSessionJsonl(rawLines, sessionId, subagentLinesMap = 
         id: del.to,
         parentId: sessionId,
         depth: 1,
-        name: del.label || `子体 ${del.to}`,
+        name: del.label || `子会话 ${del.to}`,
         role: isRev ? 'reviewer' : 'subagent',
         roleShort: inferRoleBadge(del.label || del.to, false, isRev),
         hueIndex: agents.length % 8,
@@ -1270,29 +1281,58 @@ export async function collectSessionFleet({
   selected.sort(compareFamily);
 
   const HOST_ZH = { sandbox: '沙箱演练', antigravity: 'Antigravity', claude: 'Claude Code', codex: 'Codex', local: '本地快照' };
+  const stripSystemTags = raw => String(raw ?? '')
+    .replace(/<\/?(?:CONTEXT_SUMMARY|subagent_reminder|user_rules|messaging|artifacts|guidelines|instructions|system|task)[^>]*>/gi, ' ')
+    .replace(/^(?:RESUMING MY OWN TASK IN PROGRESS\.?|The user requests above[^.]*\.)/i, ' ')
+    .replace(/\[(?:Message|truncated[^\]]*)\]/gi, ' ');
   const enrichSummaryText = (raw, fallback) => {
-    const cleaned = cleanInlinePlain(
-      String(raw ?? '')
-        .replace(/<\/?(?:CONTEXT_SUMMARY|subagent_reminder|user_rules|messaging|artifacts|guidelines|instructions|system|task)[^>]*>/gi, ' ')
-        .replace(/^(?:RESUMING MY OWN TASK IN PROGRESS\.?|The user requests above[^.]*\.)/i, ' ')
-        .replace(/\[(?:Message|truncated[^\]]*)\]/gi, ' '),
-    );
+    const cleaned = cleanInlinePlain(stripSystemTags(raw));
     if (cleaned.length >= 16) {
-      return cleaned.length > 96 ? `${cleaned.slice(0, 92).replace(/[，、；：,\s]+$/, '')}…` : cleaned;
+      return cleaned.length > 96 ? `${cleaned.slice(0, 92).replace(/[，、；：,\s*]+$/, '')}…` : cleaned;
     }
     return fallback;
   };
+  const extractDistinctFollowup = (raw, titleText, fallback) => {
+    const baseTitle = cleanFleetTitleText(titleText).replace(/…$/, '');
+    const lines = stripSystemTags(raw)
+      .split(/\r?\n/)
+      .map(l => cleanInlinePlain(l).replace(/^[#\s>*-]+/, '').trim())
+      .filter(Boolean);
+    const restLines = lines.filter((ln, idx) => !(idx === 0 && baseTitle && (ln.startsWith(baseTitle) || baseTitle.startsWith(ln))));
+    const joinedRest = restLines.join(' ').trim();
+    if (joinedRest.length >= 14 && (!baseTitle || joinedRest !== baseTitle)) {
+      return joinedRest.length > 96 ? `${joinedRest.slice(0, 92).replace(/[，、；：,\s*]+$/, '')}…` : joinedRest;
+    }
+    const singleClean = cleanInlinePlain(stripSystemTags(raw));
+    if (baseTitle && singleClean.startsWith(baseTitle)) {
+      const tail = singleClean.slice(baseTitle.length).replace(/^[：:，,。；;·\-\s]+/, '').trim();
+      if (tail.length >= 14) {
+        return tail.length > 96 ? `${tail.slice(0, 92).replace(/[，、；：,\s*]+$/, '')}…` : tail;
+      }
+      return fallback;
+    }
+    return enrichSummaryText(raw, fallback);
+  };
   for (const fam of selected) {
     const coord = (fam.agents || []).find(a => !a.parentId) || fam.agents?.[0];
-    const cleanTitle = enrichSummaryText(fam.title, `${HOST_ZH[fam.host] || fam.host} 会话编队`);
-    fam.title = cleanTitle.length > 56 ? `${cleanTitle.slice(0, 52)}…` : cleanTitle;
+    const cleanTitle = cleanFleetTitleText(fam.title) || enrichSummaryText(fam.title, `${HOST_ZH[fam.host] || fam.host} 会话编队`);
+    fam.title = cleanTitle.length > 56 ? `${cleanTitle.slice(0, 52).replace(/\*{1,2}$/, '').trim()}…` : cleanTitle;
     const totalTok = fam.summary?.totalTokens || 0;
     const delCnt = fam.summary?.totalDelegations ?? (fam.delegations?.length || 0);
-    const fallbackBrief = `${HOST_ZH[fam.host] || fam.host} 多智能体协作编队，含 ${fam.agents?.length || 0} 个会话、${delCnt} 次委派，累计消耗 ${totalTok.toLocaleString()} Tokens。`;
-    fam.briefSummary = enrichSummaryText(coord?.prompt || coord?.duty || fam.title, fallbackBrief);
+    const fallbackBrief = `${HOST_ZH[fam.host] || fam.host} 协作编队 · 共 ${fam.agents?.length || 0} 个会话、${delCnt} 次任务委派${totalTok > 0 ? `，累计 ${totalTok.toLocaleString()} Tokens` : ''}。`;
+    fam.briefSummary = extractDistinctFollowup(coord?.prompt || '', fam.title, fallbackBrief);
     for (const a of fam.agents || []) {
-      const aFallback = `${a.executionMode || '会话节点'} · ${a.duty || a.name}`;
-      a.briefSummary = enrichSummaryText(a.prompt || a.duty, aFallback);
+      a.name = cleanFleetTitleText(a.name) || a.id;
+      a.duty = cleanFleetTitleText(a.duty) || a.name;
+      const aFallback = `${a.executionMode || '会话节点'} · ${a.steps || 0} 步`;
+      a.briefSummary = extractDistinctFollowup(a.prompt || '', a.name, aFallback);
+    }
+    for (const d of fam.delegations || []) {
+      d.label = cleanFleetTitleText(d.label) || '子任务委派';
+    }
+    for (const ev of fam.events || []) {
+      ev.summary = cleanFleetTitleText(ev.summary);
+      ev.duty = cleanFleetTitleText(ev.duty);
     }
   }
 

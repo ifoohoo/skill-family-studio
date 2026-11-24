@@ -1290,6 +1290,9 @@ async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHist
     else if (ts.running > 0 || ts.done > 0 || ts.blocked > 0 || t.activeLockCount > 0) status = 'in_progress';
     let summary = ts.focusBanner?.detail || '';
     let liveMarkdown = '';
+    let liveStructured = '';
+    const liveExt = t.planPath ? extname(t.planPath).toLowerCase() : '.md';
+    const liveFormat = liveExt === '.json' ? 'json' : (liveExt === '.csv' ? 'csv' : 'markdown');
     if ((!summary || ts.total === 0) && t.planPath) {
       const raw = await readTextBoundedSafe(t.planPath);
       if (raw !== null) {
@@ -1297,7 +1300,15 @@ async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHist
           summary = extractArtifactBrief({ rawText: raw, fallbackTitle: t.title, typeLabel: '活跃执行计划', path: t.planPath }).summary;
         }
         if (ts.total === 0) {
-          liveMarkdown = sanitizePublicText(raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '')).trim().slice(0, 60000);
+          if (liveFormat === 'markdown') {
+            liveMarkdown = sanitizePublicText(raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '')).trim().slice(0, 60000);
+          } else {
+            let pretty = raw;
+            if (liveFormat === 'json') {
+              try { pretty = JSON.stringify(JSON.parse(raw), null, 2); } catch {}
+            }
+            liveStructured = sanitizePublicText(pretty).trim().slice(0, 40000);
+          }
         }
       }
     }
@@ -1316,12 +1327,14 @@ async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHist
       updatedAt: st?.mtime ? new Date(st.mtime).toISOString() : new Date().toISOString(),
       isHistorical: false,
       isSandbox: Boolean(t.isSandbox),
+      fileFormat: liveFormat,
       planPath: shortDisplayPath(t.planPath || ''),
       completedSteps: ts.done,
       totalSteps: ts.total,
       percent: ts.percent,
       taskSummary: ts,
       markdownText: liveMarkdown || undefined,
+      structuredText: liveStructured || undefined,
       target: t,
     }));
   }
@@ -1359,6 +1372,7 @@ async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHist
     const raw = await readTextBoundedSafe(cand.abs);
     if (raw === null) continue;
     const ext = extname(cand.abs).toLowerCase();
+    const histFormat = ext === '.json' ? 'json' : (ext === '.csv' ? 'csv' : 'markdown');
     const stem = basename(cand.abs, ext);
     const ts = parsePlanSummary(raw, ext, stem);
     const brief = extractArtifactBrief({ rawText: raw, fallbackTitle: stem, code: stem, typeLabel: cand.badge, path: cand.abs });
@@ -1371,6 +1385,14 @@ async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHist
       status = 'in_progress';
     }
     const percent = ts.total > 0 ? ts.percent : (status === 'completed' ? 100 : 0);
+    let histStructured = '';
+    if (ts.total === 0 && histFormat !== 'markdown') {
+      let pretty = raw;
+      if (histFormat === 'json') {
+        try { pretty = JSON.stringify(JSON.parse(raw), null, 2); } catch {}
+      }
+      histStructured = sanitizePublicText(pretty).trim().slice(0, 40000);
+    }
     histCount += 1;
     plans.push(sanitizeDeep({
       id: `hist:${cand.repoName}:${basename(cand.abs)}`.replace(/[^A-Za-z0-9_.:/-]+/g, '_'),
@@ -1381,18 +1403,20 @@ async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHist
       statusLabel: status === 'completed' ? '已完成' : (status === 'in_progress' ? '进行中' : '待启动'),
       repoId: cand.repoId,
       repoName: cand.repoName,
-      badge: cand.badge,
+      badge: histFormat === 'markdown' ? cand.badge : '状态/规划数据',
       updatedAt: cand.mtimeMs ? new Date(cand.mtimeMs).toISOString() : null,
       isHistorical: true,
       isSandbox: false,
+      fileFormat: histFormat,
       planPath: shortDisplayPath(cand.abs),
       completedSteps: ts.done,
       totalSteps: ts.total,
       percent,
       taskSummary: ts,
-      markdownText: ts.total === 0
+      markdownText: ts.total === 0 && histFormat === 'markdown'
         ? sanitizePublicText(raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '')).trim().slice(0, 60000)
         : undefined,
+      structuredText: histStructured || undefined,
       target: null,
     }));
   }
