@@ -22,17 +22,11 @@ export const DEFAULT_SUPPORT_REPO_NAMES = Object.freeze(new Set([
   'skill-family-test-workspace',
   'skill-family-hub-workspace',
   'skill-family-doc-render-workspace',
-  'humanize-rewrite-workspace',
   'skill-failure-auditor-workspace',
   'skill-family-audit-workspace',
   'release-skill',
   'artifact-graph',
   'agent-method-registry',
-  'user-story-workspace',
-  'flow-architect',
-  'cost-modeler-workspace',
-  'e2e-test',
-  'artifact-skill-set-workspace',
 ]));
 
 const STUDIO_PKG_JSON_URL = new URL('../package.json', import.meta.url);
