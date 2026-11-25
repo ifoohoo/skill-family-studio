@@ -271,7 +271,18 @@ async function probeFoundationTrack(repoReal, repoEntry) {
     const pinMap = prof?.adoption?.foundation_pin?.packages || prof?.foundationPin?.packages || null;
     if (pinMap && typeof pinMap === 'object') {
       for (const pkgName of FOUNDATION_PKG_NAMES) {
-        const rawVer = typeof pinMap[pkgName] === 'string' ? pinMap[pkgName] : pinMap[pkgName]?.version;
+        const pinEntry = pinMap[pkgName];
+        if (
+          pinEntry
+          && typeof pinEntry === 'object'
+          && pinEntry.path === null
+          && pinEntry.sha256 === null
+          && !prof?.adoption?.adopted_at
+        ) {
+          // 跳过 engineering-kit 初始化留下的未生效空模板占位（path/sha256/adopted_at 均为 null）
+          continue;
+        }
+        const rawVer = typeof pinEntry === 'string' ? pinEntry : pinEntry?.version;
         const tuple = parseSemverTuple(rawVer);
         if (tuple) {
           evidence.push({
@@ -836,7 +847,9 @@ function evaluateArchitecturalRisks(rawRisks, probedRepos, probedByKey, hubActua
 
     if (risk.probeKind === 'foundation_pin_022') {
       const legacyRepos = probedRepos.filter(r =>
-        r.live?.existsOnDisk && (
+        (r.ring === 'core' || r.ring === 'method')
+        && r.live?.existsOnDisk
+        && (
           r.live.foundation?.hasLegacy022
           || (
             r.expectedFoundationTrack === '0.39.x'
@@ -987,10 +1000,16 @@ async function evaluateRoadmapMilestones(rawRoadmap, ctx) {
         probeSource = '各目标仓 artifacts/traceability-version-lock.json + sft-runs.json';
       } else if (ms.probeCheck === 'independent_site_070') {
         const docRender = lookupProbedRepo(probedByKey, 'skill-family-doc-render')
-          || probedRepos.find(r => r.publicName === 'skill-family-doc-render');
+          || lookupProbedRepo(probedByKey, 'skill-family-docs')
+          || probedRepos.find(r =>
+            r.publicName === 'skill-family-doc-render'
+            || r.publicName === 'skill-family-docs',
+          );
         const drTuple = parseSemverTuple(docRender?.live?.sourceVersion?.version);
         const drReady = Boolean(drTuple && compareSemverTuple(drTuple, [0, 7, 0]) >= 0);
-        const targets = resolveMilestoneTargets(ms.ownerRepos, r => r.ring === 'core' && r.expectedDocSiteMode === 'independent_site_070');
+        const rawTargets = resolveMilestoneTargets(ms.ownerRepos, r => r.ring === 'core' && r.expectedDocSiteMode === 'independent_site_070');
+        const expectedSiteTargets = rawTargets.filter(r => r.expectedDocSiteMode === 'independent_site_070');
+        const targets = expectedSiteTargets.length > 0 ? expectedSiteTargets : rawTargets;
         const siteReady = targets.filter(r => r.live?.docSite?.isIndependentSite);
         if (drReady && targets.length > 0 && siteReady.length === targets.length) {
           status = 'passed';
