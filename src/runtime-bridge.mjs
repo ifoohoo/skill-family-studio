@@ -3,7 +3,7 @@
 import { lstatSync, realpathSync } from 'node:fs';
 import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, dirname, extname, isAbsolute, join, resolve, sep } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { digestDocument } from 'skill-family-contracts';
 import {
   FOUNDATION_PACKAGE_VERSION,
@@ -379,10 +379,71 @@ export function parsePlanSummary(content, ext = '.md', sourceLabel = 'plan') {
           children,
         };
       };
-      const topList = Array.isArray(parsed)
-        ? parsed
-        : (parsed?.waves || parsed?.phases || parsed?.milestones || parsed?.tasks || parsed?.steps || parsed?.actual_steps || []);
-      tree = (Array.isArray(topList) ? topList : []).map((e, i) => convertNode(e, i, 0, 'JSON 阶段步骤')).filter(Boolean);
+      const unwrappedReceipt = Array.isArray(parsed?.runs) && parsed.runs.length > 0 && parsed.runs.at(-1)?.kind === 'skill-family-test.run-receipt'
+        ? parsed.runs.at(-1)
+        : parsed;
+      const isRunReceipt = Boolean(
+        unwrappedReceipt
+        && typeof unwrappedReceipt === 'object'
+        && !Array.isArray(unwrappedReceipt)
+        && Array.isArray(unwrappedReceipt.items)
+        && (unwrappedReceipt.kind === 'skill-family-test.run-receipt' || typeof unwrappedReceipt.overallStatus === 'string'),
+      );
+      const isTestEvidence = !isRunReceipt && Array.isArray(parsed?.runs)
+        && parsed.runs.some(r => r && typeof r === 'object' && ('exitCode' in r || 'command' in r));
+
+      if (isRunReceipt) {
+        tree = unwrappedReceipt.items
+          .filter(it => it && typeof it === 'object')
+          .map((it, i) => {
+            const rawId = String(it.id ?? it.requirementId ?? `ITEM-${i + 1}`);
+            const reqId = typeof it.requirementId === 'string' && it.requirementId && it.requirementId !== rawId ? it.requirementId : '';
+            const status = (it.passed === true || it.verdict === 'passed' || it.disposition === 'explicitly_skipped' || it.disposition === 'not_applicable')
+              ? 'done'
+              : (it.verdict === 'failed' || it.disposition === 'failed' ? 'blocked' : 'todo');
+            return {
+              id: rawId,
+              title: sanitizePublicText(reqId ? `${rawId} · ${reqId}` : String(it.title ?? rawId)),
+              kind: 'step',
+              depth: 0,
+              status,
+              rawStatus: String(it.verdict ?? it.disposition ?? status),
+              group: '测试与门禁运行项',
+              detail: sanitizePublicText(String(it.reason ?? (it.disposition === 'explicitly_skipped' ? '按约定显式跳过' : ''))),
+              blockedBy: [],
+              sourceType: 'json',
+              sourceLabel,
+              children: [],
+            };
+          });
+      } else if (isTestEvidence) {
+        tree = parsed.runs
+          .filter(r => r && typeof r === 'object')
+          .map((r, i) => {
+            const rawId = String(r.id ?? r.requirementId ?? `RUN-${i + 1}`);
+            const reqId = typeof r.requirementId === 'string' && r.requirementId && r.requirementId !== rawId ? r.requirementId : '';
+            const status = typeof r.exitCode === 'number' ? (r.exitCode === 0 ? 'done' : 'blocked') : 'done';
+            return {
+              id: rawId,
+              title: sanitizePublicText(reqId ? `${rawId} · ${reqId}` : rawId),
+              kind: 'step',
+              depth: 0,
+              status,
+              rawStatus: typeof r.exitCode === 'number' ? `exit=${r.exitCode}` : status,
+              group: '实测命令执行记录',
+              detail: sanitizePublicText(String(r.command ?? '')),
+              blockedBy: [],
+              sourceType: 'json',
+              sourceLabel,
+              children: [],
+            };
+          });
+      } else {
+        const topList = Array.isArray(parsed)
+          ? parsed
+          : (parsed?.waves || parsed?.phases || parsed?.milestones || parsed?.tasks || parsed?.steps || parsed?.actual_steps || []);
+        tree = (Array.isArray(topList) ? topList : []).map((e, i) => convertNode(e, i, 0, 'JSON 阶段步骤')).filter(Boolean);
+      }
       tasks.push(...collectLeafTasks(tree));
     } catch {}
   } else {
@@ -1251,6 +1312,7 @@ export async function collectStudioRuntimeView({
   const currentRepoTargets = selectedRepoId ? cleanTargets.filter(t => t.repoId === selectedRepoId || t.isSandbox) : cleanTargets;
   const ecosystemActiveTargets = cleanTargets.filter(t => t.activeLockCount > 0 || t.processCount > 0 || t.eventCount > 0 || t.taskSummary.total > 0);
   const plans = await discoverExecutionPlans(base, catalog, inspected);
+  const workspaceSummary = summarizeWorkspaceRuntime(plans, selectedRepoId, catalog);
 
   return {
     schemaVersion: 1,
@@ -1263,12 +1325,67 @@ export async function collectStudioRuntimeView({
     targets: cleanTargets,
     plans,
     currentRepoTargets,
-    currentRepoHasRuntime: currentRepoTargets.length > 0,
+    currentRepoHasRuntime: currentRepoTargets.some(t => t.activeLockCount > 0 || t.processCount > 0 || t.eventCount > 0 || t.taskSummary.total > 0) || workspaceSummary.currentRepoRunCount > 0,
     ecosystemActiveTargets,
+    workspaceSummary,
   };
 }
 
-async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHistorical = 20) {
+export function summarizeWorkspaceRuntime(plans = [], selectedRepoId = null, catalog = null) {
+  const repoNameById = new Map();
+  if (catalog?.byId) {
+    for (const r of catalog.byId.values()) repoNameById.set(r.id, r.displayName || r.name);
+  }
+  const list = Array.isArray(plans) ? plans : [];
+  const isSelected = p => Boolean(p?.isSandbox) || (!selectedRepoId ? true : p?.repoId === selectedRepoId);
+  const currentRepoPlans = selectedRepoId ? list.filter(isSelected) : list;
+  const otherRepoPlans = selectedRepoId
+    ? list.filter(p => p && !p.isSandbox && p.repoId !== selectedRepoId)
+    : [];
+
+  const byRepo = new Map();
+  for (const p of otherRepoPlans) {
+    const rid = p.repoId || p.repoName || 'workspace';
+    const rName = p.repoName || repoNameById.get(rid) || rid;
+    if (!byRepo.has(rid)) {
+      byRepo.set(rid, {
+        repoId: p.repoId || null,
+        repoName: rName,
+        runCount: 0,
+        activeCount: 0,
+        latestTitle: '',
+        latestUpdatedAt: null,
+        latestTs: 0,
+      });
+    }
+    const bucket = byRepo.get(rid);
+    bucket.runCount += 1;
+    if (p.status === 'in_progress') bucket.activeCount += 1;
+    const ts = p.updatedAt ? Date.parse(p.updatedAt) : 0;
+    const numTs = Number.isFinite(ts) ? ts : 0;
+    if (!bucket.latestTitle || numTs >= bucket.latestTs) {
+      bucket.latestTitle = p.title || '';
+      bucket.latestUpdatedAt = p.updatedAt || bucket.latestUpdatedAt;
+      bucket.latestTs = numTs;
+    }
+  }
+
+  const recentRepos = [...byRepo.values()]
+    .sort((a, b) => (b.activeCount - a.activeCount) || (b.latestTs - a.latestTs) || (b.runCount - a.runCount) || String(a.repoName).localeCompare(String(b.repoName)))
+    .map(({ latestTs: _omit, ...rest }) => rest);
+
+  return {
+    selectedRepoId: selectedRepoId || null,
+    currentRepoRunCount: currentRepoPlans.length,
+    totalRunCount: list.length,
+    otherRepoRunCount: otherRepoPlans.length,
+    otherRepoCount: recentRepos.length,
+    recentRepos,
+    mostRecentRepo: recentRepos[0] || null,
+  };
+}
+
+async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHistorical = 24) {
   const repoNameById = new Map();
   if (catalog?.byId) {
     for (const r of catalog.byId.values()) repoNameById.set(r.id, r.displayName || r.name);
@@ -1278,16 +1395,19 @@ async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHist
   const seenPlanRealPaths = new Set();
 
   for (const t of liveInspected) {
-    if (!t.planPath && !(t.taskSummary?.total > 0)) continue;
+    const hasLiveTelemetry = (t.activeLockCount || 0) > 0 || (t.processCount || 0) > 0 || (t.eventCount || 0) > 0;
+    if (!t.planPath && !(t.taskSummary?.total > 0) && !hasLiveTelemetry) continue;
     let rp = t.planPath || '';
     if (rp) {
       try { rp = await realpath(rp); } catch {}
       seenPlanRealPaths.add(rp);
     }
     const ts = t.taskSummary || { total: 0, done: 0, running: 0, blocked: 0, todo: 0, percent: 0, tree: [], tasks: [] };
+    const hasRunningProc = (t.processes || []).some(p => p.processStatus === 'RUNNING');
     let status = 'pending';
-    if (ts.total > 0 && ts.done === ts.total && ts.running === 0 && ts.blocked === 0) status = 'completed';
-    else if (ts.running > 0 || ts.done > 0 || ts.blocked > 0 || t.activeLockCount > 0) status = 'in_progress';
+    if (ts.total > 0 && ts.done === ts.total && ts.running === 0 && ts.blocked === 0 && !hasRunningProc && !(t.activeLockCount > 0)) status = 'completed';
+    else if (ts.running > 0 || ts.done > 0 || ts.blocked > 0 || t.activeLockCount > 0 || hasRunningProc) status = 'in_progress';
+    else if (hasLiveTelemetry) status = 'completed';
     let summary = ts.focusBanner?.detail || '';
     let liveMarkdown = '';
     let liveStructured = '';
@@ -1312,8 +1432,17 @@ async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHist
         }
       }
     }
-    if (!summary) summary = `${t.badge || '运行计划'}：共 ${ts.total} 步，已完成 ${ts.done} 步（${ts.percent}%）。`;
+    if (!summary) {
+      summary = !t.planPath && hasLiveTelemetry
+        ? `活跃排他锁 ${t.activeLockCount || 0} 把 · 子进程调用 ${t.processCount || 0} 条 · 状态事件 ${t.eventCount || 0} 条`
+        : `${t.badge || '运行计划'}：共 ${ts.total} 步，已完成 ${ts.done} 步（${ts.percent}%）。`;
+    }
     const st = t.planPath ? await safeLstat(t.planPath) : null;
+    const fallbackAt = t.stateStore?.events?.at(-1)?.recordedAt
+      || t.processes?.at(-1)?.endedAt
+      || t.processes?.at(-1)?.startedAt
+      || t.locks?.[0]?.acquiredAt
+      || new Date().toISOString();
     plans.push(sanitizeDeep({
       id: `live:${t.id}`,
       targetId: t.id,
@@ -1323,15 +1452,15 @@ async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHist
       statusLabel: status === 'completed' ? '已完成' : (status === 'in_progress' ? '进行中' : '待启动'),
       repoId: t.repoId || null,
       repoName: repoNameById.get(t.repoId) || (t.isSandbox ? '隔离沙箱演练' : '当前工作区'),
-      badge: t.isSandbox ? '实时沙箱' : (t.isUserRegistered ? '手动挂载' : '活跃运行计划'),
-      updatedAt: st?.mtime ? new Date(st.mtime).toISOString() : new Date().toISOString(),
+      badge: t.isSandbox ? '实时沙箱' : (t.isUserRegistered ? '手动挂载' : (!t.planPath && hasLiveTelemetry ? '运行态监控源' : '活跃运行计划')),
+      updatedAt: st?.mtime ? new Date(st.mtime).toISOString() : fallbackAt,
       isHistorical: false,
       isSandbox: Boolean(t.isSandbox),
       fileFormat: liveFormat,
-      planPath: shortDisplayPath(t.planPath || ''),
+      planPath: shortDisplayPath(t.planPath || t.stateDir || t.runsDir || ''),
       completedSteps: ts.done,
       totalSteps: ts.total,
-      percent: ts.percent,
+      percent: ts.total > 0 ? ts.percent : (status === 'completed' ? 100 : 0),
       taskSummary: ts,
       markdownText: liveMarkdown || undefined,
       structuredText: liveStructured || undefined,
@@ -1341,27 +1470,61 @@ async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHist
 
   const candidateFiles = [];
   const seenCandAbs = new Set();
-  const addCandidate = async (absPath, repoId, repoName, badge) => {
-    if (!absPath || hasSensitiveSegment(absPath) || seenCandAbs.has(absPath)) return;
+  const addCandidate = async (absPath, repoId, repoName, badge, { repoRoot = null, defaultTitle = '' } = {}) => {
+    if (!absPath || hasSensitiveSegment(absPath) || seenCandAbs.has(absPath)) return false;
     const st = await safeLstat(absPath);
-    if (!st?.isFile()) return;
+    if (!st?.isFile()) return false;
     let rp = absPath;
     try { rp = await realpath(absPath); } catch {}
-    if (seenPlanRealPaths.has(rp) || seenCandAbs.has(rp)) return;
+    if (seenPlanRealPaths.has(rp) || seenCandAbs.has(rp)) return false;
     seenCandAbs.add(absPath);
     seenCandAbs.add(rp);
-    candidateFiles.push({ abs: rp, mtimeMs: st.mtimeMs || 0, repoId, repoName, badge });
+    candidateFiles.push({ abs: rp, mtimeMs: st.mtimeMs || 0, repoId, repoName, badge, repoRoot, defaultTitle });
+    return true;
   };
 
   const repoDirs = catalog?.byId ? [...catalog.byId.values()] : [{ id: null, name: basename(base), displayName: basename(base), realPath: base }];
   for (const r of repoDirs) {
     const rName = r.displayName || r.name;
     for (const rootFile of ['PLAN.md', 'execution-plan.md']) {
-      await addCandidate(join(r.realPath, rootFile), r.id, rName, '仓库执行计划');
+      await addCandidate(join(r.realPath, rootFile), r.id, rName, '仓库执行计划', { repoRoot: r.realPath });
+    }
+    const hasReleaseReceipt = await addCandidate(
+      join(r.realPath, '.runs/release-testing/results.json'),
+      r.id,
+      rName,
+      '发布测试收据',
+      { repoRoot: r.realPath, defaultTitle: `${rName} · 发布测试运行收据` },
+    );
+    const hasSftReceipt = await addCandidate(
+      join(r.realPath, 'artifacts/tests/sft-runs.json'),
+      r.id,
+      rName,
+      '测试运行收据',
+      { repoRoot: r.realPath, defaultTitle: `${rName} · 门禁测试运行收据` },
+    );
+    if (!hasReleaseReceipt && !hasSftReceipt) {
+      await addCandidate(
+        join(r.realPath, 'artifacts/tests/latest-test-evidence.json'),
+        r.id,
+        rName,
+        '测试执行证据',
+        { repoRoot: r.realPath, defaultTitle: `${rName} · 最新测试执行记录` },
+      );
     }
     for (const sub of ['.runs', '.artifacts', 'docs/plans', 'artifacts/plans']) {
-      const files = await walkBounded(join(r.realPath, sub), 2, n => /\.(md|json)$/i.test(n) && /(plan|spec|roadmap|execution)/i.test(n));
-      for (const f of files) await addCandidate(f, r.id, rName, '历史运行/规划');
+      const files = await walkBounded(
+        join(r.realPath, sub),
+        2,
+        n => /\.(md|json)$/i.test(n) && (/(plan|spec|roadmap|execution)/i.test(n) || /^results\.json$/i.test(n)) && !/markers\.json$/i.test(n),
+      );
+      for (const f of files) {
+        const isReceipt = /^results\.json$/i.test(basename(f));
+        await addCandidate(f, r.id, rName, isReceipt ? '测试运行收据' : '历史运行/规划', {
+          repoRoot: r.realPath,
+          defaultTitle: isReceipt ? `${rName} · 测试运行收据` : '',
+        });
+      }
     }
   }
 
@@ -1375,7 +1538,7 @@ async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHist
     const histFormat = ext === '.json' ? 'json' : (ext === '.csv' ? 'csv' : 'markdown');
     const stem = basename(cand.abs, ext);
     const ts = parsePlanSummary(raw, ext, stem);
-    const brief = extractArtifactBrief({ rawText: raw, fallbackTitle: stem, code: stem, typeLabel: cand.badge, path: cand.abs });
+    const brief = extractArtifactBrief({ rawText: raw, fallbackTitle: cand.defaultTitle || stem, code: stem, typeLabel: cand.badge, path: cand.abs });
     let status = 'completed';
     if (ts.total > 0) {
       if (ts.done === ts.total && ts.running === 0 && ts.blocked === 0) status = 'completed';
@@ -1393,17 +1556,24 @@ async function discoverExecutionPlans(base, catalog, liveInspected = [], maxHist
       }
       histStructured = sanitizePublicText(pretty).trim().slice(0, 40000);
     }
+    const relKey = cand.repoRoot ? relative(cand.repoRoot, cand.abs).split('\\').join('/') : basename(cand.abs);
+    const resolvedTitle = (cand.defaultTitle && (!brief.title || brief.title === stem))
+      ? cand.defaultTitle
+      : (brief.title || cand.defaultTitle || stem);
+    const resolvedSummary = (cand.defaultTitle && ts.total > 0)
+      ? `共 ${ts.total} 项检查，已通过或豁免 ${ts.done} 项${ts.blocked > 0 ? `，失败 ${ts.blocked} 项` : ''}（${ts.percent}%）。`
+      : brief.summary;
     histCount += 1;
     plans.push(sanitizeDeep({
-      id: `hist:${cand.repoName}:${basename(cand.abs)}`.replace(/[^A-Za-z0-9_.:/-]+/g, '_'),
+      id: `hist:${cand.repoId || cand.repoName}:${relKey}`.replace(/[^A-Za-z0-9_.:/-]+/g, '_'),
       targetId: null,
-      title: cleanInlinePlain(brief.title || stem),
-      summary: cleanInlinePlain(brief.summary),
+      title: cleanInlinePlain(resolvedTitle),
+      summary: cleanInlinePlain(resolvedSummary),
       status,
       statusLabel: status === 'completed' ? '已完成' : (status === 'in_progress' ? '进行中' : '待启动'),
       repoId: cand.repoId,
       repoName: cand.repoName,
-      badge: histFormat === 'markdown' ? cand.badge : '状态/规划数据',
+      badge: histFormat === 'markdown' ? cand.badge : (cand.defaultTitle ? cand.badge : '状态/规划数据'),
       updatedAt: cand.mtimeMs ? new Date(cand.mtimeMs).toISOString() : null,
       isHistorical: true,
       isSandbox: false,

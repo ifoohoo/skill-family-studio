@@ -100,6 +100,7 @@ export {
   registerMonitorTarget,
   removeMonitorTarget,
   runSandboxExercise,
+  summarizeWorkspaceRuntime,
 } from './runtime-bridge.mjs';
 
 export {

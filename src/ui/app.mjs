@@ -71,6 +71,7 @@ const state = {
   rtFleetEventQuery: '',
   rtFleetRichMode: true,
   rtSseStatus: 'connected',
+  rtReturnRepo: null,
 };
 
 const el = (tag, text, cls) => {
@@ -2906,7 +2907,160 @@ function openRegisterRuntimeModal(onRegistered, editTarget = null) {
   (isEdit ? fTitle.inp : fId.inp).focus();
 }
 
-function renderTaskTreeView(host, scopedTargets, { plans = [], fleetFamCount = 0, onGoFleet = null, onRunSandbox = null, onMountSource = null, onScopeWorkspace = null } = {}) {
+export function buildRuntimeEmptyStateCard(doc = document, {
+  curRepoName = '',
+  rtScope = 'repo',
+  scopedTargetFilterActive = false,
+  otherPlansCount = 0,
+  otherRepos = [],
+  mostRecentRepo = null,
+  totalPlansCount = 0,
+  fleetFamCount = 0,
+  writable = true,
+  onViewWorkspaceTasks = null,
+  onJumpRecentRepo = null,
+  onResetTargetFilter = null,
+  onGoFleet = null,
+  onRunSandbox = null,
+  onMountSource = null,
+} = {}) {
+  const mk = (tag, text, cls) => {
+    const node = doc.createElement(tag);
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    if (cls) node.className = cls;
+    return node;
+  };
+
+  const emptyCard = mk('div', null, 'st-card st-guide-section st-rt-empty-card');
+  const actRow = mk('div', null, 'st-empty-actions');
+  let hasPrimaryAction = false;
+
+  if (scopedTargetFilterActive && totalPlansCount > 0) {
+    const h = mk('h3', '当前筛选的运行源下暂无任务记录', '');
+    if (h.style) h.style.marginTop = '0';
+    emptyCard.append(
+      h,
+      mk('p', '所选单一运行源尚未关联执行计划或运行收据；可恢复查看全部运行源下的记录。', 'st-muted-xs'),
+    );
+    const resetBtn = mk('button', `🔄 查看全部运行源（共 ${totalPlansCount} 条）`, 'st-btn st-btn-primary');
+    resetBtn.type = 'button';
+    resetBtn.dataset.action = 'reset-target-filter';
+    resetBtn.addEventListener('click', () => onResetTargetFilter?.());
+    actRow.append(resetBtn);
+    hasPrimaryAction = true;
+  } else if (rtScope === 'repo' && otherPlansCount > 0) {
+    const h = mk('h3', curRepoName ? `当前仓库「${curRepoName}」暂无运行记录` : '当前仓库暂无运行记录', '');
+    if (h.style) h.style.marginTop = '0';
+    const repoCount = otherRepos.length || 1;
+    const recentHint = mostRecentRepo?.repoName ? `（最近活跃：${mostRecentRepo.repoName}）` : '';
+    emptyCard.append(
+      h,
+      mk(
+        'p',
+        `同工作区其余 ${repoCount} 个子仓库共有 ${otherPlansCount} 条最近运行记录${recentHint}。可在当前监控面板直接展开全工作区跨仓汇总列表，或切换到最近有运行记录的子仓库并随时一键切回。`,
+        'st-muted-xs',
+      ),
+    );
+    if (otherRepos.length > 0) {
+      const repoPills = mk('div', null, 'st-graph-controls');
+      if (repoPills.style) repoPills.style.marginTop = '8px';
+      for (const r of otherRepos.slice(0, 5)) {
+        repoPills.append(mk('span', `${r.repoName} · ${r.runCount} 条`, 'st-badge st-badge-zinc'));
+      }
+      if (otherRepos.length > 5) {
+        repoPills.append(mk('span', `+${otherRepos.length - 5} 个仓库`, 'st-muted-xs'));
+      }
+      emptyCard.append(repoPills);
+    }
+    const wsPlansBtn = mk('button', `查看全工作区最近任务（共 ${otherPlansCount} 条）`, 'st-btn st-btn-primary');
+    wsPlansBtn.type = 'button';
+    wsPlansBtn.dataset.action = 'view-workspace-recent';
+    wsPlansBtn.addEventListener('click', () => onViewWorkspaceTasks?.());
+    actRow.append(wsPlansBtn);
+    hasPrimaryAction = true;
+
+    if (mostRecentRepo?.repoId && typeof onJumpRecentRepo === 'function') {
+      const jumpBtn = mk('button', `↗ 跳往最近有任务的仓库（${mostRecentRepo.repoName}）`, 'st-btn');
+      jumpBtn.type = 'button';
+      jumpBtn.dataset.action = 'jump-recent-repo';
+      jumpBtn.addEventListener('click', () => onJumpRecentRepo(mostRecentRepo));
+      actRow.append(jumpBtn);
+    }
+  } else {
+    const h = mk(
+      'h3',
+      rtScope === 'repo' && curRepoName ? `当前仓库「${curRepoName}」及全工作区暂无运行记录` : '当前工作区暂无运行记录',
+      '',
+    );
+    if (h.style) h.style.marginTop = '0';
+    emptyCard.append(
+      h,
+      mk('p', '当前工作区各受管仓库尚未产生执行计划、受管子进程轨迹或测试运行收据。可按以下任一方式触发或接入运行记录：', 'st-muted-xs'),
+    );
+    const guideList = mk('ol', null, 'st-fleet-md-list');
+    if (guideList.style) guideList.style.marginTop = '8px';
+    for (const tip of [
+      '在宿主对话中让智能体创建 PLAN.md / execution-plan.md 或执行技能族测试，自动在 .runs/ 与 artifacts/tests/ 生成运行收据；',
+      '点击下方「▶ 运行隔离沙箱演练」，在临时隔离目录一键生成多波次任务树、多智能体会话编队与排他写锁样板；',
+      '点击「+ 挂载运行源」，手动接入已有的 state-store、.runs 或 Markdown / JSON / CSV 计划文件。',
+    ]) {
+      guideList.append(mk('li', tip));
+    }
+    emptyCard.append(guideList);
+  }
+
+  if (fleetFamCount > 0 && typeof onGoFleet === 'function') {
+    const fleetBtn = mk('button', `🛰️ 查看本机 ${fleetFamCount} 组智能体会话 →`, `st-btn${hasPrimaryAction ? '' : ' st-btn-primary'}`);
+    fleetBtn.type = 'button';
+    fleetBtn.dataset.action = 'go-fleet';
+    fleetBtn.addEventListener('click', onGoFleet);
+    actRow.append(fleetBtn);
+    hasPrimaryAction = true;
+  }
+  const sbxEmptyBtn = mk('button', '▶ 运行隔离沙箱演练', `st-btn${hasPrimaryAction ? '' : ' st-btn-primary'}`);
+  sbxEmptyBtn.type = 'button';
+  sbxEmptyBtn.dataset.action = 'run-sandbox';
+  sbxEmptyBtn.disabled = !writable;
+  sbxEmptyBtn.addEventListener('click', () => onRunSandbox?.(sbxEmptyBtn));
+  const mntEmptyBtn = mk('button', '+ 挂载运行源', 'st-btn');
+  mntEmptyBtn.type = 'button';
+  mntEmptyBtn.dataset.action = 'mount-source';
+  mntEmptyBtn.disabled = !writable;
+  mntEmptyBtn.addEventListener('click', () => onMountSource?.());
+  actRow.append(sbxEmptyBtn, mntEmptyBtn);
+  emptyCard.append(actRow);
+  return emptyCard;
+}
+
+function deriveFallbackOtherRepos(plans = [], curRepoId = null) {
+  const other = plans.filter(p => p && !p.isSandbox && p.repoId !== curRepoId);
+  const byRepo = new Map();
+  for (const p of other) {
+    const rid = p.repoId || p.repoName || 'workspace';
+    if (!byRepo.has(rid)) {
+      byRepo.set(rid, { repoId: p.repoId || null, repoName: p.repoName || rid, runCount: 0, activeCount: 0, latestTs: 0 });
+    }
+    const item = byRepo.get(rid);
+    item.runCount += 1;
+    if (p.status === 'in_progress') item.activeCount += 1;
+    const ts = p.updatedAt ? Date.parse(p.updatedAt) : 0;
+    if (Number.isFinite(ts) && ts > item.latestTs) item.latestTs = ts;
+  }
+  const recentRepos = [...byRepo.values()].sort((a, b) => (b.activeCount - a.activeCount) || (b.latestTs - a.latestTs) || (b.runCount - a.runCount));
+  return { otherPlansCount: other.length, recentRepos, mostRecentRepo: recentRepos[0] || null };
+}
+
+function renderTaskTreeView(host, scopedTargets, {
+  plans = [],
+  workspaceSummary = null,
+  curRepo = null,
+  fleetFamCount = 0,
+  onGoFleet = null,
+  onRunSandbox = null,
+  onMountSource = null,
+  onScopeWorkspace = null,
+  onJumpRepo = null,
+} = {}) {
   const scopedPlans = plans.filter(p => {
     if (state.rtSelectedTargetId !== '__all__' && p.targetId !== state.rtSelectedTargetId) return false;
     if (state.rtScope === 'repo' && p.repoId !== state.repoId && !p.isSandbox) return false;
@@ -2914,40 +3068,46 @@ function renderTaskTreeView(host, scopedTargets, { plans = [], fleetFamCount = 0
   });
 
   if (scopedPlans.length === 0) {
-    const emptyCard = el('div', null, 'st-card st-guide-section st-rt-empty-card');
-    emptyCard.append(
-      el('h3', '当前范围内暂无活跃或历史执行计划文件', ''),
-      el('p', '支持解析多级标题与缩进复选框的 .md、嵌套 .json 或 .csv 计划文件；也可直接查看本机智能体会话编队、运行沙箱演练或手动挂载计划文件。', 'st-muted-xs'),
-    );
-    emptyCard.firstChild.style.marginTop = '0';
-    const actRow = el('div', null, 'st-empty-actions');
-    if (state.rtScope === 'repo' && plans.length > 0) {
-      const wsPlansBtn = el('button', `🌐 查看全工作区历史与规划 (${plans.length})`, 'st-btn st-btn-primary');
-      wsPlansBtn.type = 'button';
-      wsPlansBtn.addEventListener('click', () => {
+    const fb = deriveFallbackOtherRepos(plans, state.repoId);
+    const otherPlansCount = typeof workspaceSummary?.otherRepoRunCount === 'number'
+      ? workspaceSummary.otherRepoRunCount
+      : fb.otherPlansCount;
+    const otherRepos = Array.isArray(workspaceSummary?.recentRepos) ? workspaceSummary.recentRepos : fb.recentRepos;
+    const mostRecentRepo = workspaceSummary?.mostRecentRepo ?? fb.mostRecentRepo;
+    const emptyCard = buildRuntimeEmptyStateCard(document, {
+      curRepoName: curRepo?.displayName || curRepo?.name || '',
+      rtScope: state.rtScope,
+      scopedTargetFilterActive: state.rtSelectedTargetId !== '__all__',
+      otherPlansCount,
+      otherRepos,
+      mostRecentRepo,
+      totalPlansCount: plans.length,
+      fleetFamCount,
+      writable: state.writable,
+      onResetTargetFilter: () => {
+        state.rtSelectedTargetId = '__all__';
+        if (typeof onScopeWorkspace === 'function') onScopeWorkspace();
+        else renderRuntimePanel({ forceRefresh: false });
+      },
+      onViewWorkspaceTasks: () => {
         state.rtScope = 'workspace';
         state.rtSelectedTargetId = '__all__';
         if (typeof onScopeWorkspace === 'function') onScopeWorkspace();
-        else renderRuntimePanel();
-      });
-      actRow.append(wsPlansBtn);
-    }
-    if (fleetFamCount > 0 && typeof onGoFleet === 'function') {
-      const fleetBtn = el('button', `🛰️ 查看本机 ${fleetFamCount} 组智能体会话 →`, `st-btn${state.rtScope === 'repo' && plans.length > 0 ? '' : ' st-btn-primary'}`);
-      fleetBtn.type = 'button';
-      fleetBtn.addEventListener('click', onGoFleet);
-      actRow.append(fleetBtn);
-    }
-    const sbxEmptyBtn = el('button', '▶ 运行隔离沙箱演练', `st-btn${fleetFamCount > 0 || (state.rtScope === 'repo' && plans.length > 0) ? '' : ' st-btn-primary'}`);
-    sbxEmptyBtn.type = 'button';
-    sbxEmptyBtn.disabled = !state.writable;
-    sbxEmptyBtn.addEventListener('click', () => onRunSandbox?.(sbxEmptyBtn));
-    const mntEmptyBtn = el('button', '+ 挂载运行源', 'st-btn');
-    mntEmptyBtn.type = 'button';
-    mntEmptyBtn.disabled = !state.writable;
-    mntEmptyBtn.addEventListener('click', () => onMountSource?.());
-    actRow.append(sbxEmptyBtn, mntEmptyBtn);
-    emptyCard.append(actRow);
+        else renderRuntimePanel({ forceRefresh: false });
+      },
+      onJumpRecentRepo: targetRepo => {
+        if (!targetRepo?.repoId || typeof onJumpRepo !== 'function') return;
+        if (state.repoId && state.repoId !== targetRepo.repoId) {
+          state.rtReturnRepo = { id: state.repoId, name: curRepo?.displayName || curRepo?.name || state.repoId };
+        }
+        state.rtScope = 'repo';
+        state.rtSelectedTargetId = '__all__';
+        onJumpRepo(targetRepo.repoId);
+      },
+      onGoFleet,
+      onRunSandbox,
+      onMountSource,
+    });
     host.append(emptyCard);
     return;
   }
@@ -3054,6 +3214,19 @@ function renderTaskTreeView(host, scopedTargets, { plans = [], fleetFamCount = 0
       el('div', null, 'st-graph-controls'),
     );
     const toneCls = plan.status === 'completed' ? 'st-badge-emerald' : (plan.status === 'in_progress' ? 'st-badge-indigo' : 'st-badge-zinc');
+    if (plan.repoId && plan.repoId !== state.repoId && typeof onJumpRepo === 'function') {
+      const jumpRepoBtn = el('button', `↗ 切换到该仓库（${plan.repoName}）`, 'st-jump-pill');
+      jumpRepoBtn.type = 'button';
+      jumpRepoBtn.addEventListener('click', () => {
+        if (state.repoId) {
+          state.rtReturnRepo = { id: state.repoId, name: curRepo?.displayName || curRepo?.name || state.repoId };
+        }
+        state.rtScope = 'repo';
+        state.rtSelectedTargetId = '__all__';
+        onJumpRepo(plan.repoId);
+      });
+      fTop.lastChild.append(jumpRepoBtn);
+    }
     fTop.lastChild.append(
       el('span', `${plan.statusLabel} · ${plan.percent ?? ts.percent ?? 0}%`, `st-badge ${toneCls}`),
       infoTrigger('rt:taskStatus', document),
@@ -3460,9 +3633,28 @@ function renderDiagnosticsView(host, scopedTargets, lockWarnMs, { onEditTarget =
   host.append(diagWrap);
 }
 
-function renderRuntimeScopeToolbar(targetHost, { curRepo, repoTargets, allTargets, scopeBaseTargets, hideMountCta = false, onEditTarget, onRemoveTarget, onPaintSync, onMountSync }) {
+function renderRuntimeScopeToolbar(targetHost, {
+  curRepo,
+  repoTargets,
+  allTargets,
+  scopeBaseTargets,
+  hideMountCta = false,
+  returnRepo = null,
+  onReturnRepo = null,
+  onEditTarget,
+  onRemoveTarget,
+  onPaintSync,
+  onMountSync,
+}) {
   const bar = el('div', null, 'st-rt-scope-row');
   const leftBar = el('div', null, 'st-graph-controls');
+  if (returnRepo?.id && returnRepo.id !== curRepo?.id && typeof onReturnRepo === 'function') {
+    const retBtn = el('button', `↩ 切回原仓库（${returnRepo.name}）`, 'st-jump-pill');
+    retBtn.type = 'button';
+    retBtn.dataset.action = 'return-prev-repo';
+    retBtn.addEventListener('click', onReturnRepo);
+    leftBar.append(retBtn);
+  }
   const scopeSwitch = el('div', null, 'st-view-switch');
   const bRepo = el('button', `聚焦当前项目 (${curRepo?.name || '当前仓'} · ${repoTargets.length})`, `st-btn st-btn-xs${state.rtScope === 'repo' ? ' is-active' : ''}`);
   bRepo.type = 'button';
@@ -3685,6 +3877,14 @@ async function renderRuntimePanel({ forceRefresh = true } = {}) {
         allTargets,
         scopeBaseTargets,
         hideMountCta: isTasksEmptyState,
+        returnRepo: state.rtReturnRepo,
+        onReturnRepo: () => {
+          const prevId = state.rtReturnRepo?.id;
+          state.rtReturnRepo = null;
+          state.rtScope = 'repo';
+          state.rtSelectedTargetId = '__all__';
+          if (prevId) selectRepo(prevId);
+        },
         onEditTarget: handleEditTarget,
         onRemoveTarget: handleRemoveTarget,
         onPaintSync: paintRuntimeView,
@@ -3700,9 +3900,12 @@ async function renderRuntimePanel({ forceRefresh = true } = {}) {
     if (state.rtView === 'tasks') {
       renderTaskTreeView(viewHost, scopedTargets, {
         plans: allPlans,
+        workspaceSummary: rt.workspaceSummary || null,
+        curRepo,
         fleetFamCount,
         onGoFleet: () => { state.rtView = 'fleet'; paintRuntimeView(); },
         onScopeWorkspace: paintRuntimeView,
+        onJumpRepo: nextRepoId => selectRepo(nextRepoId),
         onRunSandbox: runSandboxWithGuard,
         onMountSource: () => openRegisterRuntimeModal(() => renderRuntimePanel({ forceRefresh: true })),
       });
@@ -3765,6 +3968,7 @@ async function selectRepo(repoId, { skipRender = false } = {}) {
   selectRepoAbort = typeof AbortController !== 'undefined' ? new AbortController() : null;
   const signal = selectRepoAbort?.signal;
   state.repoId = repoId;
+  if (state.rtReturnRepo?.id === repoId) state.rtReturnRepo = null;
   state.snap = null;
   state.alignment = null;
   state.selectedUid = null;
