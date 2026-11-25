@@ -2,6 +2,15 @@
 
 `skill-family-studio` 是面向任意技能族与业务域套组的本地离线可视化控制台。它在单一回环端口（默认 `127.0.0.1:57630`）内统一承载三业务主页签（`审阅与对齐`、`制品图谱`、`运行监控`）与按需「手册」，提供 `artifact-graph` 固定坐标宽屏图谱与 `sandbox` 沙箱化的 Archify 业务图联动、4 列三层双向一致性体检与跨仓互跳、6 组手风琴折叠目录树四态审阅，以及双栏多级任务树与跨宿主智能体编队监控。
 
+## 安装与本地写入边界
+
+```bash
+npm install -g skill-family-studio
+```
+
+<!-- release-skill:external-write-boundary -->
+`skill-family-studio` 全程离线运行于本机回环地址（默认 `127.0.0.1:57630`），不会连接外部网络或修改任何远端仓库。`inspect-setup`、`doctor`、`snapshot` 以及 `--readonly` 预览模式均为纯只读检查；仅当你执行 `init-workspace` 初始化配置，或在默认可写模式下提交审阅结论与批注时，才会在本地写入 `.studio-workspace.json` 或 `.skill-family-studio/reviews.json`。
+
 ## 三十秒零记忆启动（推荐：直接对 AI 助手说一句话）
 
 安装技能包后，**不需要背任何命令行参数**。只要你在项目目录里对 Codex / Claude Code / Kimi Code / Antigravity 说：
@@ -27,7 +36,12 @@
 <details>
 <summary>高级与手动 CLI 命令参考（平时交由 AI 助手代劳即可，按需展开）</summary>
 
+<!-- release-skill:safe-first-command -->
 ```bash
+# 安全首选命令：只读查看命令说明与环境健康状态（零写入）
+npx skill-family-studio --help
+npx skill-family-studio doctor --root /absolute/project/path --scan-roots none
+
 # 只读探测当前目录角色与推荐启动参数（输出结构化 JSON）
 npx skill-family-studio inspect-setup --root /absolute/project/path
 
@@ -61,6 +75,11 @@ npx skill-family-studio snapshot --root /absolute/project/path
 - **Antigravity**：提供严格遵守官方十键白名单的根级 `plugin.json`，支持按宿主规范挂载至项目 `.agents/skills`、`.agent/skills` 或 `.gemini/config/{skills,plugins}`。
 
 完整逐页引导、角色动线与运行监控说明请参阅随附的 [USER-GUIDE.md](USER-GUIDE.md)。
+
+## 常见故障处理
+
+- **启动或环境自检失败**：先运行 `npx skill-family-studio doctor --root . --scan-roots none --json` 核对当前 `node` 版本是否处于 `>=22.22.2 <23` 区间。
+- **默认端口冲突或混入其他目录**：改用 `npx skill-family-studio ensure --root . --port 0 --scan-roots none` 自动分配空闲回环端口并仅聚焦当前仓库。
 
 ## 开源许可与署名
 
