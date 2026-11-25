@@ -111,3 +111,13 @@ export {
   normalizeStudioTab,
   runStudioDoctor,
 } from './server.mjs';
+
+export {
+  DEFAULT_LIFECYCLE_MODEL_REL,
+  DEFAULT_LIFECYCLE_REGISTRY_REL,
+  RING_SHORT_META,
+  buildLifecycleRingMap,
+  discoverLifecycleCollection,
+  inspectLifecycleCollaboration,
+  loadLifecycleSummary,
+} from './lifecycle-inspector.mjs';

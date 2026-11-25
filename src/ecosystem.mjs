@@ -1123,6 +1123,14 @@ async function loadRepoCollections(repoReal) {
       extraItems.push(...await loadLifecycleStoryPack(repoReal, col));
     }
   }
+  const lifecycleDocPaths = new Set();
+  for (const col of studioCfg.collections ?? []) {
+    if (col?.kind !== 'lifecycle-collaboration-model') continue;
+    for (const k of ['modelJson', 'registryJson', 'architectureDoc', 'roadmapSpec']) {
+      const clean = normalizeSafeRelativeAssetPath(col[k]);
+      if (clean) lifecycleDocPaths.add(clean);
+    }
+  }
 
   // 若无声明式 Archify 清单，通用兜底发现 artifacts/diagrams/**/*.html
   if (archifyDiagrams.length === 0) {
@@ -1148,7 +1156,7 @@ async function loadRepoCollections(repoReal) {
     } catch {}
   }
 
-  return { studioCfg, extraItems, archifyDiagrams, allowedArchifyFiles, allowedArchifyDirs };
+  return { studioCfg, extraItems, archifyDiagrams, allowedArchifyFiles, allowedArchifyDirs, lifecycleDocPaths };
 }
 
 async function loadRepoSchemaSafe(repoReal) {
@@ -1404,7 +1412,7 @@ export async function inspectProjectRepo(record, emptyScanDir) {
   ];
 
   // 自动配对同源 Markdown 文稿与 JSON/YAML 数据契约，支持正文顶栏一键互跳；图谱未收录时安全受控探测磁盘派生人读文稿
-  const companionPaths = new Set();
+  const companionPaths = new Set(colResult.lifecycleDocPaths ?? []);
   const humanItems = allReviewItems.filter(i => !i.isMachineContract && i.path);
   const contractItems = allReviewItems.filter(i => i.isMachineContract && i.path);
   const GENERIC_CONTRACT_STEMS = new Set(['source', 'original', 'story-source.candidate', 'index', 'readme', 'coverage', 'reading']);

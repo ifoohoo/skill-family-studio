@@ -38,6 +38,7 @@
 
       <nav class="st-topbar-center" aria-label="控制台主模块导航">
         <div class="st-primary-tabs" role="tablist">
+          <button type="button" id="st-lifecycle-tab-btn" role="tab" class="st-tab-btn" data-tab="lifecycle" aria-selected="false" hidden>🧭 全周期协同</button>
           <button type="button" role="tab" class="st-tab-btn" data-tab="review" aria-selected="false">📝 审阅与对齐</button>
           <button type="button" role="tab" class="st-tab-btn" data-tab="graph" aria-selected="false">🕸️ 制品图谱</button>
           <button type="button" role="tab" class="st-tab-btn" data-tab="runtime" aria-selected="false">⚡ 运行监控</button>
@@ -60,6 +61,7 @@
     <main id="st-main-canvas" class="studio-canvas wb-canvas" role="main">
       <div id="st-readonly-bar" class="st-readonly-bar" hidden></div>
       <div id="st-toast-host" class="st-toast-host" aria-live="polite"></div>
+      <section id="st-panel-lifecycle" data-panel="lifecycle" hidden></section>
       <section id="st-panel-guide" data-panel="guide" hidden></section>
       <section id="st-panel-graph" data-panel="graph" hidden></section>
       <section id="st-panel-review" data-panel="review" hidden></section>

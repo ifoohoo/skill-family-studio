@@ -988,9 +988,40 @@ const DISPOSITION_LABELS = Object.freeze({
   abandoned: '已废弃',
 });
 
+const PORTFOLIO_RING_SHORT = Object.freeze({
+  core: { ring: 'core', label: '内环核心', tone: 'indigo' },
+  method: { ring: 'method', label: '可插拔方法', tone: 'emerald' },
+  consumer: { ring: 'consumer', label: '下游消费样本', tone: 'zinc' },
+  retired: { ring: 'retired', label: '已退役归并', tone: 'amber' },
+  'external-tool': { ring: 'external-tool', label: '外部工具依赖', tone: 'purple' },
+});
+
+async function loadPortfolioRingByRepoName(repoReal) {
+  const wsDoc = await readJsonContainedSafe(repoReal, '.studio-workspace.json');
+  const col = Array.isArray(wsDoc?.collections)
+    ? wsDoc.collections.find(c => c && c.kind === 'lifecycle-collaboration-model')
+    : null;
+  const regRel = typeof col?.registryJson === 'string' && col.registryJson.trim()
+    ? col.registryJson.trim()
+    : 'artifacts/requirements-data/lifecycle-ecosystem.registry.json';
+  const reg = await readJsonContainedSafe(repoReal, regRel);
+  if (!reg || !Array.isArray(reg.repositories)) return {};
+  const map = {};
+  for (const r of reg.repositories) {
+    if (!r || typeof r !== 'object') continue;
+    const badge = PORTFOLIO_RING_SHORT[r.ring] || null;
+    if (!badge) continue;
+    for (const k of [r.id, r.name, r.publicName, typeof r.repoRef === 'string' && r.repoRef !== '.' ? basename(r.repoRef) : null]) {
+      if (k && !['__proto__', 'constructor', 'prototype'].includes(k)) map[k] = badge;
+    }
+  }
+  return map;
+}
+
 export async function inspectPortfolioAllocations(repoReal, catalog) {
   const doc = await readJsonContainedSafe(repoReal, 'artifacts/portfolio-allocations.json');
-  if (!doc) return { present: false, portfolioId: null, title: null, items: [], summary: null };
+  if (!doc) return { present: false, portfolioId: null, title: null, items: [], summary: null, ringByRepoName: {} };
+  const ringByRepoName = await loadPortfolioRingByRepoName(repoReal);
 
   const rawItems = Array.isArray(doc.items) ? doc.items : [];
   const briefCache = new Map();
@@ -1085,10 +1116,12 @@ export async function inspectPortfolioAllocations(repoReal, catalog) {
         if (!itemIssues.some(x => x.code === iss.code && x.message === iss.message)) itemIssues.push(iss);
       }
 
+      const resolvedTargetName = targetMeta?.name || String(a?.targetRepo || '').split('/').pop();
       allocations.push({
         targetRepo: a?.targetRepo || '',
         targetRepoId: targetMeta?.repoId || null,
-        targetRepoName: targetMeta?.name || String(a?.targetRepo || '').split('/').pop(),
+        targetRepoName: resolvedTargetName,
+        ringBadge: ringByRepoName[resolvedTargetName] || null,
         targetUid: a?.targetUid || '',
         targetPath: a?.targetPath || '',
         targetTitle: targetBrief.title,
@@ -1191,6 +1224,7 @@ export async function inspectPortfolioAllocations(repoReal, catalog) {
     title: doc.title || '高阶需求拆分与承接总表',
     items,
     summary,
+    ringByRepoName,
   };
 }
 

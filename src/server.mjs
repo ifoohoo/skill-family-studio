@@ -44,6 +44,7 @@ import {
 } from './runtime-bridge.mjs';
 import { collectSessionFleet } from './session-fleet.mjs';
 import { computePathDigest } from './setup-advisor.mjs';
+import { inspectLifecycleCollaboration, loadLifecycleSummary } from './lifecycle-inspector.mjs';
 
 const PKG_SRC_DIR = fileURLToPath(new URL('./', import.meta.url));
 const UI_DIR = join(PKG_SRC_DIR, 'ui');
@@ -195,7 +196,7 @@ export function normalizeStudioTab(rawTab) {
   if (!clean) return null;
   if (clean === 'overview') return 'guide';
   if (clean === 'monitor') return 'runtime';
-  if (['guide', 'graph', 'review', 'runtime'].includes(clean)) return clean;
+  if (['lifecycle', 'guide', 'graph', 'review', 'runtime'].includes(clean)) return clean;
   return 'graph';
 }
 
@@ -236,6 +237,7 @@ export async function createStudioServer({
   let cachedCatalog = null;
   let catalogAt = 0;
   const repoCache = new Map();
+  const lifecycleCache = new Map();
   let sandboxHandle = null;
 
   const getCatalog = async (force = false) => {
@@ -243,6 +245,19 @@ export async function createStudioServer({
     cachedCatalog = await discoverStudioRepos(resolvedRoot, { scanRoots, env });
     catalogAt = Date.now();
     return cachedCatalog;
+  };
+
+  const getLifecyclePayload = async (catalog, reqRepoId = null, force = false) => {
+    const cacheKey = reqRepoId || '__default__';
+    const hit = lifecycleCache.get(cacheKey);
+    if (!force && hit && Date.now() - hit.at < 12000) return hit.payload;
+    const payload = await inspectLifecycleCollaboration({
+      root: resolvedRoot,
+      catalog,
+      repoId: reqRepoId || null,
+    });
+    lifecycleCache.set(cacheKey, { at: Date.now(), payload });
+    return payload;
   };
 
   const getRepoEntry = async (record, force = false) => {
@@ -361,11 +376,14 @@ export async function createStudioServer({
         const force = url.searchParams.get('refresh') === '1';
         const catalog = await getCatalog(force);
         const fb = getLegacyFallback(catalog);
-        const store = await readStudioReviewStore(resolvedRoot, {
-          reviewsPath,
-          legacyFallbackRoot: fb.legacyFallbackRoot,
-          defaultPrimaryRepoId: fb.defaultPrimaryRepoId,
-        });
+        const [store, lcSummary] = await Promise.all([
+          readStudioReviewStore(resolvedRoot, {
+            reviewsPath,
+            legacyFallbackRoot: fb.legacyFallbackRoot,
+            defaultPrimaryRepoId: fb.defaultPrimaryRepoId,
+          }),
+          loadLifecycleSummary({ root: resolvedRoot, catalog }),
+        ]);
         sendJson(res, 200, {
           ok: true,
           writable,
@@ -376,6 +394,7 @@ export async function createStudioServer({
           decisions: store.decisions,
           annotations: store.annotations,
           guide: STUDIO_GUIDE_MODEL,
+          lifecycle: lcSummary,
           ecosystem: {
             available: catalog.available,
             count: catalog.count,
@@ -488,6 +507,16 @@ export async function createStudioServer({
           return;
         }
         sendJson(res, 200, { ok: true, writable, updatedAt: store.updatedAt, ...summary });
+        return;
+      }
+
+      if (pathname === '/api/studio/lifecycle') {
+        if (req.method !== 'GET') { sendJson(res, 405, { ok: false, error: '仅支持 GET 请求。' }); return; }
+        const force = url.searchParams.get('refresh') === '1';
+        const catalog = await getCatalog(force);
+        const reqRepo = url.searchParams.get('repo') || null;
+        const lc = await getLifecyclePayload(catalog, reqRepo, force);
+        sendJson(res, 200, lc);
         return;
       }
 
@@ -664,6 +693,7 @@ export async function createStudioServer({
           cachedCatalog = null;
           catalogAt = 0;
           repoCache.clear();
+          lifecycleCache.clear();
           const nextCatalog = await getCatalog(true);
           const addedRec = [...nextCatalog.byId.values()].find(r => r.realPath === saved.realPath);
           broadcast('catalog-change', { action: 'register', repoId: addedRec?.id || null, at: new Date().toISOString() });
@@ -687,6 +717,7 @@ export async function createStudioServer({
           cachedCatalog = null;
           catalogAt = 0;
           repoCache.clear();
+          lifecycleCache.clear();
           const nextCatalog = await getCatalog(true);
           broadcast('catalog-change', { action: 'unregister', repoId: saved.removedRepoId, at: new Date().toISOString() });
           sendJson(res, 200, {
@@ -710,6 +741,7 @@ export async function createStudioServer({
           cachedCatalog = null;
           catalogAt = 0;
           repoCache.clear();
+          lifecycleCache.clear();
           const nextCatalog = await getCatalog(true);
           broadcast('catalog-change', { action: 'meta', repoId: saved.repoId, at: new Date().toISOString() });
           sendJson(res, 200, {
@@ -740,6 +772,7 @@ export async function createStudioServer({
         '/assets/tooltips.mjs': { file: join(UI_DIR, 'tooltips.mjs'), type: MIME_TYPES['.mjs'] },
         '/assets/diagram-svg.mjs': { file: join(UI_DIR, 'diagram-svg.mjs'), type: MIME_TYPES['.mjs'] },
         '/assets/fleet-ui.mjs': { file: join(UI_DIR, 'fleet-ui.mjs'), type: MIME_TYPES['.mjs'] },
+        '/assets/lifecycle-ui.mjs': { file: join(UI_DIR, 'lifecycle-ui.mjs'), type: MIME_TYPES['.mjs'] },
         '/graph-layout.mjs': { file: join(PKG_SRC_DIR, 'graph-layout.mjs'), type: MIME_TYPES['.mjs'] },
         '/assets/graph-layout.mjs': { file: join(PKG_SRC_DIR, 'graph-layout.mjs'), type: MIME_TYPES['.mjs'] },
       };
@@ -858,6 +891,7 @@ export async function collectStudioSnapshot({
       selectedRepoId: targetRepoId,
       registryPath: runtimeRegistryPath,
     });
+    const lifecycle = await loadLifecycleSummary({ root: resolvedRoot, catalog });
     return {
       schemaVersion: 1,
       kind: 'skill-family-studio.snapshot',
@@ -868,6 +902,10 @@ export async function collectStudioSnapshot({
         count: catalog.count,
         primaryRepoId: catalog.primaryRepoId,
         repos: catalog.repos,
+      },
+      lifecycle: {
+        available: lifecycle.available,
+        subject: lifecycle.subject || null,
       },
       selectedRepo: inspected ? inspected.publicSnapshot : null,
       alignment,

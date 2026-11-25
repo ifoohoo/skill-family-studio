@@ -7,6 +7,7 @@
 import { computeAdaptiveGraphLayout, pickDefaultArtifactNode } from '../graph-layout.mjs';
 import { buildReviewStatusFlowSvg, buildTriLayerLockSvg } from './diagram-svg.mjs';
 import { mountFleetMonitor, renderSafeMarkdownToDom } from './fleet-ui.mjs';
+import { mountLifecyclePanel } from './lifecycle-ui.mjs';
 import { closeGlobalTooltip, GLOSSARY, infoTrigger, initTooltipManager, isTooltipOpen, renderEntityBrief, thWithInfo } from './tooltips.mjs';
 
 const STATUS_META = {
@@ -72,6 +73,18 @@ const state = {
   rtFleetRichMode: true,
   rtSseStatus: 'connected',
   rtReturnRepo: null,
+  lifecycleSummary: null,
+  lifecycleData: null,
+  lcSubView: 'matrix',
+  lcStateMode: 'ideal',
+  lcMethodExpanded: false,
+  lcSelectedDetail: null,
+  lcLedgerFilter: 'all',
+  lcCapPhase: 'all',
+  lcCapPlane: 'all',
+  lcCapStatus: 'all',
+  lcCapVerifyMode: 'all',
+  lcCapQuery: '',
 };
 
 const el = (tag, text, cls) => {
@@ -622,11 +635,17 @@ function renderRepoPopover() {
   }
 }
 
+function syncLifecycleTabVisibility() {
+  const lcBtn = document.getElementById('st-lifecycle-tab-btn');
+  if (!lcBtn) return;
+  lcBtn.hidden = !state.lifecycleSummary?.available;
+}
+
 function normalizeUiTab(raw) {
   const t = String(raw ?? '').trim().toLowerCase();
   if (t === 'overview') return 'guide';
   if (t === 'monitor') return 'runtime';
-  return ['guide', 'graph', 'review', 'runtime'].includes(t) ? t : 'graph';
+  return ['lifecycle', 'guide', 'graph', 'review', 'runtime'].includes(t) ? t : 'graph';
 }
 
 let lockTickTimer = null;
@@ -2245,6 +2264,14 @@ function renderAlignmentOverview(host) {
             allocHead.append(jumpBtn);
           } else {
             allocHead.append(el('span', `${alRowItem.targetRepoName} · ${alRowItem.targetTitle || alRowItem.targetUid}`, 'st-badge st-badge-zinc'));
+          }
+          const ringBadge = alRowItem.ringBadge
+            || pf.ringByRepoName?.[alRowItem.targetRepoName]
+            || state.lifecycleSummary?.ringByRepoName?.[alRowItem.targetRepoName]
+            || state.lifecycleData?.ringByRepoName?.[alRowItem.targetRepoName]
+            || null;
+          if (ringBadge?.label) {
+            allocHead.append(el('span', ringBadge.label, `st-badge st-badge-${ringBadge.tone || 'zinc'}`));
           }
           const lockBadgeText = (alRowItem.codeLocksFresh && alRowItem.executionVerified)
             ? '✅ 实测收据+双锁'
@@ -3951,8 +3978,82 @@ async function renderRuntimePanel({ forceRefresh = true } = {}) {
   paintRuntimeView();
 }
 
+let lifecycleLoadSeq = 0;
+
+async function renderLifecyclePanel({ forceRefresh = false } = {}) {
+  const host = document.getElementById('st-panel-lifecycle');
+  if (!host) return;
+  const mySeq = ++lifecycleLoadSeq;
+  if (!state.lifecycleData) {
+    host.replaceChildren(el('p', '正在执行全生态只读机器探针（版本、Git Tag、Foundation 轨道、SHA-256 收据与里程碑核验）…', 'st-muted-xs'));
+  }
+  if (forceRefresh || !state.lifecycleData) {
+    try {
+      const qs = forceRefresh ? '?refresh=1' : '';
+      const lcRes = await apiJson(`/api/studio/lifecycle${qs}`);
+      if (mySeq !== lifecycleLoadSeq) return;
+      state.lifecycleData = lcRes;
+      if (lcRes.available) {
+        state.lifecycleSummary = {
+          available: true,
+          hostRepoId: lcRes.hostRepoId,
+          subject: lcRes.subject,
+          ringByRepoName: lcRes.ringByRepoName || {},
+        };
+        syncLifecycleTabVisibility();
+      }
+    } catch (err) {
+      if (mySeq !== lifecycleLoadSeq) return;
+      host.replaceChildren(el('p', `加载全周期协同探针失败：${err.message}`, 'st-muted-xs'));
+      return;
+    }
+  }
+
+  const paint = () => {
+    mountLifecyclePanel(host, {
+      data: state.lifecycleData,
+      state,
+      doc: document,
+      onStateChange: paint,
+      onRefresh: async btn => {
+        if (btn) { btn.disabled = true; btn.textContent = '探针扫描中…'; }
+        await renderLifecyclePanel({ forceRefresh: true });
+        showStudioToast('✓ 已完成全周期只读机器探针重测', { tone: 'emerald' });
+      },
+      onSelectRepo: async nextRepoId => {
+        if (!nextRepoId) return;
+        await selectRepo(nextRepoId, { skipRender: true });
+        const hitRepo = state.repos.find(r => r.id === nextRepoId);
+        showStudioToast(`✓ 已切换当前仓库至「${hitRepo?.displayName || hitRepo?.name || nextRepoId}」，正在打开审阅与对齐视图`, { tone: 'emerald' });
+        switchTab('review');
+      },
+      onOpenDoc: async (hostRepoId, docPath) => {
+        const targetRepoId = hostRepoId || state.repoId;
+        if (targetRepoId && targetRepoId !== state.repoId) {
+          await selectRepo(targetRepoId, { skipRender: true });
+        }
+        const clean = String(docPath || '').trim();
+        const items = [...(state.snap?.reviewItems || []), ...(state.snap?.nodes || [])];
+        const hit = items.find(i => i.path === clean || i.uid === clean);
+        if (hit) {
+          state.selectedUid = hit.uid;
+          state.selectedAnchor = null;
+          state.reviewMode = 'reader';
+          switchTab('review');
+        } else {
+          showStudioToast(`提示：可在高阶工作区审阅目录中查阅 ${clean}`, { tone: 'emerald' });
+          state.reviewMode = 'reader';
+          switchTab('review');
+        }
+      },
+    });
+  };
+  paint();
+}
+
 function renderActiveTab() {
-  if (state.tab === 'guide') renderGuidePanel();
+  if (state.tab === 'lifecycle') renderLifecyclePanel({ forceRefresh: false });
+  else if (state.tab === 'guide') renderGuidePanel();
   else if (state.tab === 'graph') renderGraphPanel();
   else if (state.tab === 'review') renderReviewPanel();
   else if (state.tab === 'runtime') renderRuntimePanel({ forceRefresh: !state.runtime || state.runtimeRepoId !== state.repoId });
@@ -4107,6 +4208,13 @@ async function boot() {
           targetSearch.select?.();
           return;
         }
+      } else if (state.tab === 'lifecycle') {
+        const lcSearch = document.getElementById('st-lc-cap-search');
+        if (lcSearch) {
+          lcSearch.focus();
+          lcSearch.select?.();
+          return;
+        }
       } else if (state.tab === 'runtime') {
         const rtSearch = document.getElementById('st-plan-search')
           || document.querySelector('#st-panel-runtime .st-md-master input[type="search"], #st-panel-runtime input[type="search"]');
@@ -4146,6 +4254,8 @@ async function boot() {
   state.decisions = init.decisions || {};
   state.annotations = init.annotations || [];
   state.guide = init.guide || null;
+  state.lifecycleSummary = init.lifecycle || { available: false, ringByRepoName: {} };
+  syncLifecycleTabVisibility();
 
   const qs = new URLSearchParams(location.search);
   const initialRepo = qs.get('repo') || init.defaultRepo || init.ecosystem?.primaryRepoId || state.repos[0]?.id;
@@ -4171,6 +4281,9 @@ async function boot() {
     });
     es.addEventListener('catalog-change', async () => {
       const fresh = await apiJson('/api/studio/state?refresh=1');
+      state.lifecycleSummary = fresh.lifecycle || state.lifecycleSummary;
+      state.lifecycleData = null;
+      syncLifecycleTabVisibility();
       await applyEcosystemUpdate(fresh.ecosystem);
     });
     es.addEventListener('runtime-change', () => {
