@@ -43,6 +43,12 @@ import {
   runSandboxExercise,
 } from './runtime-bridge.mjs';
 import { collectSessionFleet } from './session-fleet.mjs';
+import {
+  collectStudioStbView,
+  consumeDriverCsrfToken,
+  issueDriverCsrfToken,
+  runLiveStbAuditDemo,
+} from './stb-bridge.mjs';
 import { computePathDigest } from './setup-advisor.mjs';
 import { inspectLifecycleCollaboration, loadLifecycleSummary } from './lifecycle-inspector.mjs';
 
@@ -567,6 +573,23 @@ export async function createStudioServer({
         return;
       }
 
+      if (pathname === '/api/studio/stb') {
+        if (req.method !== 'GET') { sendJson(res, 405, { ok: false, error: '仅支持 GET 请求。' }); return; }
+        const stbPayload = await collectStudioStbView({ root: resolvedRoot });
+        sendJson(res, 200, stbPayload);
+        return;
+      }
+
+      if (pathname === '/api/studio/driver/csrf') {
+        if (req.method !== 'GET') { sendJson(res, 405, { ok: false, error: '仅支持 GET 请求。' }); return; }
+        if (String(req.headers['x-studio-request'] ?? '').trim() !== '1') {
+          sendJson(res, 403, { ok: false, error: 'CSRF 签发接口必须携带 X-Studio-Request: 1。' });
+          return;
+        }
+        sendJson(res, 200, { ok: true, ...issueDriverCsrfToken() });
+        return;
+      }
+
       if (req.method === 'POST' || req.method === 'DELETE') {
         const expectedPort = server.address()?.port ?? (Number.isInteger(port) && port > 0 ? port : null);
         if (!isSafeLoopbackOrigin(req, expectedPort)) {
@@ -757,6 +780,26 @@ export async function createStudioServer({
           });
           return;
         }
+
+        if (pathname === '/api/studio/driver/run-demo') {
+          if (!consumeDriverCsrfToken(body.csrfToken)) {
+            sendJson(res, 403, { ok: false, error: '一次性 CSRF 令牌无效或已过期，请重新确认后发起。' });
+            return;
+          }
+          if (body.hitlConfirmed !== true) {
+            sendJson(res, 400, { ok: false, error: '缺少人工显式确认（hitlConfirmed: true），已拒绝启动执行驱动进程。' });
+            return;
+          }
+          const mode = body.mode === 'clean' ? 'clean' : 'fabricated';
+          const entry = await enqueueWrite(async () => runLiveStbAuditDemo({
+            root: resolvedRoot,
+            mode,
+            hitlConfirmed: true,
+          }));
+          broadcast('runtime-change', { action: 'stb-demo', bundleId: entry.bundleId, at: new Date().toISOString() });
+          sendJson(res, 200, { ok: true, entry });
+          return;
+        }
       }
 
       if (!['GET', 'HEAD'].includes(req.method ?? 'GET')) {
@@ -772,6 +815,7 @@ export async function createStudioServer({
         '/assets/tooltips.mjs': { file: join(UI_DIR, 'tooltips.mjs'), type: MIME_TYPES['.mjs'] },
         '/assets/diagram-svg.mjs': { file: join(UI_DIR, 'diagram-svg.mjs'), type: MIME_TYPES['.mjs'] },
         '/assets/fleet-ui.mjs': { file: join(UI_DIR, 'fleet-ui.mjs'), type: MIME_TYPES['.mjs'] },
+        '/assets/stb-ui.mjs': { file: join(UI_DIR, 'stb-ui.mjs'), type: MIME_TYPES['.mjs'] },
         '/assets/lifecycle-ui.mjs': { file: join(UI_DIR, 'lifecycle-ui.mjs'), type: MIME_TYPES['.mjs'] },
         '/graph-layout.mjs': { file: join(PKG_SRC_DIR, 'graph-layout.mjs'), type: MIME_TYPES['.mjs'] },
         '/assets/graph-layout.mjs': { file: join(PKG_SRC_DIR, 'graph-layout.mjs'), type: MIME_TYPES['.mjs'] },

@@ -8,6 +8,7 @@ import { computeAdaptiveGraphLayout, pickDefaultArtifactNode } from '../graph-la
 import { buildReviewStatusFlowSvg, buildTriLayerLockSvg } from './diagram-svg.mjs';
 import { mountFleetMonitor, renderSafeMarkdownToDom } from './fleet-ui.mjs';
 import { mountLifecyclePanel } from './lifecycle-ui.mjs';
+import { mountStbReconciliationPanel } from './stb-ui.mjs';
 import { closeGlobalTooltip, GLOSSARY, infoTrigger, initTooltipManager, isTooltipOpen, renderEntityBrief, thWithInfo } from './tooltips.mjs';
 
 const STATUS_META = {
@@ -29,6 +30,8 @@ const state = {
   alignment: null,
   runtime: null,
   fleet: null,
+  stb: null,
+  rtSelectedStbId: null,
   selectedUid: null,
   reviewMode: 'reader', // 'alignment' | 'reader'
   alignFilter: 'all',
@@ -3757,14 +3760,16 @@ async function renderRuntimePanel({ forceRefresh = true } = {}) {
   }
   if (forceRefresh || !state.runtime || state.runtimeRepoId !== state.repoId) {
     try {
-      const [rtRes, fleetRes] = await Promise.all([
+      const [rtRes, fleetRes, stbRes] = await Promise.all([
         apiJson(`/api/studio/runtime?repo=${encodeURIComponent(state.repoId || '')}`),
         apiJson('/api/studio/fleet').catch(() => null),
+        apiJson('/api/studio/stb').catch(() => null),
       ]);
       if (mySeq !== runtimeLoadSeq) return;
       state.runtime = rtRes;
       state.runtimeRepoId = state.repoId;
       if (fleetRes) state.fleet = fleetRes;
+      if (stbRes) state.stb = stbRes;
     } catch (err) {
       if (mySeq !== runtimeLoadSeq) return;
       host.replaceChildren(el('p', `读取运行态失败：${err.message}`, 'st-muted-xs'));
@@ -3796,6 +3801,47 @@ async function renderRuntimePanel({ forceRefresh = true } = {}) {
       + scopedTargets.filter(t => t.stateStore?.integrity === 'CHAIN_BROKEN').length
       + scopedTargets.flatMap(t => t.processes || []).filter(p => p.processStatus === 'TIMED_OUT').length;
     const fleetFamCount = state.fleet?.families?.length ?? 0;
+    const stbRedCount = state.stb?.kpi?.redCardCount ?? 0;
+    const stbTotalCount = state.stb?.kpi?.totalBundles ?? 0;
+
+    const runLiveStbDemoWithHitl = async (mode, triggerBtn) => {
+      if (!state.writable) {
+        showStudioToast('当前处于只读模式（--readonly），无法启动执行驱动实跑演练。', { tone: 'warn' });
+        return;
+      }
+      const label = mode === 'clean' ? '净室通过轨迹' : '疑似伪造完成拦截演练';
+      const confirmed = window.confirm(
+        `【人工显式确认 HITL】\n即将于本地禁网隔离临时沙箱中启动 dsh-headless-driver 子进程执行「${label}」，并调用 skill-failure-auditor 对账。\n是否确认授权执行？`,
+      );
+      if (!confirmed) return;
+      const prevTxt = triggerBtn?.textContent;
+      if (triggerBtn) { triggerBtn.disabled = true; triggerBtn.textContent = '沙箱执行与对账中…'; }
+      try {
+        const csrf = await apiJson('/api/studio/driver/csrf', {
+          headers: { 'X-Studio-Request': '1' },
+        });
+        const res = await apiJson('/api/studio/driver/run-demo', {
+          method: 'POST',
+          body: JSON.stringify({
+            mode,
+            hitlConfirmed: true,
+            csrfToken: csrf.token,
+          }),
+        });
+        if (res.entry?.id) state.rtSelectedStbId = res.entry.id;
+        showStudioToast(
+          res.entry?.suspectedFabrication
+            ? `🔴 已捕获并亮起疑似伪造完成红牌：${res.entry.bundleId}`
+            : `🟢 净室沙箱轨迹对账通过：${res.entry?.bundleId || ''}`,
+          { tone: res.entry?.suspectedFabrication ? 'warn' : 'emerald' },
+        );
+        renderRuntimePanel({ forceRefresh: true });
+      } catch (err) {
+        showStudioToast(`执行驱动演练失败：${err.message}`, { tone: 'error' });
+      } finally {
+        if (triggerBtn) { triggerBtn.disabled = !state.writable; triggerBtn.textContent = prevTxt || '实跑演练'; }
+      }
+    };
 
     const runSandboxWithGuard = async triggerBtn => {
       const prevTxt = triggerBtn?.textContent;
@@ -3868,6 +3914,7 @@ async function renderRuntimePanel({ forceRefresh = true } = {}) {
     for (const [vk, vl, tipKey] of [
       ['tasks', '🌳 任务推进树', 'rt:view:tasks'],
       ['fleet', `🛰️ 智能体会话编队 (${fleetFamCount})`, 'rt:view:fleet'],
+      ['stb', `🛡️ STB 追溯与防伪红牌 (${stbRedCount > 0 ? `🔴 ${stbRedCount} 红牌` : `${stbTotalCount} 份`})`, 'rt:view:stb'],
       ['diag', `🩺 异常排障 (${sWarnCount > 0 ? `⚠️ ${sWarnCount} 告警` : '🟢 无卡死'})`, 'rt:view:diag'],
     ]) {
       const b = el('button', vl, `st-btn${state.rtView === vk ? ' is-active' : ''}`);
@@ -3952,6 +3999,18 @@ async function renderRuntimePanel({ forceRefresh = true } = {}) {
         });
       };
       paintFleet();
+    } else if (state.rtView === 'stb') {
+      const paintStb = () => {
+        mountStbReconciliationPanel(viewHost, {
+          stbData: state.stb,
+          state,
+          doc: document,
+          writable: state.writable,
+          onSelectEntry: () => paintStb(),
+          onRunLiveDemo: (mode, btn) => runLiveStbDemoWithHitl(mode, btn),
+        });
+      };
+      paintStb();
     } else {
       renderDiagnosticsView(viewHost, scopedTargets, lockWarnMs, {
         onEditTarget: handleEditTarget,

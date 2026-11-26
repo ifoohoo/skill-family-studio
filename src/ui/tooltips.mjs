@@ -109,6 +109,7 @@ export const GLOSSARY = Object.freeze({
   'rt:scope': { title: '监控范围切换', meaning: '「聚焦当前项目」只展示顶栏当前所选仓库及沙箱运行源；「全工作区监控源聚合」汇总所有已发现仓库中的活跃任务与锁告警。' },
   'rt:view:tasks': { title: '🌳 任务推进树', meaning: '默认首屏：把波次 → 阶段/父任务 → 子步骤及 blockedBy 前置依赖收成可折叠树，顶部直接亮出当前执行焦点。' },
   'rt:view:fleet': { title: '🛰️ 智能体会话编队', meaning: '汇总本机真实多智能体日志或沙箱演练编队，左侧展示父子会话树，右上画跨会话委派/回报泳道，下方检查每次委派简报。' },
+  'rt:view:stb': { title: '🛡️ STB 追溯与防伪红牌', meaning: '呈现 execution-driver 封存的 SessionTraceBundle 多会话轨迹、40% 上下文膨胀水位，以及由 skill-failure-auditor 对账驱动的「疑似伪造完成硬闸红牌」。' },
   'rt:view:diag': { title: '🩺 异常排障', meaning: '按需排障页：标签亮出「🟢 无卡死」时平时无需打开；仅在出现「⚠️ 告警」、任务停滞或怀疑排他锁超时时点击排查。' },
   'rt:taskStatus': { title: '任务节点状态', meaning: '🟢 已完成 · 🔵 进行中 · 🔴 异常阻断（含前置依赖 blockedBy）· ⚪ 待推进；父节点自动按子节点汇总百分比。' },
   'rt:sessionRole': { title: '会话编队角色', meaning: '「主控」负责拆解协调、「子会话」并行落地具体任务、「审阅」负责只读独立复核。' },

@@ -1,6 +1,6 @@
 {
   "name": "skill-family-studio",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
   "description": "单端口统一承载 artifact-graph 宽屏制品图谱审阅与 Foundation 运行态监控的本地离线研发控制台。",
   "author": "广州市风荷科技有限公司",
@@ -40,9 +40,9 @@
   ],
   "dependencies": {
     "artifact-graph": "1.2.0",
-    "skill-family-contracts": "0.39.0",
-    "skill-family-harness-node": "0.39.0",
-    "skill-family-engineering-kit": "0.39.0",
+    "skill-family-contracts": "0.39.2",
+    "skill-family-harness-node": "0.39.2",
+    "skill-family-engineering-kit": "0.39.2",
     "yaml": "2.9.0"
   },
   "scripts": {

@@ -6,6 +6,7 @@ import { lstat, readdir, realpath } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { VERSION_LOCK_PATH } from 'artifact-graph';
+import { findSchemaByObject, verifySessionTraceBundleSeal } from 'skill-family-contracts';
 import { readFileContained, resolveContained } from 'skill-family-harness-node';
 import { parse as parseYaml } from 'yaml';
 import {
@@ -309,13 +310,47 @@ async function probeFoundationTrack(repoReal, repoEntry) {
   for (const rel of extraPinPaths) {
     const doc = await readJsonContainedSafe(repoReal, rel);
     if (!doc) continue;
-    const rawText = JSON.stringify(doc);
-    const m022 = /\b0\.22\.\d+\b/.exec(rawText);
-    const m039 = /\b0\.39\.\d+\b/.exec(rawText);
-    const hitVer = m022?.[0] || m039?.[0] || (typeof doc.pinnedVersion === 'string' ? doc.pinnedVersion : null);
-    const tuple = parseSemverTuple(hitVer);
-    if (tuple) {
-      evidence.push({ pkgName: 'foundation-pin', version: formatSemverTuple(tuple), tuple, source: rel });
+    if (Array.isArray(doc.packages) && doc.packages.length > 0) {
+      for (const item of doc.packages) {
+        const tuple = parseSemverTuple(item?.version);
+        if (tuple) {
+          evidence.push({
+            pkgName: item?.name || 'foundation-pin',
+            version: formatSemverTuple(tuple),
+            tuple,
+            source: `${rel}#packages`,
+          });
+        }
+      }
+      continue;
+    }
+    const structuralCandidates = [
+      doc.pinnedVersion,
+      doc.foundationVersion,
+      doc.targetVersion,
+      doc.minimumFoundationVersion,
+    ].filter(v => typeof v === 'string');
+    let matchedStructured = false;
+    for (const candidate of structuralCandidates) {
+      const tuple = parseSemverTuple(candidate);
+      if (tuple) {
+        evidence.push({ pkgName: 'foundation-pin', version: formatSemverTuple(tuple), tuple, source: rel });
+        matchedStructured = true;
+      }
+    }
+    if (!matchedStructured) {
+      const sanitized = { ...doc };
+      delete sanitized.note;
+      if (sanitized.source && typeof sanitized.source === 'object') {
+        sanitized.source = { ...sanitized.source, note: undefined };
+      }
+      const rawText = JSON.stringify(sanitized);
+      const m022 = /\b0\.22\.\d+\b/.exec(rawText);
+      const m039 = /\b0\.39\.\d+\b/.exec(rawText);
+      const tuple = parseSemverTuple(m022?.[0] || m039?.[0] || null);
+      if (tuple) {
+        evidence.push({ pkgName: 'foundation-pin', version: formatSemverTuple(tuple), tuple, source: rel });
+      }
     }
   }
 
@@ -632,28 +667,58 @@ async function probeHubActual(hubRepoReal, registryRepos) {
 async function probeAuditReleaseCycle(auditRepoReal) {
   if (!auditRepoReal) {
     return {
-      detected: false,
-      detail: '未定位到 Audit 仓库目录',
+      detected: true,
+      pinnedCall: 'audit_repo_missing',
+      detail: '未定位到 Audit 仓库目录，按 fail-closed 判定解耦状态未核实',
       probeSource: '未检出 Audit 仓库',
     };
   }
   const subDirs = await listSubpackageNames(auditRepoReal);
-  const candidates = [
+  const methodCandidates = [
     'spec/methods/release-audit.json',
     ...subDirs.map(s => `packages/${s}/spec/methods/release-audit.json`),
-    'generated/platforms/claude-code/skills/skill-family-audit-conformance-audit/scripts/conformance_workflow.py',
-    ...subDirs.map(s => `packages/${s}/generated/platforms/claude-code/skills/skill-family-audit-conformance-audit/scripts/conformance_workflow.py`),
   ];
-
-  for (const rel of candidates) {
-    const raw = await readTextContainedSafe(auditRepoReal, rel);
-    if (!raw) continue;
-    if (raw.includes('verify-records') && raw.includes('release-skill')) {
+  let checkedMethodCount = 0;
+  let verifiedMethodSource = null;
+  for (const rel of methodCandidates) {
+    const methodDoc = await readJsonContainedSafe(auditRepoReal, rel);
+    if (!methodDoc) continue;
+    checkedMethodCount += 1;
+    verifiedMethodSource = rel;
+    const raw = JSON.stringify(methodDoc);
+    const procExec = methodDoc?.maximumSideEffects?.processExecution;
+    if ((raw.includes('verify-records') && raw.includes('release-skill')) || (procExec && procExec !== 'none')) {
       const pinMatch = /release-skill@([0-9A-Za-z._-]+):verify-records/.exec(raw);
       return {
         detected: true,
-        pinnedCall: pinMatch ? `release-skill@${pinMatch[1]}:verify-records` : 'release-skill:verify-records',
-        detail: `检出 Audit 方法反向调用 ${pinMatch ? `release-skill@${pinMatch[1]}` : 'release-skill'} 的 verify-records 接口，与发布门禁消费形成双向耦合环`,
+        pinnedCall: pinMatch ? `release-skill@${pinMatch[1]}:verify-records` : `processExecution:${procExec || 'verify-records'}`,
+        detail: `检出 Audit release-audit 方法仍声明反向进程执行或 verify-records 耦合（${procExec || 'verify-records'}），与发布门禁消费形成双向耦合环`,
+        probeSource: rel,
+      };
+    }
+  }
+  if (checkedMethodCount === 0) {
+    return {
+      detected: true,
+      pinnedCall: 'release_audit_contract_missing',
+      detail: 'Audit 仓库未检出 spec/methods/release-audit.json 方法合同，按 fail-closed 判定未完成单向解耦核实',
+      probeSource: 'spec/methods/release-audit.json（缺失）',
+    };
+  }
+
+  const receiptHelperCandidates = [
+    'plugin-src/skills/skill-family-audit-release/scripts/release_receipts.py',
+    ...subDirs.map(s => `packages/${s}/plugin-src/skills/skill-family-audit-release/scripts/release_receipts.py`),
+    'generated/platforms/claude-code/skills/skill-family-audit-release-audit/scripts/release_receipts.py',
+    ...subDirs.map(s => `packages/${s}/generated/platforms/claude-code/skills/skill-family-audit-release-audit/scripts/release_receipts.py`),
+  ];
+  for (const rel of receiptHelperCandidates) {
+    const raw = await readTextContainedSafe(auditRepoReal, rel);
+    if (raw) {
+      return {
+        detected: true,
+        pinnedCall: 'release_receipts_bridge_present',
+        detail: `检出残留反向桥接脚本 ${rel}`,
         probeSource: rel,
       };
     }
@@ -663,7 +728,7 @@ async function probeAuditReleaseCycle(auditRepoReal) {
     detected: false,
     pinnedCall: null,
     detail: '未检出 Audit 对 release-skill verify-records 的反向调用，单向解耦已成立',
-    probeSource: 'spec/methods/release-audit.json（零 verify-records 反向调用）',
+    probeSource: `${verifiedMethodSource}（processExecution=none 且零 verify-records 反向调用）`,
   };
 }
 
@@ -839,8 +904,22 @@ function lookupProbedRepo(probedByKey, key) {
   return probedByKey.get(key) || probedByKey.get(basename(String(key))) || null;
 }
 
-function evaluateArchitecturalRisks(rawRisks, probedRepos, probedByKey, hubActual, auditCycle) {
-  return (rawRisks || []).map(risk => {
+async function checkAnyFileInTargets(targets, relCandidates) {
+  const hits = [];
+  for (const t of targets) {
+    if (!t.live?.realPath) continue;
+    for (const rel of relCandidates) {
+      if (await existsContainedFile(t.live.realPath, rel)) {
+        hits.push(`${t.publicName}/${rel}`);
+        break;
+      }
+    }
+  }
+  return hits;
+}
+
+async function evaluateArchitecturalRisks(rawRisks, probedRepos, probedByKey, hubActual, auditCycle) {
+  return Promise.all((rawRisks || []).map(async risk => {
     let detected = false;
     let liveEvidence = '';
     let probeSource = '';
@@ -880,12 +959,21 @@ function evaluateArchitecturalRisks(rawRisks, probedRepos, probedByKey, hubActua
         || probedRepos.find(r => r.publicName === 'skill-eval');
       const ver = evalRepo?.live?.sourceVersion?.version || null;
       const fndAligned = Boolean(evalRepo?.live?.foundation?.alignedWithExpected && evalRepo?.live?.foundation?.foundationTrackActual === '0.39.x');
-      detected = !evalRepo?.live?.existsOnDisk || isPlaceholderVersion(ver) || !fndAligned;
+      const requiredEngineModules = evalRepo ? await Promise.all([
+        'packages/skill-eval/src/oracle-vault.mjs',
+        'packages/skill-eval/src/judge-calibration.mjs',
+        'packages/skill-eval/src/sfa-hard-gate.mjs',
+        'packages/skill-eval/src/scorecard-engine.mjs',
+        'packages/skill-eval/schemas/scorecard.schema.json',
+      ].map(rel => checkAnyFileInTargets([evalRepo], [rel]).then(hits => hits.length > 0))) : [];
+      const allModulesPresent = requiredEngineModules.length === 5 && requiredEngineModules.every(Boolean);
+      const receiptReady = Boolean(evalRepo?.live?.locksAndReceipt?.receiptPassed && evalRepo?.live?.locksAndReceipt?.lockPresent);
+      detected = !evalRepo?.live?.existsOnDisk || isPlaceholderVersion(ver) || !fndAligned || !allModulesPresent || !receiptReady;
       liveEvidence = evalRepo?.live?.existsOnDisk
-        ? `当前版本=${ver || '未声明'}，底座=${evalRepo.live.foundation?.foundationTrackActual || 'not-applicable'}，锁与收据=${evalRepo.live.locksAndReceipt?.badgeLabel || '未建'}`
+        ? `当前版本=${ver || '未声明'}，底座=${evalRepo.live.foundation?.foundationTrackActual || 'not-applicable'}，核心模块=${allModulesPresent ? '5/5 就绪' : '缺失'}，锁与收据=${evalRepo.live.locksAndReceipt?.badgeLabel || '未建'}`
         : '本地未检出已重塑的计分卡引擎包';
       probeSource = evalRepo?.live?.existsOnDisk
-        ? `skill-eval/${evalRepo.live.sourceVersion?.probeSource || 'package.json'} + ${evalRepo.live.foundation?.probeSource || 'profile.json'}`
+        ? `skill-eval/${evalRepo.live.sourceVersion?.probeSource || 'package.json'} + packages/skill-eval/src/* + sft-runs.json`
         : 'skill-eval 目录探针';
     }
 
@@ -898,7 +986,7 @@ function evaluateArchitecturalRisks(rawRisks, probedRepos, probedByKey, hubActua
       liveEvidence,
       probeSource,
     };
-  });
+  }));
 }
 
 function evaluateCapabilityCatalog(rawCatalog, probedByKey) {
@@ -938,20 +1026,6 @@ async function evaluateRoadmapMilestones(rawRoadmap, ctx) {
   const resolveMilestoneTargets = (ownerRepos, fallbackPred) => {
     const explicit = (ownerRepos || []).map(k => lookupProbedRepo(probedByKey, k)).filter(Boolean);
     return explicit.length > 0 ? explicit : probedRepos.filter(fallbackPred);
-  };
-
-  const checkAnyFileInTargets = async (targets, relCandidates) => {
-    const hits = [];
-    for (const t of targets) {
-      if (!t.live?.realPath) continue;
-      for (const rel of relCandidates) {
-        if (await existsContainedFile(t.live.realPath, rel)) {
-          hits.push(`${t.publicName}/${rel}`);
-          break;
-        }
-      }
-    }
-    return hits;
   };
 
   const outStages = [];
@@ -1087,32 +1161,58 @@ async function evaluateRoadmapMilestones(rawRoadmap, ctx) {
         probeSource = `skill-family-audit/${auditCycle.probeSource} + ${hubActual.probeSource}`;
       } else if (ms.probeCheck === 'acp_dsh_driver_and_stb') {
         const targets = resolveMilestoneTargets(ms.ownerRepos, r => r.ring === 'core' && r.live?.existsOnDisk);
-        const driverHits = await checkAnyFileInTargets(targets, [
+        const driverPkgHits = await checkAnyFileInTargets(targets, [
           'packages/execution-driver/package.json',
-          'src/execution-driver.mjs',
         ]);
+        const driverEntryHits = await checkAnyFileInTargets(targets, [
+          'packages/execution-driver/src/index.mjs',
+        ]);
+        const driverReady = driverPkgHits.length > 0 && driverEntryHits.length > 0;
+        const stbContractRegistered = Boolean(findSchemaByObject('session-trace-bundle'));
         const stbHits = await checkAnyFileInTargets(targets, [
-          'packages/skill-family-contracts/schemas/session-trajectory-bundle.schema.json',
-          'schemas/session-trajectory-bundle.schema.json',
-          'artifacts/contracts/stb.schema.json',
+          'packages/skill-family-contracts/src/schemas/session-trace-bundle.schema.json',
+          'packages/skill-family-contracts/schemas/session-trace-bundle.schema.json',
+          'schemas/session-trace-bundle.schema.json',
         ]);
-        if (driverHits.length > 0 && stbHits.length > 0) {
+        let verifiedSampleReady = false;
+        for (const repo of targets) {
+          if (!repo?.live?.realPath) continue;
+          const sampleStb = await readJsonContainedSafe(repo.live.realPath, 'packages/execution-driver/fixtures/verified-stb-bundle.json')
+            || await readJsonContainedSafe(repo.live.realPath, '.skill-family-studio/traces/latest-stb.json');
+          const samplePc = await readJsonContainedSafe(repo.live.realPath, 'packages/execution-driver/fixtures/verified-stb-conclusion.json')
+            || await readJsonContainedSafe(repo.live.realPath, '.skill-family-studio/traces/latest-stb-conclusion.json');
+          if (!sampleStb || !samplePc) continue;
+          const sealVerify = verifySessionTraceBundleSeal(sampleStb);
+          const digest = sealVerify.valid ? sealVerify.bundleDigestSha256 : null;
+          if (
+            sealVerify.valid
+            && typeof digest === 'string'
+            && samplePc?.kind === 'skill-family.professional-conclusion'
+            && samplePc?.provider?.id === 'skill-failure-auditor'
+            && samplePc?.outcome?.code === 'FAILURE_DIAGNOSIS_CLEAR'
+            && samplePc?.details?.verdict === 'PASS'
+            && samplePc?.subject?.revision === `sha256:${digest}`
+          ) {
+            verifiedSampleReady = true;
+            break;
+          }
+        }
+        if (driverReady && stbContractRegistered && stbHits.length > 0 && verifiedSampleReady) {
           status = 'passed';
-          badgeLabel = '✅ 已达成';
+          badgeLabel = '✅ 已达成 (Driver + STB + SFA 核验闭环)';
           badgeTone = 'emerald';
-        } else if (driverHits.length > 0 || stbHits.length > 0) {
+        } else if (driverReady || stbHits.length > 0) {
           status = 'partial';
           badgeLabel = '🔵 部分落盘';
           badgeTone = 'indigo';
         }
-        liveDetail = `ACP Driver 包：${driverHits[0] || '待建'} · STB Schema：${stbHits[0] || '待建'}`;
-        probeSource = 'packages/execution-driver + session-trajectory-bundle.schema.json 探针';
+        liveDetail = `ACP Driver 包：${driverReady ? driverPkgHits[0] : '待建'} · STB Schema：${stbHits[0] || '待建'} · SFA 封存对账实证：${verifiedSampleReady ? '已就绪' : '待核验'}`;
+        probeSource = 'packages/execution-driver + session-trace-bundle.schema.json + SFA 封存对账结论探针';
       } else if (ms.probeCheck === 'blueprint_canvas_and_mocks') {
         const targets = resolveMilestoneTargets(ms.ownerRepos, r => r.ring === 'core' && r.live?.existsOnDisk);
         const bpHits = await checkAnyFileInTargets(targets, [
           'packages/skill-family-studio/src/ui/blueprint-canvas.mjs',
           'src/ui/blueprint-canvas.mjs',
-          'schemas/orchestration-blueprint.schema.json',
         ]);
         const mockHits = await checkAnyFileInTargets(targets, [
           'packages/tool-mock-sandbox/package.json',
@@ -1132,25 +1232,32 @@ async function evaluateRoadmapMilestones(rawRoadmap, ctx) {
       } else if (ms.probeCheck === 'skill_eval_scorecard_engine') {
         const evalRepo = lookupProbedRepo(probedByKey, 'skill-eval')
           || probedRepos.find(r => r.publicName === 'skill-eval');
-        const scorecardHits = evalRepo ? await checkAnyFileInTargets([evalRepo], [
+        const requiredModules = [
           'packages/skill-eval/package.json',
-          'src/scorecard-engine.mjs',
-          'src/scorecard.mjs',
-          'schemas/scorecard.schema.json',
-        ]) : [];
+          'packages/skill-eval/src/oracle-vault.mjs',
+          'packages/skill-eval/src/judge-calibration.mjs',
+          'packages/skill-eval/src/sfa-hard-gate.mjs',
+          'packages/skill-eval/src/scorecard-engine.mjs',
+          'packages/skill-eval/schemas/scorecard.schema.json',
+        ];
+        const moduleChecks = evalRepo ? await Promise.all(
+          requiredModules.map(rel => checkAnyFileInTargets([evalRepo], [rel]).then(hits => hits[0] || null)),
+        ) : [];
+        const presentCount = moduleChecks.filter(Boolean).length;
         const verReady = evalRepo?.live?.existsOnDisk && !isPlaceholderVersion(evalRepo.live.sourceVersion?.version);
         const fndReady = evalRepo?.live?.foundation?.foundationTrackActual === '0.39.x';
-        if (verReady && fndReady && scorecardHits.length > 0) {
+        const receiptReady = Boolean(evalRepo?.live?.locksAndReceipt?.receiptPassed);
+        if (verReady && fndReady && presentCount === requiredModules.length && receiptReady) {
           status = 'passed';
           badgeLabel = '✅ 已达成';
           badgeTone = 'emerald';
-        } else if (scorecardHits.length > 0 || fndReady) {
+        } else if (presentCount > 0 || fndReady) {
           status = 'partial';
           badgeLabel = '🔵 重塑推进中';
           badgeTone = 'indigo';
         }
-        liveDetail = `skill-eval 当前版本=${evalRepo?.live?.sourceVersion?.version || '0.0.0'}，计分卡引擎文件=${scorecardHits[0] || '待建'}`;
-        probeSource = 'skill-eval/package.json + scorecard-engine 探针';
+        liveDetail = `skill-eval 当前版本=${evalRepo?.live?.sourceVersion?.version || '0.0.0'}，核心模块=${presentCount}/${requiredModules.length}，测试收据=${receiptReady ? '已通过' : '待核验'}`;
+        probeSource = 'skill-eval/packages/skill-eval/src/* + sft-runs.json 探针';
       } else if (ms.probeCheck === 'studio_server_otel_dengbao') {
         const targets = resolveMilestoneTargets(ms.ownerRepos, r => r.ring === 'core' && r.live?.existsOnDisk);
         const srvHits = await checkAnyFileInTargets(targets, [
@@ -1305,7 +1412,7 @@ export async function inspectLifecycleCollaboration({ root = '.', catalog = null
     }
   }
 
-  const architecturalRisks = evaluateArchitecturalRisks(
+  const architecturalRisks = await evaluateArchitecturalRisks(
     registry.architecturalRisks,
     probedRepos,
     probedByKey,

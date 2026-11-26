@@ -2429,3 +2429,216 @@ html, body {
   .st-lc-state-seg { width: 100%; }
   .st-lc-seg-btn { flex: 1 1 50%; padding: 0 8px; font-size: 12px; }
 }
+
+/* Stage 1 M1-3: SessionTraceBundle 会话追溯与反伪造对账硬闸红牌（强制 100% 全宽自适应） */
+.st-stb-panel {
+  width: 100%;
+  max-width: none;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.st-stb-kpi-card,
+.st-stb-redcard,
+.st-stb-passcard,
+.st-stb-col {
+  width: 100%;
+  max-width: none;
+}
+
+.st-stb-head-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.st-stb-title {
+  margin: 0 0 2px;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.st-stb-subtitle {
+  margin: 0 0 10px;
+  font-size: 13.5px;
+  font-weight: 700;
+}
+
+.st-stb-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.st-stb-kpi-item {
+  padding: 10px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--st-border);
+  background: var(--st-subtle);
+}
+.st-stb-kpi-item.is-rose { background: var(--st-rose-bg); border-color: var(--st-rose-bd); }
+.st-stb-kpi-item.is-amber { background: var(--st-amber-bg); border-color: var(--st-amber-bd); }
+.st-stb-kpi-item.is-emerald { background: var(--st-emerald-bg); border-color: var(--st-emerald-bd); }
+.st-stb-kpi-val { font-size: 16px; font-weight: 700; margin-top: 2px; }
+
+.st-stb-selector-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.st-stb-redcard {
+  border: 2px solid #e11d48;
+  background: var(--st-rose-bg);
+  padding: 14px 16px;
+}
+
+.st-stb-redcard-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.st-stb-redcard-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 7px;
+  background: #e11d48;
+  color: #ffffff;
+  font-weight: 700;
+  font-size: 13px;
+}
+
+.st-stb-redcard-summary {
+  margin: 6px 0;
+  font-weight: 600;
+  color: var(--st-rose-fg);
+}
+
+.st-stb-reason-list {
+  margin: 6px 0 8px 18px;
+  padding: 0;
+  font-size: 12.5px;
+}
+
+.st-stb-fm-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.st-stb-passcard {
+  border: 1px solid var(--st-emerald-bd);
+  background: var(--st-emerald-bg);
+  color: var(--st-emerald-fg);
+  padding: 12px 16px;
+}
+
+.st-stb-warncard {
+  border: 1px solid var(--st-amber-bd);
+  background: var(--st-amber-bg);
+  color: var(--st-text);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.st-stb-detail-grid {
+  width: 100%;
+  max-width: none;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.st-stb-session-box {
+  padding: 10px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--st-border);
+  background: var(--st-subtle);
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.st-stb-session-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.st-stb-turn-row {
+  padding: 6px 8px;
+  border-radius: 7px;
+  background: var(--st-surface);
+  border: 1px solid var(--st-border);
+}
+.st-stb-turn-row.is-warn {
+  border-color: var(--st-amber-bd);
+  background: var(--st-amber-bg);
+}
+
+.st-stb-turn-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  margin-bottom: 5px;
+}
+
+.st-stb-bar-track {
+  position: relative;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--st-border);
+  overflow: hidden;
+}
+
+.st-stb-bar-fill {
+  height: 100%;
+  background: #10b981;
+  border-radius: 999px;
+}
+.st-stb-bar-fill.is-warn {
+  background: #d97706;
+}
+
+.st-stb-bar-marker {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: #e11d48;
+}
+
+.st-stb-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  margin-bottom: 12px;
+}
+.st-stb-table th,
+.st-stb-table td {
+  text-align: left;
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--st-border);
+  vertical-align: top;
+}
+
+@media (max-width: 1180px) {
+  .st-stb-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .st-stb-detail-grid { grid-template-columns: minmax(0, 1fr); }
+}
