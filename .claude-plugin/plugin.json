@@ -1,6 +1,6 @@
 {
   "name": "skill-family-studio",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "单端口统一承载 artifact-graph 宽屏制品图谱审阅与 Foundation 运行态监控的本地离线研发控制台。",
   "author": {
     "name": "广州市风荷科技有限公司"

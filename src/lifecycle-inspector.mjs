@@ -641,14 +641,14 @@ async function probeHubActual(hubRepoReal, registryRepos) {
         });
       }
     }
-    if (repo.publicName === 'skill-eval') {
+    if (repo.publicName === 'skill-eval' || repo.publicName === 'skill-family-eval') {
       const legacyHeimdall = uniqueMatches.find(m => m.providerId === 'heimdall' && m.lifecycleState === 'active');
       if (legacyHeimdall) {
         drifts.push({
           repoId: repo.id,
           publicName: repo.publicName,
           kind: 'legacy_heimdall_active_in_hub',
-          detail: `skill-eval 在 Hub (${providerSource || marketSource}) 中仍以旧壳名 providerId="heimdall" 处于 active 状态，待重塑切换`,
+          detail: `${repo.publicName} 在 Hub (${providerSource || marketSource}) 中仍以旧壳名 providerId="heimdall" 处于 active 状态，待重塑切换`,
         });
       }
     }
@@ -955,8 +955,9 @@ async function evaluateArchitecturalRisks(rawRisks, probedRepos, probedByKey, hu
         : 'Hub 台账状态与生命周期三环注册表完全一致，无退役/旧壳残留。';
       probeSource = hubActual.probeSource;
     } else if (risk.probeKind === 'eval_shell_reshape') {
-      const evalRepo = lookupProbedRepo(probedByKey, 'skill-eval')
-        || probedRepos.find(r => r.publicName === 'skill-eval');
+      const evalRepo = lookupProbedRepo(probedByKey, 'skill-family-eval')
+        || lookupProbedRepo(probedByKey, 'skill-eval')
+        || probedRepos.find(r => r.publicName === 'skill-family-eval' || r.publicName === 'skill-eval');
       const ver = evalRepo?.live?.sourceVersion?.version || null;
       const fndAligned = Boolean(evalRepo?.live?.foundation?.alignedWithExpected && evalRepo?.live?.foundation?.foundationTrackActual === '0.39.x');
       const requiredEngineModules = evalRepo ? await Promise.all([
@@ -964,13 +965,17 @@ async function evaluateArchitecturalRisks(rawRisks, probedRepos, probedByKey, hu
         'packages/skill-eval/src/judge-calibration.mjs',
         'packages/skill-eval/src/sfa-hard-gate.mjs',
         'packages/skill-eval/src/scorecard-engine.mjs',
+        'packages/skill-eval/src/eval-conclusion.mjs',
         'packages/skill-eval/schemas/scorecard.schema.json',
       ].map(rel => checkAnyFileInTargets([evalRepo], [rel]).then(hits => hits.length > 0))) : [];
-      const allModulesPresent = requiredEngineModules.length === 5 && requiredEngineModules.every(Boolean);
+      const allModulesPresent = requiredEngineModules.length === 6 && requiredEngineModules.every(Boolean);
+      const hasLegacyHeimdallDir = evalRepo?.live?.realPath
+        ? await existsDir(join(evalRepo.live.realPath, 'heimdall'))
+        : false;
       const receiptReady = Boolean(evalRepo?.live?.locksAndReceipt?.receiptPassed && evalRepo?.live?.locksAndReceipt?.lockPresent);
-      detected = !evalRepo?.live?.existsOnDisk || isPlaceholderVersion(ver) || !fndAligned || !allModulesPresent || !receiptReady;
+      detected = !evalRepo?.live?.existsOnDisk || isPlaceholderVersion(ver) || !fndAligned || !allModulesPresent || hasLegacyHeimdallDir || !receiptReady;
       liveEvidence = evalRepo?.live?.existsOnDisk
-        ? `当前版本=${ver || '未声明'}，底座=${evalRepo.live.foundation?.foundationTrackActual || 'not-applicable'}，核心模块=${allModulesPresent ? '5/5 就绪' : '缺失'}，锁与收据=${evalRepo.live.locksAndReceipt?.badgeLabel || '未建'}`
+        ? `当前版本=${ver || '未声明'}，底座=${evalRepo.live.foundation?.foundationTrackActual || 'not-applicable'}，核心模块=${allModulesPresent ? '6/6 就绪' : '缺失'}，heimdall残留=${hasLegacyHeimdallDir ? '存在' : '已清理'}，锁与收据=${evalRepo.live.locksAndReceipt?.badgeLabel || '未建'}`
         : '本地未检出已重塑的计分卡引擎包';
       probeSource = evalRepo?.live?.existsOnDisk
         ? `skill-eval/${evalRepo.live.sourceVersion?.probeSource || 'package.json'} + packages/skill-eval/src/* + sft-runs.json`
@@ -1209,55 +1214,113 @@ async function evaluateRoadmapMilestones(rawRoadmap, ctx) {
         liveDetail = `ACP Driver 包：${driverReady ? driverPkgHits[0] : '待建'} · STB Schema：${stbHits[0] || '待建'} · SFA 封存对账实证：${verifiedSampleReady ? '已就绪' : '待核验'}`;
         probeSource = 'packages/execution-driver + session-trace-bundle.schema.json + SFA 封存对账结论探针';
       } else if (ms.probeCheck === 'blueprint_canvas_and_mocks') {
-        const targets = resolveMilestoneTargets(ms.ownerRepos, r => r.ring === 'core' && r.live?.existsOnDisk);
-        const bpHits = await checkAnyFileInTargets(targets, [
+        const studioRepo = lookupProbedRepo(probedByKey, 'skill-family-studio')
+          || probedRepos.find(r => r.publicName === 'skill-family-studio');
+        const sftRepo = lookupProbedRepo(probedByKey, 'skill-family-test')
+          || probedRepos.find(r => r.publicName === 'skill-family-test');
+        const bpHits = studioRepo ? await checkAnyFileInTargets([studioRepo], [
           'packages/skill-family-studio/src/ui/blueprint-canvas.mjs',
           'src/ui/blueprint-canvas.mjs',
-        ]);
-        const mockHits = await checkAnyFileInTargets(targets, [
-          'packages/tool-mock-sandbox/package.json',
-          'src/mock-recorder.mjs',
-        ]);
-        if (bpHits.length > 0 && mockHits.length > 0) {
+        ]) : [];
+        const replayHits = sftRepo ? await checkAnyFileInTargets([sftRepo], [
+          'packages/skill-family-test/src/tool-mock-replay.mjs',
+          'src/tool-mock-replay.mjs',
+        ]) : [];
+        if (bpHits.length > 0 && replayHits.length > 0) {
           status = 'passed';
           badgeLabel = '✅ 已达成';
           badgeTone = 'emerald';
-        } else if (bpHits.length > 0 || mockHits.length > 0) {
+        } else if (bpHits.length > 0 || replayHits.length > 0) {
           status = 'partial';
           badgeLabel = '🔵 部分落盘';
           badgeTone = 'indigo';
         }
-        liveDetail = `编排蓝图画布：${bpHits[0] || '待建'} · 工具替身录制沙箱：${mockHits[0] || '待建'}`;
-        probeSource = 'blueprint-canvas.mjs + packages/tool-mock-sandbox 探针';
+        liveDetail = `编排蓝图画布：${bpHits[0] || '待 Wave 4D 按实战摩擦建设'} · sft 工具替身回放：${replayHits[0] || '待 Wave 4D 建设'}`;
+        probeSource = 'skill-family-studio/blueprint-canvas.mjs + skill-family-test/tool-mock-replay.mjs 探针';
       } else if (ms.probeCheck === 'skill_eval_scorecard_engine') {
-        const evalRepo = lookupProbedRepo(probedByKey, 'skill-eval')
-          || probedRepos.find(r => r.publicName === 'skill-eval');
+        const evalRepo = lookupProbedRepo(probedByKey, 'skill-family-eval')
+          || lookupProbedRepo(probedByKey, 'skill-eval')
+          || probedRepos.find(r => r.publicName === 'skill-family-eval' || r.publicName === 'skill-eval');
+        const rsRepo = lookupProbedRepo(probedByKey, 'release-skill')
+          || probedRepos.find(r => r.publicName === 'release-skill');
+        const sfaRepo = lookupProbedRepo(probedByKey, 'skill-failure-auditor')
+          || probedRepos.find(r => r.publicName === 'skill-failure-auditor');
         const requiredModules = [
           'packages/skill-eval/package.json',
           'packages/skill-eval/src/oracle-vault.mjs',
           'packages/skill-eval/src/judge-calibration.mjs',
           'packages/skill-eval/src/sfa-hard-gate.mjs',
           'packages/skill-eval/src/scorecard-engine.mjs',
+          'packages/skill-eval/src/eval-conclusion.mjs',
           'packages/skill-eval/schemas/scorecard.schema.json',
         ];
         const moduleChecks = evalRepo ? await Promise.all(
           requiredModules.map(rel => checkAnyFileInTargets([evalRepo], [rel]).then(hits => hits[0] || null)),
         ) : [];
         const presentCount = moduleChecks.filter(Boolean).length;
+        let adversarialReady = false;
+        if (evalRepo?.live?.realPath) {
+          const advSrc = await readTextContainedSafe(
+            evalRepo.live.realPath,
+            'packages/skill-eval/src/adversarial-suite.mjs',
+          );
+          adversarialReady = Boolean(
+            advSrc &&
+            advSrc.includes('ADVERSARIAL_SUITE_ID') &&
+            advSrc.includes('evaluateAdversarialRun'),
+          );
+        }
+        let rsEvalProofReady = false;
+        if (rsRepo?.live?.realPath) {
+          const rsProofSrc = await readTextContainedSafe(
+            rsRepo.live.realPath,
+            'packages/release-skill/src/commands/professional-proof.mjs',
+          );
+          rsEvalProofReady = Boolean(
+            rsProofSrc &&
+            /export\s+async\s+function\s+readEvalProfessionalProof\b/.test(rsProofSrc),
+          );
+        }
+        const sfaAligned = sfaRepo?.live?.existsOnDisk
+          ? Boolean(sfaRepo.live.foundation?.alignedWithExpected && sfaRepo.live.foundation?.foundationTrackActual === '0.39.x')
+          : true;
+        const hubEvalActive = (hubActual.providers || []).some(
+          p =>
+            p.capabilityId === 'quality-evaluation' &&
+            (p.providerId === 'skill-family-eval' || p.providerId === 'skill-eval') &&
+            p.lifecycleState === 'active' &&
+            p.integrationStatus === 'published-verified',
+        );
         const verReady = evalRepo?.live?.existsOnDisk && !isPlaceholderVersion(evalRepo.live.sourceVersion?.version);
-        const fndReady = evalRepo?.live?.foundation?.foundationTrackActual === '0.39.x';
+        const fndReady = Boolean(
+          evalRepo?.live?.foundation?.alignedWithExpected &&
+          evalRepo?.live?.foundation?.foundationTrackActual === '0.39.x' &&
+          sfaAligned,
+        );
+        const siteReady = Boolean(evalRepo?.live?.docSite?.isIndependentSite);
         const receiptReady = Boolean(evalRepo?.live?.locksAndReceipt?.receiptPassed);
-        if (verReady && fndReady && presentCount === requiredModules.length && receiptReady) {
+        if (
+          verReady &&
+          fndReady &&
+          presentCount === requiredModules.length &&
+          siteReady &&
+          receiptReady &&
+          rsEvalProofReady &&
+          hubEvalActive &&
+          adversarialReady
+        ) {
           status = 'passed';
-          badgeLabel = '✅ 已达成';
+          badgeLabel = '✅ 已达成 (含对抗评测与 P7 门禁闭环)';
           badgeTone = 'emerald';
         } else if (presentCount > 0 || fndReady) {
           status = 'partial';
-          badgeLabel = '🔵 重塑推进中';
+          badgeLabel = adversarialReady
+            ? '🔵 引擎与对抗包已落盘（待上下游门禁串联）'
+            : '🔵 0.1.0 引擎就绪（待 4B-2 安全对抗套件）';
           badgeTone = 'indigo';
         }
-        liveDetail = `skill-eval 当前版本=${evalRepo?.live?.sourceVersion?.version || '0.0.0'}，核心模块=${presentCount}/${requiredModules.length}，测试收据=${receiptReady ? '已通过' : '待核验'}`;
-        probeSource = 'skill-eval/packages/skill-eval/src/* + sft-runs.json 探针';
+        liveDetail = `skill-family-eval v${evalRepo?.live?.sourceVersion?.version || '0.0.0'}，核心模块=${presentCount}/${requiredModules.length}，P7门禁=${rsEvalProofReady ? '已接线' : '待接线'}，Hub槽位=${hubEvalActive ? 'active' : '待切换'}，对抗套件=${adversarialReady ? '已就绪' : '待 4B-2'}`;
+        probeSource = 'skill-eval/src/* + release-skill/professional-proof.mjs + Hub lifecycle-providers.mjs';
       } else if (ms.probeCheck === 'studio_server_otel_dengbao') {
         const targets = resolveMilestoneTargets(ms.ownerRepos, r => r.ring === 'core' && r.live?.existsOnDisk);
         const srvHits = await checkAnyFileInTargets(targets, [
