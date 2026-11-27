@@ -1,5 +1,6 @@
 // @feature STU004
 // @feature STU005
+import { renderBlueprintCanvasSubView } from './blueprint-canvas.mjs';
 
 const ROLE_LABELS = Object.freeze({
   lead: { label: '主导', tone: 'indigo' },
@@ -1155,6 +1156,7 @@ export function mountLifecyclePanel(host, {
     ['contracts', '② 契约流与架构体检'],
     ['catalog', '③ 全谱系能力与采用现状'],
     ['roadmap', '④ 迁移路线与架构裁决（现状 → 理想态）'],
+    ['blueprint', '⑤ 编排蓝图画布 (M2-1)'],
   ]) {
     const b = mk('button', svLabel, `st-btn${state.lcSubView === svKey ? ' is-active' : ''}`);
     b.type = 'button';
@@ -1181,6 +1183,8 @@ export function mountLifecyclePanel(host, {
     subMount.append(renderCatalogSubView(doc, data, state, callbacks));
   } else if (state.lcSubView === 'roadmap') {
     subMount.append(renderRoadmapSubView(doc, data, state, callbacks));
+  } else if (state.lcSubView === 'blueprint') {
+    subMount.append(renderBlueprintCanvasSubView(doc, state, callbacks));
   } else {
     subMount.append(renderMatrixSubView(doc, data, state, callbacks));
   }

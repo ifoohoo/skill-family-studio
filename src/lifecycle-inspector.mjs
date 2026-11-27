@@ -1226,7 +1226,41 @@ async function evaluateRoadmapMilestones(rawRoadmap, ctx) {
           'packages/skill-family-test/src/tool-mock-replay.mjs',
           'src/tool-mock-replay.mjs',
         ]) : [];
-        if (bpHits.length > 0 && replayHits.length > 0) {
+        let bpSemanticReady = false;
+        if (studioRepo?.live?.realPath && bpHits.length > 0) {
+          const studioPrefix = studioRepo.publicName ? `${studioRepo.publicName}/` : `${studioRepo.name}/`;
+          const bpRel = bpHits[0].startsWith(studioPrefix)
+            ? bpHits[0].slice(studioPrefix.length)
+            : bpHits[0].startsWith(`${studioRepo.name}/`)
+              ? bpHits[0].slice(studioRepo.name.length + 1)
+              : bpHits[0];
+          const bpSrc = await readTextContainedSafe(studioRepo.live.realPath, bpRel);
+          bpSemanticReady = Boolean(
+            bpSrc &&
+            !/\.\s*innerHTML\b/.test(bpSrc) &&
+            bpSrc.includes('BLUEPRINT_ENUMS') &&
+            /export\s+function\s+validateBlueprintCanvasDraft\b/.test(bpSrc) &&
+            /export\s+function\s+computeBlueprintDigestSync\b/.test(bpSrc) &&
+            /export\s+function\s+renderBlueprintCanvasSubView\b/.test(bpSrc),
+          );
+        }
+        let replaySemanticReady = false;
+        if (sftRepo?.live?.realPath && replayHits.length > 0) {
+          const sftPrefix = sftRepo.publicName ? `${sftRepo.publicName}/` : `${sftRepo.name}/`;
+          const replayRel = replayHits[0].startsWith(sftPrefix)
+            ? replayHits[0].slice(sftPrefix.length)
+            : replayHits[0].startsWith(`${sftRepo.name}/`)
+              ? replayHits[0].slice(sftRepo.name.length + 1)
+              : replayHits[0];
+          const replaySrc = await readTextContainedSafe(sftRepo.live.realPath, replayRel);
+          replaySemanticReady = Boolean(
+            replaySrc &&
+            /export\s+function\s+sealToolMockFixture\b/.test(replaySrc) &&
+            /export\s+function\s+verifyToolMockFixtureSeal\b/.test(replaySrc) &&
+            /export\s+function\s+verifyToolReplayRun\b/.test(replaySrc),
+          );
+        }
+        if (bpSemanticReady && replaySemanticReady) {
           status = 'passed';
           badgeLabel = '✅ 已达成';
           badgeTone = 'emerald';
@@ -1235,8 +1269,8 @@ async function evaluateRoadmapMilestones(rawRoadmap, ctx) {
           badgeLabel = '🔵 部分落盘';
           badgeTone = 'indigo';
         }
-        liveDetail = `编排蓝图画布：${bpHits[0] || '待 Wave 4D 按实战摩擦建设'} · sft 工具替身回放：${replayHits[0] || '待 Wave 4D 建设'}`;
-        probeSource = 'skill-family-studio/blueprint-canvas.mjs + skill-family-test/tool-mock-replay.mjs 探针';
+        liveDetail = `编排蓝图画布：${bpSemanticReady ? bpHits[0] : (bpHits[0] ? `${bpHits[0]} (语义探针未齐)` : '待建设')} · sft 工具替身回放：${replaySemanticReady ? replayHits[0] : (replayHits[0] ? `${replayHits[0]} (导出未齐)` : '待建设')}`;
+        probeSource = 'skill-family-studio/blueprint-canvas.mjs + skill-family-test/tool-mock-replay.mjs 内容语义探针';
       } else if (ms.probeCheck === 'skill_eval_scorecard_engine') {
         const evalRepo = lookupProbedRepo(probedByKey, 'skill-family-eval')
           || lookupProbedRepo(probedByKey, 'skill-eval')

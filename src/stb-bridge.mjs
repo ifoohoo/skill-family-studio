@@ -2,9 +2,10 @@
 
 import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync } from 'node:fs';
 import { copyFile, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { createRequire } from 'node:module';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
@@ -199,26 +200,105 @@ export function summarizeStbEntry(id, sourceLabel, bundle, report, conclusion) {
   };
 }
 
-function resolveWorkspaceDriverPaths(root) {
-  const candidates = [
-    path.resolve(root),
-    path.resolve(root, 'skill-family-studio-workspace'),
-    WORKSPACE_CANDIDATE_ROOT,
+const localRequire = createRequire(import.meta.url);
+const IS_SOURCE_CHECKOUT = path.basename(path.dirname(STUDIO_PKG_ROOT)) === 'packages'
+  && !STUDIO_PKG_ROOT.split(path.sep).includes('node_modules');
+
+function isRegularNonSymlinkFile(candidatePath) {
+  try {
+    const st = lstatSync(candidatePath);
+    return st.isFile() && !st.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function isNonSymlinkDir(candidatePath) {
+  try {
+    const st = lstatSync(candidatePath);
+    return st.isDirectory() && !st.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function discoverSfaEvaluationTool() {
+  const envTool = typeof process.env.SFA_EVALUATION_TOOL_PATH === 'string'
+    ? process.env.SFA_EVALUATION_TOOL_PATH.trim()
+    : '';
+  if (envTool) {
+    const resolvedEnv = path.resolve(envTool);
+    if (isRegularNonSymlinkFile(resolvedEnv)) return resolvedEnv;
+  }
+
+  const relativeProbes = [
+    'scripts/evaluation_tool.py',
+    'platforms/claude-code/skill/scripts/evaluation_tool.py',
+    'platforms/codex/skill/scripts/evaluation_tool.py',
+    'packages/skill-failure-auditor/plugin-src/core/scripts/evaluation_tool.py',
   ];
-  for (const base of candidates) {
-    const driverEntry = path.join(base, 'packages/execution-driver/src/index.mjs');
-    const fixturesDir = path.join(base, 'packages/execution-driver/fixtures');
-    if (existsSync(driverEntry)) {
-      const parentEco = path.resolve(base, '..');
-      const sfaTool = path.join(
-        parentEco,
-        'skill-failure-auditor-workspace/packages/skill-failure-auditor/plugin-src/core/scripts/evaluation_tool.py',
-      );
+
+  const home = homedir();
+  for (const installedBase of [
+    path.join(home, '.agents/skills/skill-failure-auditor'),
+    path.join(home, '.claude/skills/skill-failure-auditor'),
+  ]) {
+    if (!isNonSymlinkDir(installedBase)) continue;
+    for (const rel of relativeProbes) {
+      const hit = path.join(installedBase, rel);
+      if (isRegularNonSymlinkFile(hit)) return hit;
+    }
+  }
+
+  if (IS_SOURCE_CHECKOUT) {
+    const checkoutParent = path.resolve(WORKSPACE_CANDIDATE_ROOT, '..');
+    if (isNonSymlinkDir(checkoutParent)) {
+      try {
+        for (const ent of readdirSync(checkoutParent, { withFileTypes: true })) {
+          if (!ent.isDirectory() || ent.isSymbolicLink() || ent.name.startsWith('.')) continue;
+          if (!ent.name.includes('skill-failure-auditor')) continue;
+          const childBase = path.join(checkoutParent, ent.name);
+          if (!isNonSymlinkDir(childBase)) continue;
+          for (const rel of relativeProbes) {
+            const hit = path.join(childBase, rel);
+            if (isRegularNonSymlinkFile(hit)) return hit;
+          }
+        }
+      } catch {
+        // ignore unreadable parent dir
+      }
+    }
+  }
+  return null;
+}
+
+export function resolveWorkspaceDriverPaths(_root) {
+  const sfaTool = discoverSfaEvaluationTool();
+  try {
+    const resolvedEntry = localRequire.resolve('skill-family-execution-driver');
+    if (resolvedEntry && isRegularNonSymlinkFile(resolvedEntry)) {
+      const pkgDir = path.resolve(path.dirname(resolvedEntry), '..');
+      const fixturesDir = path.join(pkgDir, 'fixtures');
+      return {
+        available: true,
+        driverEntry: resolvedEntry,
+        fixturesDir: isNonSymlinkDir(fixturesDir) ? fixturesDir : null,
+        sfaTool,
+      };
+    }
+  } catch {
+    // fallback to local source checkout layout when running uninstalled tests
+  }
+
+  if (IS_SOURCE_CHECKOUT) {
+    const driverEntry = path.join(WORKSPACE_CANDIDATE_ROOT, 'packages/execution-driver/src/index.mjs');
+    const fixturesDir = path.join(WORKSPACE_CANDIDATE_ROOT, 'packages/execution-driver/fixtures');
+    if (isRegularNonSymlinkFile(driverEntry)) {
       return {
         available: true,
         driverEntry,
-        fixturesDir,
-        sfaTool: existsSync(sfaTool) ? sfaTool : null,
+        fixturesDir: isNonSymlinkDir(fixturesDir) ? fixturesDir : null,
+        sfaTool,
       };
     }
   }

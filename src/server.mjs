@@ -817,6 +817,7 @@ export async function createStudioServer({
         '/assets/fleet-ui.mjs': { file: join(UI_DIR, 'fleet-ui.mjs'), type: MIME_TYPES['.mjs'] },
         '/assets/stb-ui.mjs': { file: join(UI_DIR, 'stb-ui.mjs'), type: MIME_TYPES['.mjs'] },
         '/assets/lifecycle-ui.mjs': { file: join(UI_DIR, 'lifecycle-ui.mjs'), type: MIME_TYPES['.mjs'] },
+        '/assets/blueprint-canvas.mjs': { file: join(UI_DIR, 'blueprint-canvas.mjs'), type: MIME_TYPES['.mjs'] },
         '/graph-layout.mjs': { file: join(PKG_SRC_DIR, 'graph-layout.mjs'), type: MIME_TYPES['.mjs'] },
         '/assets/graph-layout.mjs': { file: join(PKG_SRC_DIR, 'graph-layout.mjs'), type: MIME_TYPES['.mjs'] },
       };

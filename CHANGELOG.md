@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2
+
+- 升级对齐 `artifact-graph@1.2.3`（细粒度提示词与 `SKILL.md`/`references/**` 非代码资产 SHA-256 锁）与 `skill-family-execution-driver@0.2.1`（厂商中立受管多宿主 CLI 采集驱动与 `./replay-driver` 导出）。
+- 正式纳入公开包映射并导出 `./blueprint-canvas`（零 `innerHTML` 受限枚举多会话编排蓝图画布、实时反自审与外部副作用 HITL 门禁支配检查及 `blueprintRef` 规范化 SHA-256 摘要生成）。
+
 ## 0.2.1
 
 - 单端口统一承载三业务主页签（审阅与对齐、制品图谱、运行监控）与按需「📖 手册」，提供零配置单仓与声明式多仓发现。

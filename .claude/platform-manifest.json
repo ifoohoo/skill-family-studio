@@ -1,7 +1,7 @@
 {
   "platformId": "claude",
   "familyId": "skill-family-studio",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "logicalMappings": [
     {
       "logicalName": "skill-family-studio",
