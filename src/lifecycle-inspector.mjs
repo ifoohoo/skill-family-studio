@@ -1,5 +1,6 @@
 // @feature STU004
 // @feature STU005
+// @feature STU007
 
 import { execFile } from 'node:child_process';
 import { lstat, readdir, realpath } from 'node:fs/promises';
@@ -1357,25 +1358,124 @@ async function evaluateRoadmapMilestones(rawRoadmap, ctx) {
         probeSource = 'skill-eval/src/* + release-skill/professional-proof.mjs + Hub lifecycle-providers.mjs';
       } else if (ms.probeCheck === 'studio_server_otel_dengbao') {
         const targets = resolveMilestoneTargets(ms.ownerRepos, r => r.ring === 'core' && r.live?.existsOnDisk);
-        const srvHits = await checkAnyFileInTargets(targets, [
+        const studioRepo = lookupProbedRepo(probedByKey, 'skill-family-studio')
+          || targets.find(r => r.publicName === 'skill-family-studio')
+          || null;
+        const sfaRepo = lookupProbedRepo(probedByKey, 'skill-failure-auditor')
+          || probedRepos.find(r => r.publicName === 'skill-failure-auditor')
+          || null;
+        const rsRepo = lookupProbedRepo(probedByKey, 'release-skill')
+          || probedRepos.find(r => r.publicName === 'release-skill')
+          || null;
+
+        const srvCandidates = [
+          'packages/skill-family-studio/src/studio-collector-server.mjs',
           'packages/studio-server/package.json',
           'src/studio-collector-server.mjs',
-        ]);
-        const otelHits = await checkAnyFileInTargets(targets, [
+        ];
+        const otelCandidates = [
+          'packages/skill-family-studio/src/otel-siem-exporter.mjs',
           'packages/otel-compliance-exporter/package.json',
           'src/otel-siem-exporter.mjs',
-        ]);
-        if (srvHits.length > 0 && otelHits.length > 0) {
+        ];
+        const srvHits = await checkAnyFileInTargets(targets, srvCandidates);
+        const otelHits = await checkAnyFileInTargets(targets, otelCandidates);
+
+        let otelSemanticReady = false;
+        let collectorSemanticReady = false;
+        let governanceSemanticReady = false;
+        if (studioRepo?.live?.realPath) {
+          const otelSrc = (await readTextContainedSafe(
+            studioRepo.live.realPath,
+            'packages/skill-family-studio/src/otel-siem-exporter.mjs',
+          )) || (await readTextContainedSafe(studioRepo.live.realPath, 'src/otel-siem-exporter.mjs'));
+          const srvSrc = (await readTextContainedSafe(
+            studioRepo.live.realPath,
+            'packages/skill-family-studio/src/studio-collector-server.mjs',
+          )) || (await readTextContainedSafe(studioRepo.live.realPath, 'src/studio-collector-server.mjs'));
+
+          const retentionMatch = otelSrc
+            ? /export\s+const\s+MIN_RETENTION_DAYS\s*=\s*(\d+)\b/.exec(otelSrc)
+            : null;
+          const retentionFloor = retentionMatch ? Number.parseInt(retentionMatch[1], 10) : 0;
+
+          otelSemanticReady = Boolean(
+            otelSrc &&
+            retentionFloor >= 180 &&
+            !/\.\s*innerHTML\b/.test(otelSrc) &&
+            /export\s+class\s+ComplianceAuditLedger\b/.test(otelSrc) &&
+            /export\s+function\s+exportStbToOtelSpans\b/.test(otelSrc) &&
+            /export\s+function\s+exportAuditEventsToSiemNdjson\b/.test(otelSrc) &&
+            /export\s+function\s+buildDengbaoEvidenceMappingReport\b/.test(otelSrc),
+          );
+          collectorSemanticReady = Boolean(
+            srvSrc &&
+            !/\.\s*innerHTML\b/.test(srvSrc) &&
+            /export\s+function\s+createStudioCollectorServer\b/.test(srvSrc) &&
+            /export\s+class\s+QuotaCircuitBreaker\b/.test(srvSrc),
+          );
+          governanceSemanticReady = Boolean(
+            collectorSemanticReady &&
+            /export\s+class\s+TenantRbacAuthorizer\b/.test(srvSrc) &&
+            /export\s+class\s+HitlApprovalQueue\b/.test(srvSrc) &&
+            /export\s+async\s+function\s+exportIncidentToFb2Candidate\b/.test(srvSrc),
+          );
+        }
+
+        let sfaExportReady = false;
+        if (sfaRepo?.live?.realPath) {
+          const sfaPy =
+            (await readTextContainedSafe(
+              sfaRepo.live.realPath,
+              'packages/skill-failure-auditor/plugin-src/core/scripts/evaluation_tool.py',
+            )) ||
+            (await readTextContainedSafe(
+              sfaRepo.live.realPath,
+              'skills/skill-failure-auditor/scripts/evaluation_tool.py',
+            )) ||
+            (await readTextContainedSafe(sfaRepo.live.realPath, 'scripts/evaluation_tool.py'));
+          sfaExportReady = Boolean(sfaPy && sfaPy.includes('export-repro-candidate'));
+        }
+
+        let rsControlledPrivateReady = false;
+        if (rsRepo?.live?.realPath) {
+          const rsReceiptReady = Boolean(
+            rsRepo.live.locksAndReceipt?.receiptPassed || rsRepo.live.locksAndReceipt?.lockPresent,
+          );
+          const rsPolicySrc =
+            (await readTextContainedSafe(
+              rsRepo.live.realPath,
+              'packages/release-skill/src/core/git-url-policy.mjs',
+            )) || (await readTextContainedSafe(rsRepo.live.realPath, 'src/core/git-url-policy.mjs'));
+          const rsSourcePolicyImplemented = Boolean(
+            rsPolicySrc &&
+              rsPolicySrc.includes('validateSourcePolicyDeclaration') &&
+              rsPolicySrc.includes('controlled-private'),
+          );
+          rsControlledPrivateReady = Boolean(rsReceiptReady && rsSourcePolicyImplemented);
+        }
+
+        const studioReceiptReady = studioRepo?.live?.existsOnDisk
+          ? Boolean(studioRepo.live.locksAndReceipt?.receiptPassed)
+          : false;
+        const requiresM32Governance = ms.id === 'M3-2';
+        const fullSemanticPass = requiresM32Governance
+          ? Boolean(otelSemanticReady && governanceSemanticReady && sfaExportReady && rsControlledPrivateReady && studioReceiptReady)
+          : Boolean(otelSemanticReady && collectorSemanticReady && studioReceiptReady);
+
+        if (fullSemanticPass) {
           status = 'passed';
-          badgeLabel = '✅ 已达成';
+          badgeLabel = requiresM32Governance
+            ? '✅ 已达成 (RBAC + HITL + 线上 FB-2 闭环)'
+            : '✅ 已达成 (采集器 + OTel/SIEM + ≥180天哈希链)';
           badgeTone = 'emerald';
         } else if (srvHits.length > 0 || otelHits.length > 0) {
           status = 'partial';
-          badgeLabel = '🔵 部分落盘';
+          badgeLabel = '🔵 模块已落盘（待补齐语义契约或实测收据）';
           badgeTone = 'indigo';
         }
-        liveDetail = `Studio Server：${srvHits[0] || '远期规划'} · OTel/SIEM 等保留存：${otelHits[0] || '远期规划'}`;
-        probeSource = 'packages/studio-server + otel-compliance-exporter 探针';
+        liveDetail = `Studio Server：${collectorSemanticReady ? srvHits[0] : (srvHits[0] ? `${srvHits[0]} (语义未齐)` : '远期规划')} · OTel/SIEM ≥180天等保留存：${otelSemanticReady ? otelHits[0] : (otelHits[0] ? `${otelHits[0]} (语义未齐)` : '远期规划')}${requiresM32Governance ? ` · RBAC/HITL/FB-2：${governanceSemanticReady && sfaExportReady ? '已就绪' : '待核验'}` : ''}`;
+        probeSource = 'studio-collector-server.mjs + otel-siem-exporter.mjs 语义探针 + sft-runs.json';
       }
 
       if (status === 'passed') passedCount += 1;

@@ -4,6 +4,7 @@
 // @feature STU004
 // @feature STU005
 // @feature STU006
+// @feature STU007
 
 export {
   DEFAULT_STUDIO_REVIEWS_PATH,
